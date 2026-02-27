@@ -1,5 +1,7 @@
 # lumi-server
 
+> **🚧 Work in progress** — lumi is under active development. Features may change, break, or be incomplete.
+
 HTTP/WebSocket server for [lumi](https://github.com/ViniZap4/lumi) — a local-first, markdown-based note-taking system.
 
 Built with [Go](https://golang.org).
