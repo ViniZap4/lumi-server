@@ -1,0 +1,5 @@
+# Build binary
+lumi-server
+
+# OS files
+.DS_Store
