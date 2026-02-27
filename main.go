@@ -116,7 +116,38 @@ func main() {
 		}
 	})))
 
-	mux.HandleFunc("/ws", corsMiddleware(server.HandleWebSocket))
+	// Auth validation endpoint (no auth middleware — it validates the token itself)
+	mux.HandleFunc("/api/auth", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		token := r.Header.Get("X-Lumi-Token")
+		password := os.Getenv("LUMI_PASSWORD")
+		if password == "" {
+			password = "dev"
+		}
+		if token != password {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}))
+
+	// WebSocket with token auth via query param
+	mux.HandleFunc("/ws", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		password := os.Getenv("LUMI_PASSWORD")
+		if password == "" {
+			password = "dev"
+		}
+		token := r.URL.Query().Get("token")
+		if token != password {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		server.HandleWebSocket(w, r)
+	}))
 
 	// Peer WebSocket endpoint
 	upgrader := websocket.Upgrader{
