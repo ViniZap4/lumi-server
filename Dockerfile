@@ -16,7 +16,6 @@ COPY --from=builder /app/lumi-server .
 
 ENV LUMI_ROOT=/notes
 ENV LUMI_PORT=8080
-ENV LUMI_PASSWORD=dev
 
 EXPOSE 8080
 

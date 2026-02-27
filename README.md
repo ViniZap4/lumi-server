@@ -19,10 +19,23 @@ Built with [Go](https://golang.org).
 LUMI_ROOT=/path/to/notes LUMI_PASSWORD=secret go run main.go
 ```
 
-Environment variables:
-- `LUMI_ROOT` — path to notes directory
-- `LUMI_PASSWORD` — auth token
-- `LUMI_PORT` — server port (default: 8080)
+Or with Docker:
+
+```bash
+docker build -t lumi-server .
+docker run -p 8080:8080 -v /path/to/notes:/notes \
+  -e LUMI_PASSWORD=secret lumi-server
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LUMI_ROOT` | `/notes` (Docker) / `./notes` | Notes directory |
+| `LUMI_PASSWORD` | `dev` | Auth token (`-e` required in Docker) |
+| `LUMI_PORT` | `8080` | Server port |
+| `LUMI_SERVER_ID` | auto | Unique ID for peer sync |
+| `LUMI_PEERS` | — | Comma-separated peer URLs |
 
 ## API
 
