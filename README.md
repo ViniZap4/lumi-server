@@ -27,14 +27,17 @@ Environment variables:
 ## API
 
 ```
+POST   /api/auth          Validate token (login)
 GET    /api/folders       List folders
 GET    /api/notes         List notes
 GET    /api/notes/:id     Get note
 POST   /api/notes         Create note
 PUT    /api/notes/:id     Update note
 DELETE /api/notes/:id     Delete note
-WS     /ws                Real-time updates
+WS     /ws?token=<token>  Real-time updates (token required)
 ```
+
+All REST endpoints require `X-Lumi-Token` header. WebSocket requires `?token=` query param.
 
 ## Part of lumi
 
