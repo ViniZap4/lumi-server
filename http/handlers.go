@@ -4,6 +4,7 @@ package http
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -322,6 +323,78 @@ func (s *Server) HandleCreateFolder(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(&domain.Folder{Name: req.Name, Path: req.Name})
+}
+
+func (s *Server) HandleRenameFolder(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/api/folders/")
+	if name == "" {
+		http.Error(w, "Folder name required", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		NewName string `json:"new_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.NewName == "" {
+		http.Error(w, "New folder name required", http.StatusBadRequest)
+		return
+	}
+
+	oldPath := filepath.Join(s.rootDir, name)
+	newPath := filepath.Join(s.rootDir, req.NewName)
+
+	if err := os.Rename(oldPath, newPath); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(&domain.Folder{Name: req.NewName, Path: req.NewName})
+}
+
+func (s *Server) HandleMoveFolder(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/folders/")
+	name := strings.TrimSuffix(path, "/move")
+
+	var req struct {
+		Destination string `json:"destination"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := filesystem.MoveFolder(s.rootDir, name, req.Destination); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.hub.Broadcast("folder_updated", nil)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) HandleDeleteFolder(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/api/folders/")
+	if name == "" {
+		http.Error(w, "Folder name required", http.StatusBadRequest)
+		return
+	}
+
+	folderPath := filepath.Join(s.rootDir, name)
+
+	if err := os.RemoveAll(folderPath); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {

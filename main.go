@@ -64,6 +64,23 @@ func main() {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
 	})))
+	mux.HandleFunc("/api/folders/", corsMiddleware(auth.Middleware(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			path := strings.TrimPrefix(r.URL.Path, "/api/folders/")
+			if strings.HasSuffix(path, "/move") {
+				server.HandleMoveFolder(w, r)
+			} else {
+				http.Error(w, "Not found", http.StatusNotFound)
+			}
+		case http.MethodPut:
+			server.HandleRenameFolder(w, r)
+		case http.MethodDelete:
+			server.HandleDeleteFolder(w, r)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})))
 	mux.HandleFunc("/api/notes", corsMiddleware(auth.Middleware(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:

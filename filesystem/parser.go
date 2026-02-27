@@ -80,23 +80,27 @@ func ListNotes(dir string) ([]*domain.Note, error) {
 }
 
 func ListFolders(root string) ([]*domain.Folder, error) {
-	entries, err := os.ReadDir(root)
+	var folders []*domain.Folder
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() || path == root || strings.HasPrefix(d.Name(), ".") {
+			if d.IsDir() && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, _ := filepath.Rel(root, path)
+		folders = append(folders, &domain.Folder{
+			Name: d.Name(),
+			Path: rel,
+		})
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	var folders []*domain.Folder
-	for _, entry := range entries {
-		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
-			continue
-		}
-
-		folders = append(folders, &domain.Folder{
-			Name: entry.Name(),
-			Path: entry.Name(),
-		})
-	}
-
 	return folders, nil
 }
 
