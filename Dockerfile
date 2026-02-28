@@ -15,7 +15,6 @@ WORKDIR /app
 COPY --from=builder /app/lumi-server .
 
 ENV LUMI_ROOT=/notes
-ENV LUMI_PORT=8080
 
 EXPOSE 8080
 
