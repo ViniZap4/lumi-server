@@ -31,11 +31,11 @@ docker run -p 8080:8080 -v /path/to/notes:/notes \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LUMI_ROOT` | `/notes` (Docker) / `./notes` | Notes directory |
-| `LUMI_PASSWORD` | `dev` | Auth token (`-e` required in Docker) |
-| `LUMI_PORT` | `8080` | Server port |
-| `LUMI_SERVER_ID` | auto | Unique ID for peer sync |
-| `LUMI_PEERS` | — | Comma-separated peer URLs |
+| `LUMI_ROOT` | `/notes` (Docker) / `./notes` | Path to the notes directory |
+| `LUMI_PASSWORD` | `dev` | Password for web login, REST API (`X-Lumi-Token`), and WebSocket (`?token=`) |
+| `LUMI_PORT` | `8080` | HTTP server listen port |
+| `LUMI_SERVER_ID` | auto | Unique server ID used for peer-to-peer sync origin tracking |
+| `LUMI_PEERS` | — | Comma-separated URLs of peer lumi servers to federate with |
 
 ## API
 
