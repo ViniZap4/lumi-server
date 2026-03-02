@@ -108,13 +108,17 @@ func (h *Hub) Broadcast(msgType string, note *domain.Note) {
 // Used when receiving a message from a peer to avoid echo loops.
 func (h *Hub) BroadcastLocal(msg Message) {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
-
+	var failed []*websocket.Conn
 	for conn := range h.clients {
 		if err := conn.WriteJSON(msg); err != nil {
 			log.Printf("WebSocket write error: %v", err)
-			h.unregister <- conn
+			failed = append(failed, conn)
 		}
+	}
+	h.mu.RUnlock()
+
+	for _, conn := range failed {
+		h.unregister <- conn
 	}
 }
 

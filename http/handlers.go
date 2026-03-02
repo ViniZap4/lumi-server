@@ -397,6 +397,39 @@ func (s *Server) HandleDeleteFolder(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) HandleServeFile(w http.ResponseWriter, r *http.Request) {
+	filePath := strings.TrimPrefix(r.URL.Path, "/api/files/")
+	if filePath == "" {
+		http.Error(w, "File path required", http.StatusBadRequest)
+		return
+	}
+
+	fullPath := filepath.Join(s.rootDir, filePath)
+
+	absRoot, err := filepath.Abs(s.rootDir)
+	if err != nil {
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
+	absPath, err := filepath.Abs(fullPath)
+	if err != nil {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+	if !strings.HasPrefix(absPath, absRoot+string(os.PathSeparator)) && absPath != absRoot {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	info, err := os.Stat(absPath)
+	if err != nil || info.IsDir() {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+
+	http.ServeFile(w, r, absPath)
+}
+
 func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {

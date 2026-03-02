@@ -62,7 +62,7 @@ func ListNotes(dir string) ([]*domain.Note, error) {
 		return nil, err
 	}
 
-	var notes []*domain.Note
+	notes := make([]*domain.Note, 0)
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
 			continue
@@ -80,7 +80,7 @@ func ListNotes(dir string) ([]*domain.Note, error) {
 }
 
 func ListFolders(root string) ([]*domain.Folder, error) {
-	var folders []*domain.Folder
+	folders := make([]*domain.Folder, 0)
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err

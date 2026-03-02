@@ -2,6 +2,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -135,6 +136,9 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}))
 
+	// File serving (images, attachments)
+	mux.HandleFunc("/api/files/", corsMiddleware(auth.Middleware(server.HandleServeFile)))
+
 	// WebSocket with token auth via query param
 	mux.HandleFunc("/ws", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		password := os.Getenv("LUMI_PASSWORD")
@@ -215,11 +219,10 @@ func main() {
 }
 
 func generateID() string {
-	// Simple random ID using crypto/rand
 	b := make([]byte, 8)
-	f, _ := os.Open("/dev/urandom")
-	f.Read(b)
-	f.Close()
+	if _, err := rand.Read(b); err != nil {
+		log.Fatalf("Failed to generate random ID: %v", err)
+	}
 	const hex = "0123456789abcdef"
 	id := make([]byte, 16)
 	for i, v := range b {
