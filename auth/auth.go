@@ -14,6 +14,10 @@ func Middleware(next http.HandlerFunc) http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("X-Lumi-Token")
+		// Fall back to ?token= query param (used by <img> tags and WebSocket)
+		if token == "" {
+			token = r.URL.Query().Get("token")
+		}
 		if token != password {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
