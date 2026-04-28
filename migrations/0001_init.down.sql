@@ -1,0 +1,11 @@
+DROP TABLE IF EXISTS user_consents;
+DROP TABLE IF EXISTS audit_log;
+DROP TABLE IF EXISTS note_yjs_updates;
+DROP TABLE IF EXISTS note_yjs_snapshots;
+DROP TABLE IF EXISTS notes;
+DROP TABLE IF EXISTS invites;
+DROP TABLE IF EXISTS vault_members;
+DROP TABLE IF EXISTS vault_roles;
+DROP TABLE IF EXISTS vaults;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS users;
