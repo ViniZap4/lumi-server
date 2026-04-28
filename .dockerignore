@@ -1,5 +1,22 @@
-# server/.dockerignore
-*.md
+# Build artefacts
+/bin/
+/lumi-server
+/dist/
+
+# Source-control / docs
 .git
 .gitignore
-lumi-server
+*.md
+
+# Local env
+.env
+.env.local
+
+# Local data
+/vaults/
+/data/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

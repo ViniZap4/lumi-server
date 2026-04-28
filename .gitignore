@@ -1,5 +1,24 @@
-# Build binary
-lumi-server
+# Build output
+/bin/
+/lumi-server
+/dist/
 
-# OS files
+# Local env
+.env
+.env.local
+
+# Test artefacts
+*.test
+*.out
+coverage.*
+
+# Editor / OS
 .DS_Store
+.idea/
+.vscode/
+*.swp
+__debug_bin*
+
+# Local vault data (dev)
+/vaults/
+/data/

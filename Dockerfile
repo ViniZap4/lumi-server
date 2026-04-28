@@ -1,21 +1,20 @@
-# server/Dockerfile
-FROM golang:1.23-alpine AS builder
+# syntax=docker/dockerfile:1.6
 
-WORKDIR /app
+FROM golang:1.23-bookworm AS builder
+WORKDIR /src
+
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN go build -o lumi-server main.go
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/lumi-server ./cmd/lumi-server
 
-FROM alpine:latest
-RUN apk --no-cache add ca-certificates
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=builder /out/lumi-server /lumi-server
 
-WORKDIR /app
-COPY --from=builder /app/lumi-server .
-
-ENV LUMI_ROOT=/notes
+ENV LUMI_ROOT=/vaults \
+    LUMI_PORT=8080
 
 EXPOSE 8080
-
-CMD ["./lumi-server"]
+USER nonroot:nonroot
+ENTRYPOINT ["/lumi-server"]

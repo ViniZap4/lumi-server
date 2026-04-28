@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lumi
+      POSTGRES_PASSWORD: lumi
+      POSTGRES_DB: lumi
+    volumes:
+      - lumi-pg:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lumi -d lumi"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      LUMI_DATABASE_URL: postgres://lumi:lumi@postgres:5432/lumi?sslmode=disable
+      LUMI_ROOT: /vaults
+      LUMI_PORT: 8080
+      LUMI_REQUIRE_TLS: "false"
+      LUMI_ALLOWED_ORIGINS: "http://localhost:5173,http://localhost:3000"
+      LUMI_REGISTRATION: invite-only
+      LUMI_AUDIT_RETENTION_DAYS: "90"
+    volumes:
+      - lumi-vaults:/vaults
+    ports:
+      - "8080:8080"
+
+volumes:
+  lumi-pg:
+  lumi-vaults:

@@ -1,61 +1,56 @@
 # lumi-server
 
-> **🚧 Work in progress** — lumi is under active development. Features may change, break, or be incomplete.
+Backend for **lumi v2**: a multi-tenant collaborative note-taking server.
 
-HTTP/WebSocket server for [lumi](https://github.com/ViniZap4/lumi) — a local-first, markdown-based note-taking system.
+See [SPEC.md](https://github.com/ViniZap4/lumi/blob/main/SPEC.md) in the lumi
+monorepo for the full architecture, data model, API surface, and rollout plan.
 
-Built with [Go](https://golang.org).
+## Status
 
-## Features
+- `main` — v1 (single-password REST + WebSocket sync hub).
+- `v2`   — current branch. v2 implementation in progress per SPEC.md.
 
-- RESTful API for notes and folders
-- WebSocket hub for real-time sync
-- Token-based authentication (`X-Lumi-Token`)
-- CORS support for web client
+## Quick start (dev)
 
-## Run
-
-```bash
-LUMI_ROOT=/path/to/notes LUMI_PASSWORD=secret go run main.go
+```sh
+cp .env.example .env
+docker compose up -d postgres
+make dev
 ```
 
-Or with Docker:
-
-```bash
-docker build -t lumi-server .
-docker run -p 8080:8080 -v /path/to/notes:/notes \
-  -e LUMI_PASSWORD=secret lumi-server
-```
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LUMI_ROOT` | `/notes` (Docker) / `./notes` | Path to the notes directory |
-| `LUMI_PASSWORD` | `dev` | Password for web login, REST API (`X-Lumi-Token`), and WebSocket (`?token=`) |
-| `LUMI_PORT` | `8080` | HTTP server listen port |
-| `LUMI_SERVER_ID` | auto | Unique server ID used for peer-to-peer sync origin tracking |
-| `LUMI_PEERS` | — | Comma-separated URLs of peer lumi servers to federate with |
-
-## API
+## Layout
 
 ```
-POST   /api/auth          Validate token (login)
-GET    /api/folders       List folders
-GET    /api/notes         List notes
-GET    /api/notes/:id     Get note
-POST   /api/notes         Create note
-PUT    /api/notes/:id     Update note
-DELETE /api/notes/:id     Delete note
-WS     /ws?token=<token>  Real-time updates (token required)
+cmd/lumi-server/           binary entrypoint
+internal/
+  api/                     Fiber routes + middleware
+  auth/                    sessions, login, password hashing, middleware
+  config/                  env parsing
+  domain/                  canonical types, errors, capability vocabulary
+  invites/                 invite generation + accept flow
+  members/                 vault membership
+  notes/                   note metadata + CRDT bridge (Phase 2)
+  roles/                   custom per-vault roles
+  storage/
+    fs/                    SafeJoin, atomic write, vault.yaml
+    pg/                    sqlc-generated queries
+  users/                   user CRUD
+  vaults/                  vault CRUD
+migrations/                SQL migrations
 ```
 
-All REST endpoints require `X-Lumi-Token` header. WebSocket requires `?token=` query param.
+## Pillars
 
-## Documentation
+1. Security first / LGPD compliance
+2. Performance
+3. DX
+4. Scale
+5. UX
+6. UI
+7. QA
 
-Full docs at [lumi-note.vercel.app/#/docs](https://lumi-note.vercel.app/#/docs).
+See SPEC.md.
 
 ## Part of lumi
 
-This is a component of the [lumi monorepo](https://github.com/ViniZap4/lumi).
+Component of the [lumi monorepo](https://github.com/ViniZap4/lumi).
