@@ -31,6 +31,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
 
+	"github.com/ViniZap4/lumi-server/internal/audit"
 	"github.com/ViniZap4/lumi-server/internal/auth"
 	"github.com/ViniZap4/lumi-server/internal/domain"
 	"github.com/ViniZap4/lumi-server/internal/invites"
@@ -449,6 +450,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	vaults.NewHandlers(vaultsSvc).Register(authed)
 	roles.NewHandlers(rolesSvc, membersSvc).Register(authed)
 	members.NewHandlers(membersSvc, membersSvc).Register(authed)
+	audit.NewHandlers(auditStore, membersSvc).Register(authed)
 
 	// Invites: split between vault-scoped (authed) and public.
 	invites.NewHandlers(invitesSvc).Register(app, authed, membersSvc)
