@@ -44,6 +44,14 @@ type MemberAdder interface {
 	Add(ctx context.Context, m domain.Member) error
 }
 
+// VaultWatcher is notified after a new vault directory is provisioned
+// so the FS watcher can attach inotify/kqueue handles. nil-safe — when
+// the watcher is not wired (e.g. dev runs with FS-CRDT bridge
+// disabled) Create still succeeds.
+type VaultWatcher interface {
+	WatchVault(slug string) error
+}
+
 // Service orchestrates vault lifecycle.
 type Service struct {
 	repo     VaultRepo
@@ -52,6 +60,7 @@ type Service struct {
 	fs       *fs.Manager
 	audit    audit.Recorder
 	resolver capguard.Resolver
+	watcher  VaultWatcher
 	now      func() time.Time
 }
 
@@ -79,6 +88,11 @@ func NewService(
 		now:      time.Now,
 	}
 }
+
+// SetWatcher installs a runtime hook for vault provisioning. Pass nil
+// to disable. Called by the composition root once both the vaults
+// service and the fswatch manager exist.
+func (s *Service) SetWatcher(w VaultWatcher) { s.watcher = w }
 
 // ---- Slug ------------------------------------------------------------------
 
@@ -259,6 +273,13 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (domain.Vault, err
 		CreatedAt: created.CreatedAt,
 	}); err != nil {
 		// Non-fatal: dir is provisioned, vault is valid in DB. Log via audit.
+	}
+	// Hook the watcher up so external edits to this brand-new vault
+	// reach the CRDT layer without a server restart. Failure to attach
+	// is non-fatal — the next restart's WatchExistingVaults sweep will
+	// pick it up.
+	if s.watcher != nil {
+		_ = s.watcher.WatchVault(created.Slug)
 	}
 
 	s.recordAudit(ctx, in.CreatedBy, created.ID, domain.ActionVaultCreate, in.IP, in.UserAgent, map[string]any{

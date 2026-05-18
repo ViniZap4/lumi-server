@@ -35,6 +35,7 @@ import (
 	"github.com/ViniZap4/lumi-server/internal/auth"
 	"github.com/ViniZap4/lumi-server/internal/crdt"
 	"github.com/ViniZap4/lumi-server/internal/domain"
+	"github.com/ViniZap4/lumi-server/internal/fswatch"
 	"github.com/ViniZap4/lumi-server/internal/invites"
 	"github.com/ViniZap4/lumi-server/internal/members"
 	"github.com/ViniZap4/lumi-server/internal/notes"
@@ -428,8 +429,23 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	membersSvc := members.NewService(memberRepoAdapter{memberStore}, auditStore)
 	vaultsSvc := vaults.NewService(vaultStore, roleStore, memberStore, fsMgr, auditStore, membersSvc)
 	usersSvc := users.NewService(userStore, consentStore, auditStore, auditStore, vaultStore)
-	notesSvc := notes.NewService(noteStore, vaultStore, fsMgr, auditStore, membersSvc, crdtRegistry)
+	// FS watcher. Handler is set below once the WS hub exists; the
+	// silencer side (SkipNext) is what notes.Service needs at this
+	// point, and that surface is available immediately.
+	fsWatcher, err := fswatch.New(fsMgr.Root, fsMgr, nil, zlog)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fswatch: %w", err)
+	}
+
+	notesSvc := notes.NewService(noteStore, vaultStore, fsMgr, auditStore, membersSvc, crdtRegistry, fsWatcher)
 	wsHub := wsync.NewHub(crdtRegistry)
+
+	fsWatcher.SetHandler(buildFSHandler(zlog, vaultStore, noteStore, fsMgr, crdtRegistry, wsHub))
+	vaultsSvc.SetWatcher(fsWatcher)
+	if err := fsWatcher.WatchExistingVaults(); err != nil {
+		zlog.Warn().Err(err).Msg("fswatch: WatchExistingVaults")
+	}
+	go fsWatcher.Run(ctx)
 	invitesSvc := invites.NewService(invites.Deps{
 		Repo:          inviteStore,
 		Users:         userStore,
@@ -494,10 +510,102 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 
 	shutdown := func(ctx context.Context) error {
 		_ = ctx
+		_ = fsWatcher.Close()
 		wsHub.Close()
 		return nil
 	}
 	return app, shutdown, nil
+}
+
+// buildFSHandler stitches an fswatch.Handler that routes external markdown
+// edits into the CRDT layer. Pipeline:
+//
+//  1. Look up the vault by on-disk slug (skip if unknown — could be a
+//     stale dir left behind by a deleted vault).
+//  2. Look up the note row by path (skip if no row — Phase 2.4 does NOT
+//     auto-create on drop-in files; that's a 2.4.b call).
+//  3. Read frontmatter + body from disk.
+//  4. If a live WS Room exists, drive the change through it so
+//     subscribers see the broadcast; otherwise apply + persist via the
+//     CRDT registry directly.
+//  5. The note's pg row gets updated_at bumped so list/search reflects
+//     the external edit.
+//
+// Errors are logged but never propagated — the watcher is a best-effort
+// background process; one bad file should not stall others.
+func buildFSHandler(
+	zlog zerolog.Logger,
+	vaultStore *pg.VaultStore,
+	noteStore *pg.NoteStore,
+	fsMgr *fs.Manager,
+	crdtReg *crdt.Registry,
+	hub *wsync.Hub,
+) fswatch.Handler {
+	const originKind = "fs-watcher"
+	log := zlog.With().Str("component", "fswatch.handler").Logger()
+	return fswatch.HandlerFunc(func(ctx context.Context, ev fswatch.Event) {
+		v, err := vaultStore.GetBySlug(ctx, ev.VaultSlug)
+		if err != nil {
+			log.Debug().Err(err).Str("slug", ev.VaultSlug).Msg("vault lookup failed")
+			return
+		}
+		n, err := noteStore.GetByPath(ctx, v.ID, ev.RelativePath)
+		if err != nil {
+			log.Debug().Err(err).Str("path", ev.RelativePath).Msg("note lookup failed (no auto-create in 2.4)")
+			return
+		}
+		_, body, err := fsMgr.ReadNote(v.Slug, n.Path)
+		if err != nil {
+			log.Warn().Err(err).Str("path", n.Path).Msg("read note failed")
+			return
+		}
+
+		// If subscribers are connected, drive the diff through the
+		// live Room so they see the update. Otherwise apply + persist
+		// without touching the WS layer.
+		newText := string(body)
+		if room := hub.RoomIfActive(v.ID, n.ID); room != nil {
+			doc := room.Doc()
+			update, err := doc.ApplyTextDiff(newText, originKind)
+			if err != nil {
+				log.Warn().Err(err).Msg("live ApplyTextDiff failed")
+				return
+			}
+			if len(update) == 0 {
+				return
+			}
+			if err := room.ApplyAndBroadcastFromFS(update); err != nil {
+				log.Warn().Err(err).Msg("ApplyAndBroadcastFromFS failed")
+			}
+			return
+		}
+
+		// Cold path: no live room. Load doc, apply, persist, close.
+		doc, err := crdtReg.LoadDoc(ctx, v.ID, n.ID)
+		if err != nil {
+			log.Warn().Err(err).Msg("LoadDoc failed")
+			return
+		}
+		defer doc.Close()
+		update, err := doc.ApplyTextDiff(newText, originKind)
+		if err != nil {
+			log.Warn().Err(err).Msg("cold ApplyTextDiff failed")
+			return
+		}
+		if len(update) == 0 {
+			return
+		}
+		if err := crdtReg.PersistChange(ctx, v.ID, n.ID, update, uuid.Nil, originKind, doc); err != nil {
+			log.Warn().Err(err).Msg("PersistChange failed")
+		}
+		// Bump updated_at so list/search reflects the external edit.
+		// We don't audit fs-watcher writes for now — the action is
+		// attributed to the underlying user via their OS audit; future
+		// slice could surface them via a "system" actor.
+		updated := n
+		updated.UpdatedAt = time.Now().UTC()
+		_ = noteStore.Upsert(ctx, updated)
+	})
 }
 
 // ---------------------------------------------------------- middleware ------

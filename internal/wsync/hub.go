@@ -208,10 +208,29 @@ func (r *Room) Doc() *crdt.Doc {
 	return r.doc
 }
 
+// OriginFSWatcher is the origin_kind tag for updates originating from
+// the external filesystem watcher. Distinct from OriginLive so the
+// audit log shows "user edited via Finder/$EDITOR" separately from
+// "user edited via web client".
+const OriginFSWatcher = "fs-watcher"
+
 // ApplyAndBroadcast applies update to the room's doc, persists it via
 // the CRDT registry, and fans it out to every subscriber except origin.
 // originUser is the user id recorded in note_yjs_updates.origin_user_id.
 func (r *Room) ApplyAndBroadcast(update []byte, origin *Subscriber, originUser uuid.UUID) error {
+	return r.applyAndBroadcastWithOrigin(update, origin, originUser, OriginLive)
+}
+
+// ApplyAndBroadcastFromFS applies an externally-sourced update (the FS
+// watcher having read a file edited outside the app), persists it
+// tagged "fs-watcher", and broadcasts to ALL subscribers — there is no
+// connection to suppress because the change did not originate from
+// the WS transport.
+func (r *Room) ApplyAndBroadcastFromFS(update []byte) error {
+	return r.applyAndBroadcastWithOrigin(update, nil, uuid.Nil, OriginFSWatcher)
+}
+
+func (r *Room) applyAndBroadcastWithOrigin(update []byte, origin *Subscriber, originUser uuid.UUID, originKind string) error {
 	if r.evicted.Load() {
 		return fmt.Errorf("wsync: room evicted")
 	}
@@ -221,7 +240,7 @@ func (r *Room) ApplyAndBroadcast(update []byte, origin *Subscriber, originUser u
 	// Persist before broadcasting so a crash between the two doesn't
 	// leave subscribers with state the server then loses.
 	if err := r.hub.registry.PersistChange(
-		r.persistCtx, r.vaultID, r.noteID, update, originUser, OriginLive, r.doc,
+		r.persistCtx, r.vaultID, r.noteID, update, originUser, originKind, r.doc,
 	); err != nil {
 		return err
 	}
@@ -309,4 +328,15 @@ func (h *Hub) NewSubscriber(userID uuid.UUID) *Subscriber {
 		Out:    make(chan []byte, h.sendBuf),
 		Done:   make(chan struct{}),
 	}
+}
+
+// RoomIfActive returns the live Room for (vaultID, noteID) without
+// creating one. Used by the FS watcher to broadcast external edits to
+// any currently-connected subscribers; if there are none, the watcher
+// applies and persists through the registry directly without touching
+// the WS layer.
+func (h *Hub) RoomIfActive(vaultID uuid.UUID, noteID string) *Room {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.rooms[roomKey(vaultID, noteID)]
 }

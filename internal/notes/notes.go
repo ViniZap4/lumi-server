@@ -50,6 +50,19 @@ type VaultLookup interface {
 
 // ---- Service ---------------------------------------------------------------
 
+// FSEventSilencer is the seam that lets the FS watcher know "we're
+// about to write this path ourselves, please drop the inotify echo".
+// Pass a no-op (or nil) when the watcher is disabled.
+type FSEventSilencer interface {
+	SkipNext(absPath string)
+}
+
+// nopSilencer is the default when no watcher is wired. Keeps the
+// Service callers branchless.
+type nopSilencer struct{}
+
+func (nopSilencer) SkipNext(string) {}
+
 // Service orchestrates Postgres metadata, on-disk markdown bodies, the
 // CRDT shadow, and audit recording. Methods are non-transactional in
 // Phase 2.1/2.2; FS errors after a pg row write are best-effort rolled
@@ -65,6 +78,7 @@ type Service struct {
 	audit    audit.Recorder
 	resolver capguard.Resolver
 	crdt     *crdt.Registry
+	silencer FSEventSilencer
 	now      func() time.Time
 }
 
@@ -75,12 +89,16 @@ func NewService(
 	a audit.Recorder,
 	resolver capguard.Resolver,
 	crdtReg *crdt.Registry,
+	silencer FSEventSilencer,
 ) *Service {
 	if notes == nil || vaults == nil || fsMgr == nil || resolver == nil {
 		panic("notes.NewService: missing dependency")
 	}
 	if a == nil {
 		a = audit.Noop{}
+	}
+	if silencer == nil {
+		silencer = nopSilencer{}
 	}
 	return &Service{
 		notes:    notes,
@@ -89,7 +107,17 @@ func NewService(
 		audit:    a,
 		resolver: resolver,
 		crdt:     crdtReg,
+		silencer: silencer,
 		now:      time.Now,
+	}
+}
+
+// suppressFSEvent computes the absolute on-disk path for (slug, rel)
+// and registers it in the watcher's skip map. Cheap; safe to call
+// before every fs.Manager write.
+func (s *Service) suppressFSEvent(slug, rel string) {
+	if abs, err := s.fs.NotePath(slug, rel); err == nil {
+		s.silencer.SkipNext(abs)
 	}
 }
 
@@ -172,6 +200,7 @@ func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput)
 	if len(in.Tags) > 0 {
 		front["tags"] = in.Tags
 	}
+	s.suppressFSEvent(v.Slug, relPath)
 	if err := s.fs.WriteNote(v.Slug, relPath, front, []byte(in.Body)); err != nil {
 		return domain.Note{}, fmt.Errorf("write note: %w", err)
 	}
@@ -283,6 +312,10 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 			} else if !errors.Is(err, domain.ErrNotFound) {
 				return domain.Note{}, err
 			}
+			// A move fires events on BOTH the source (Rename) and the
+			// destination (Create); silence both.
+			s.suppressFSEvent(v.Slug, n.Path)
+			s.suppressFSEvent(v.Slug, cleaned)
 			if err := s.fs.MoveNote(v.Slug, n.Path, cleaned); err != nil {
 				return domain.Note{}, err
 			}
@@ -325,6 +358,7 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 		if _, ok := front["id"]; !ok {
 			front["id"] = id
 		}
+		s.suppressFSEvent(v.Slug, newPath)
 		if err := s.fs.WriteNote(v.Slug, newPath, front, body); err != nil {
 			return domain.Note{}, err
 		}
@@ -401,6 +435,7 @@ func (s *Service) Delete(ctx context.Context, vaultID uuid.UUID, id string, acto
 	if err := s.notes.Delete(ctx, vaultID, id); err != nil {
 		return err
 	}
+	s.suppressFSEvent(v.Slug, n.Path)
 	if err := s.fs.DeleteNote(v.Slug, n.Path); err != nil && !errors.Is(err, domain.ErrNotFound) {
 		// pg row is already gone; surface but don't fail the request.
 		s.recordAudit(ctx, actor, vaultID, domain.ActionNoteDelete, ip, ua, map[string]any{
@@ -531,6 +566,7 @@ func (s *Service) ApplyDiff(
 	if _, ok := front["id"]; !ok {
 		front["id"] = id
 	}
+	s.suppressFSEvent(v.Slug, n.Path)
 	if err := s.fs.WriteNote(v.Slug, n.Path, front, []byte(mergedText)); err != nil {
 		return SnapshotResult{}, fmt.Errorf("crdt + fs mirror: write note: %w", err)
 	}
