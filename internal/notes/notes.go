@@ -3,13 +3,15 @@
 // <root>/<vault-slug>/<note-id>.md as markdown with YAML frontmatter;
 // Postgres stores only path/title/timestamps for cheap list/search.
 //
-// CRDT live-collab (Yjs sync, snapshot/diff endpoints) is Phase 2.2; this
-// file ships the pure-REST CRUD surface only so apple-client and tui-client
-// v2 can browse, create, edit and delete notes against a v2 server.
+// Phase 2.2 adds the CRDT shadow: every body change also runs through a
+// yrs document so concurrent writers can be merged. The filesystem
+// remains the source of truth for what's on disk; the CRDT is the
+// operational projection.
 package notes
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +26,7 @@ import (
 
 	"github.com/ViniZap4/lumi-server/internal/audit"
 	"github.com/ViniZap4/lumi-server/internal/capguard"
+	"github.com/ViniZap4/lumi-server/internal/crdt"
 	"github.com/ViniZap4/lumi-server/internal/domain"
 	"github.com/ViniZap4/lumi-server/internal/storage/fs"
 )
@@ -47,16 +50,21 @@ type VaultLookup interface {
 
 // ---- Service ---------------------------------------------------------------
 
-// Service orchestrates Postgres metadata, on-disk markdown bodies, and audit
-// recording. Methods are non-transactional in Phase 2.1; FS errors after a
-// pg row write are best-effort rolled back. SPEC tightens transactional
-// guarantees in Phase 3.
+// Service orchestrates Postgres metadata, on-disk markdown bodies, the
+// CRDT shadow, and audit recording. Methods are non-transactional in
+// Phase 2.1/2.2; FS errors after a pg row write are best-effort rolled
+// back. SPEC tightens transactional guarantees in Phase 3.
+//
+// The CRDT registry is optional: when nil, the snapshot/diff endpoints
+// return 503 but the rest of the surface keeps working. This lets the
+// server boot in environments without libyrs (smoke tests, fallback).
 type Service struct {
 	notes    NoteRepo
 	vaults   VaultLookup
 	fs       *fs.Manager
 	audit    audit.Recorder
 	resolver capguard.Resolver
+	crdt     *crdt.Registry
 	now      func() time.Time
 }
 
@@ -66,6 +74,7 @@ func NewService(
 	fsMgr *fs.Manager,
 	a audit.Recorder,
 	resolver capguard.Resolver,
+	crdtReg *crdt.Registry,
 ) *Service {
 	if notes == nil || vaults == nil || fsMgr == nil || resolver == nil {
 		panic("notes.NewService: missing dependency")
@@ -79,6 +88,7 @@ func NewService(
 		fs:       fsMgr,
 		audit:    a,
 		resolver: resolver,
+		crdt:     crdtReg,
 		now:      time.Now,
 	}
 }
@@ -178,6 +188,14 @@ func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput)
 		// Roll back the on-disk file so we don't leave orphans.
 		_ = s.fs.DeleteNote(v.Slug, relPath)
 		return domain.Note{}, err
+	}
+
+	// Seed the CRDT shadow so future /diff and /snapshot calls have a
+	// base state. Best-effort: a CRDT init failure does NOT fail the
+	// create — the FS+pg side is already committed and the registry can
+	// lazily fill in on the next write.
+	if s.crdt != nil {
+		_ = s.crdt.InitFromText(ctx, vaultID, id, in.Body, in.Actor, "snapshot-init")
 	}
 
 	s.recordAudit(ctx, in.Actor, vaultID, domain.ActionNoteCreate, in.IP, in.UA, map[string]any{
@@ -310,6 +328,14 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 		if err := s.fs.WriteNote(v.Slug, newPath, front, body); err != nil {
 			return domain.Note{}, err
 		}
+		// Mirror body edits into the CRDT log so /snapshot and /diff
+		// remain in sync with FS. Best-effort: a CRDT failure here
+		// doesn't roll back the FS write — the note is still readable
+		// via /content, and slice 2.4 (fsnotify watcher) will close
+		// the gap.
+		if in.Body != nil && s.crdt != nil {
+			_ = s.applyBodyToCRDT(ctx, vaultID, id, *in.Body, in.Actor, "web-patch")
+		}
 	}
 
 	updated := domain.Note{
@@ -391,6 +417,175 @@ func (s *Service) Delete(ctx context.Context, vaultID uuid.UUID, id string, acto
 	return nil
 }
 
+// ---- CRDT snapshot + diff --------------------------------------------------
+
+// errCRDTUnavailable is returned by GetSnapshot/ApplyDiff when the
+// service was constructed without a CRDT registry (libyrs not linked or
+// intentionally disabled).
+var errCRDTUnavailable = fmt.Errorf("%w: crdt not available", domain.ErrValidation)
+
+// SnapshotResult is the wire shape of GET /snapshot — text + opaque
+// state vector (lib0 v1). The handler base64-encodes the vector.
+type SnapshotResult struct {
+	NoteID      string
+	Path        string
+	Text        string
+	VectorClock []byte
+}
+
+// GetSnapshot loads the CRDT doc for the note and returns the current
+// merged text + its state vector. The on-disk file is NOT consulted —
+// the CRDT is the canonical "what would two concurrent writers see?"
+// answer for slice 2.2.
+func (s *Service) GetSnapshot(ctx context.Context, vaultID uuid.UUID, id string) (SnapshotResult, error) {
+	if s.crdt == nil {
+		return SnapshotResult{}, errCRDTUnavailable
+	}
+	n, err := s.notes.Get(ctx, vaultID, id)
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+	doc, err := s.crdt.LoadDoc(ctx, vaultID, id)
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+	defer doc.Close()
+
+	text, err := doc.Text()
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+	sv, err := doc.StateVectorV1()
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+	return SnapshotResult{
+		NoteID:      n.ID,
+		Path:        n.Path,
+		Text:        text,
+		VectorClock: sv,
+	}, nil
+}
+
+// ApplyDiff is the TUI-style "I rewrote the whole body, merge it in"
+// path. The supplied newText is diffed against the CRDT's current text
+// and applied as a single (remove, insert) operation, preserving any
+// concurrent edits the caller did not see. baseClock is currently
+// advisory (slice 2.2 always merges against current state — slice 2.3
+// will use it for 3-way conflict signalling).
+//
+// On success, the resulting text is also written back to the on-disk
+// markdown file with the existing frontmatter so the FS view stays
+// consistent. originKind is recorded on the update row for audit.
+func (s *Service) ApplyDiff(
+	ctx context.Context,
+	vaultID uuid.UUID, id string,
+	newText string,
+	originKind string,
+	actor uuid.UUID, ip, ua string,
+) (SnapshotResult, error) {
+	if s.crdt == nil {
+		return SnapshotResult{}, errCRDTUnavailable
+	}
+	n, err := s.notes.Get(ctx, vaultID, id)
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+	v, err := s.vaults.GetByID(ctx, vaultID)
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+
+	doc, err := s.crdt.LoadDoc(ctx, vaultID, id)
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+	defer doc.Close()
+
+	update, err := doc.ApplyTextDiff(newText, originKind)
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+	if len(update) == 0 {
+		// No-op edit. Return the current snapshot for parity.
+		text, _ := doc.Text()
+		sv, _ := doc.StateVectorV1()
+		return SnapshotResult{NoteID: n.ID, Path: n.Path, Text: text, VectorClock: sv}, nil
+	}
+
+	if err := s.crdt.PersistChange(ctx, vaultID, id, update, actor, originKind, doc); err != nil {
+		return SnapshotResult{}, err
+	}
+
+	// Mirror to the on-disk markdown, preserving frontmatter.
+	front, _, err := s.fs.ReadNote(v.Slug, n.Path)
+	if err != nil {
+		// FS read failed but CRDT is updated — surface the error so the
+		// client knows the state diverged. They can retry by reading
+		// /content and re-PATCHing.
+		return SnapshotResult{}, fmt.Errorf("crdt + fs mirror: read note: %w", err)
+	}
+	mergedText, _ := doc.Text()
+	now := s.now().UTC()
+	front["updated_at"] = now.Format(time.RFC3339)
+	if _, ok := front["id"]; !ok {
+		front["id"] = id
+	}
+	if err := s.fs.WriteNote(v.Slug, n.Path, front, []byte(mergedText)); err != nil {
+		return SnapshotResult{}, fmt.Errorf("crdt + fs mirror: write note: %w", err)
+	}
+
+	updated := domain.Note{
+		ID:        id,
+		VaultID:   vaultID,
+		Path:      n.Path,
+		Title:     n.Title,
+		CreatedAt: n.CreatedAt,
+		UpdatedAt: now,
+	}
+	if err := s.notes.Upsert(ctx, updated); err != nil {
+		return SnapshotResult{}, err
+	}
+	s.recordAudit(ctx, actor, vaultID, domain.ActionNoteEdit, ip, ua, map[string]any{
+		"note_id": id,
+		"path":    n.Path,
+		"source":  originKind,
+		"bytes":   len(update),
+	})
+
+	sv, err := doc.StateVectorV1()
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+	return SnapshotResult{
+		NoteID:      id,
+		Path:        n.Path,
+		Text:        mergedText,
+		VectorClock: sv,
+	}, nil
+}
+
+// applyBodyToCRDT is the PATCH-body bridge: load doc, apply diff, persist.
+// Best-effort — caller treats CRDT errors as non-fatal.
+func (s *Service) applyBodyToCRDT(ctx context.Context, vaultID uuid.UUID, id string, newBody string, actor uuid.UUID, originKind string) error {
+	if s.crdt == nil {
+		return nil
+	}
+	doc, err := s.crdt.LoadDoc(ctx, vaultID, id)
+	if err != nil {
+		return err
+	}
+	defer doc.Close()
+	update, err := doc.ApplyTextDiff(newBody, originKind)
+	if err != nil {
+		return err
+	}
+	if len(update) == 0 {
+		return nil
+	}
+	return s.crdt.PersistChange(ctx, vaultID, id, update, actor, originKind, doc)
+}
+
 // ---- Audit -----------------------------------------------------------------
 
 func (s *Service) recordAudit(ctx context.Context, userID, vaultID uuid.UUID, action, ip, ua string, payload map[string]any) {
@@ -463,6 +658,15 @@ func (h *Handlers) Register(r fiber.Router) {
 	r.Delete("/vaults/:vault/notes/:id",
 		capguard.RequireCapability(resolver, domain.CapNoteDelete),
 		h.delete,
+	)
+	// CRDT TUI-style snapshot + diff sync — see SPEC.md "CRDT integration".
+	r.Get("/vaults/:vault/notes/:id/snapshot",
+		capguard.RequireCapability(resolver, domain.CapNoteRead),
+		h.getSnapshot,
+	)
+	r.Post("/vaults/:vault/notes/:id/diff",
+		capguard.RequireCapability(resolver, domain.CapNoteEdit),
+		h.applyDiff,
 	)
 }
 
@@ -686,6 +890,82 @@ func (h *Handlers) delete(c *fiber.Ctx) error {
 		return mapErr(c, err)
 	}
 	return c.SendStatus(http.StatusNoContent)
+}
+
+// getSnapshot — GET /api/vaults/:vault/notes/:id/snapshot
+//
+// Returns { id, path, text, vector_clock } where vector_clock is the
+// base64-encoded lib0-v1 state vector. Clients use vector_clock as the
+// "base" when later POSTing /diff — though slice 2.2 treats it as
+// advisory only.
+func (h *Handlers) getSnapshot(c *fiber.Ctx) error {
+	vaultID, err := capguard.WithVaultID(c)
+	if err != nil {
+		return nil
+	}
+	id, err := noteIDParam(c)
+	if err != nil {
+		return nil
+	}
+	r, err := h.svc.GetSnapshot(c.UserContext(), vaultID, id)
+	if err != nil {
+		if errors.Is(err, errCRDTUnavailable) {
+			return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "crdt_unavailable"})
+		}
+		return mapErr(c, err)
+	}
+	return c.JSON(fiber.Map{
+		"id":           r.NoteID,
+		"path":         r.Path,
+		"text":         r.Text,
+		"vector_clock": base64.StdEncoding.EncodeToString(r.VectorClock),
+	})
+}
+
+type diffReq struct {
+	// BaseClock is base64-encoded; advisory in slice 2.2.
+	BaseClock string `json:"base_clock,omitempty"`
+	// Text is the full new body the caller wants to commit. The server
+	// computes the minimal (remove, insert) operation against the
+	// CRDT's current state, preserving any concurrent edits.
+	Text string `json:"text"`
+	// Origin labels the source ("tui-diff", "web", etc). Defaults to
+	// "tui-diff" — the canonical case for this endpoint.
+	Origin string `json:"origin,omitempty"`
+}
+
+// applyDiff — POST /api/vaults/:vault/notes/:id/diff
+func (h *Handlers) applyDiff(c *fiber.Ctx) error {
+	vaultID, err := capguard.WithVaultID(c)
+	if err != nil {
+		return nil
+	}
+	id, err := noteIDParam(c)
+	if err != nil {
+		return nil
+	}
+	var req diffReq
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid_body"})
+	}
+	origin := strings.TrimSpace(req.Origin)
+	if origin == "" {
+		origin = "tui-diff"
+	}
+	uid, _ := capguard.UserIDFrom(c)
+	r, err := h.svc.ApplyDiff(c.UserContext(), vaultID, id, req.Text, origin, uid, c.IP(), string(c.Request().Header.UserAgent()))
+	if err != nil {
+		if errors.Is(err, errCRDTUnavailable) {
+			return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "crdt_unavailable"})
+		}
+		return mapErr(c, err)
+	}
+	return c.JSON(fiber.Map{
+		"id":           r.NoteID,
+		"path":         r.Path,
+		"text":         r.Text,
+		"vector_clock": base64.StdEncoding.EncodeToString(r.VectorClock),
+	})
 }
 
 // yamlToJSON walks a value tree produced by gopkg.in/yaml.v3's Unmarshal

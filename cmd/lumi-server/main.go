@@ -33,6 +33,7 @@ import (
 
 	"github.com/ViniZap4/lumi-server/internal/audit"
 	"github.com/ViniZap4/lumi-server/internal/auth"
+	"github.com/ViniZap4/lumi-server/internal/crdt"
 	"github.com/ViniZap4/lumi-server/internal/domain"
 	"github.com/ViniZap4/lumi-server/internal/invites"
 	"github.com/ViniZap4/lumi-server/internal/members"
@@ -54,6 +55,32 @@ type authUserRepoAdapter struct{ *pg.UserStore }
 
 func (a authUserRepoAdapter) CreateUser(ctx context.Context, in auth.CreateUserInput) (domain.User, error) {
 	return a.UserStore.CreateUser(ctx, pg.CreateUserInput(in))
+}
+
+// crdtRepoAdapter bridges pg.NoteYjsStore to crdt.SnapshotRepo. The pg
+// store returns its own DTO shapes; the crdt registry takes a smaller
+// row type. Conversion is trivial; this adapter keeps the storage and
+// crdt packages from cross-importing each other's types.
+type crdtRepoAdapter struct{ *pg.NoteYjsStore }
+
+func (a crdtRepoAdapter) GetSnapshot(ctx context.Context, vaultID uuid.UUID, noteID string) (crdt.SnapshotRow, error) {
+	row, err := a.NoteYjsStore.GetSnapshot(ctx, vaultID, noteID)
+	if err != nil {
+		return crdt.SnapshotRow{}, err
+	}
+	return crdt.SnapshotRow{State: row.State}, nil
+}
+
+func (a crdtRepoAdapter) ListUpdatesSince(ctx context.Context, vaultID uuid.UUID, noteID string, sinceID int64, limit int) ([]crdt.UpdateRow, error) {
+	rows, err := a.NoteYjsStore.ListUpdatesSince(ctx, vaultID, noteID, sinceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]crdt.UpdateRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, crdt.UpdateRow{ID: r.ID, Update: r.Update, OriginKind: r.OriginKind})
+	}
+	return out, nil
 }
 
 // memberRepoAdapter bridges pg.MemberStore to members.Repo. Same reason.
@@ -369,6 +396,8 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	memberStore := pg.NewMemberStore(pool)
 	inviteStore := pg.NewInviteStore(pool)
 	noteStore := pg.NewNoteStore(pool)
+	noteYjsStore := pg.NewNoteYjsStore(pool)
+	crdtRegistry := crdt.NewRegistry(crdtRepoAdapter{noteYjsStore})
 
 	// Auth service.
 	authCfg := auth.Config{
@@ -398,7 +427,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	membersSvc := members.NewService(memberRepoAdapter{memberStore}, auditStore)
 	vaultsSvc := vaults.NewService(vaultStore, roleStore, memberStore, fsMgr, auditStore, membersSvc)
 	usersSvc := users.NewService(userStore, consentStore, auditStore, auditStore, vaultStore)
-	notesSvc := notes.NewService(noteStore, vaultStore, fsMgr, auditStore, membersSvc)
+	notesSvc := notes.NewService(noteStore, vaultStore, fsMgr, auditStore, membersSvc, crdtRegistry)
 	invitesSvc := invites.NewService(invites.Deps{
 		Repo:          inviteStore,
 		Users:         userStore,

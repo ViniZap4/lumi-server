@@ -3,6 +3,16 @@
 /lumi-server
 /dist/
 
+# Native CRDT lib (yrs) — built from vendor/y-crdt, copied here by `make libyrs`.
+/internal/crdt/lib/
+/internal/crdt/include/
+
+# Sandbox-only cargo cache override (see Makefile / docs).
+/.cargo-cache/
+
+# Rust build artefacts under the vendored y-crdt submodule.
+/third_party/y-crdt/target/
+
 # Local env
 .env
 .env.local
