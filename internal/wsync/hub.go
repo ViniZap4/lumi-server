@@ -22,6 +22,11 @@ const DefaultIdleTTL = 5 * time.Minute
 // clients that block longer than this many queued messages are dropped.
 const DefaultSendBuffer = 256
 
+// DefaultMaxUserConnections is the per-user concurrent WS cap. Past
+// this, TryAcquireUserSlot returns false and the upgrade handler
+// closes with a "policy violation" code.
+const DefaultMaxUserConnections = 10
+
 // Origin labels recorded in note_yjs_updates.origin_kind when an
 // update arrives over this transport.
 const OriginLive = "web"
@@ -62,7 +67,9 @@ func (s *Subscriber) CloseSubscriber() {
 }
 
 // Hub indexes rooms by (vault_id, note_id) so multiple clients viewing
-// the same note share a single in-memory doc.
+// the same note share a single in-memory doc. Also tracks per-user
+// concurrent connection counts so a single user cannot exhaust server
+// goroutines or memory by opening thousands of WS sessions.
 type Hub struct {
 	registry *crdt.Registry
 
@@ -73,6 +80,10 @@ type Hub struct {
 	rootCtx  context.Context
 	rootCxl  context.CancelFunc
 	closed   atomic.Bool
+
+	slotsMu      sync.Mutex
+	userSlots    map[uuid.UUID]int
+	maxUserSlots int
 }
 
 // HubOption configures Hub at construction.
@@ -88,6 +99,13 @@ func WithSendBuffer(n int) HubOption {
 	return func(h *Hub) { h.sendBuf = n }
 }
 
+// WithMaxUserConnections overrides the default per-user WS connection
+// cap. Use 0 to disable the cap entirely (not recommended in
+// production).
+func WithMaxUserConnections(n int) HubOption {
+	return func(h *Hub) { h.maxUserSlots = n }
+}
+
 // NewHub constructs a Hub backed by the supplied CRDT registry.
 func NewHub(registry *crdt.Registry, opts ...HubOption) *Hub {
 	if registry == nil {
@@ -95,12 +113,14 @@ func NewHub(registry *crdt.Registry, opts ...HubOption) *Hub {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &Hub{
-		registry: registry,
-		rooms:    make(map[string]*Room),
-		idleTTL:  DefaultIdleTTL,
-		sendBuf:  DefaultSendBuffer,
-		rootCtx:  ctx,
-		rootCxl:  cancel,
+		registry:     registry,
+		rooms:        make(map[string]*Room),
+		idleTTL:      DefaultIdleTTL,
+		sendBuf:      DefaultSendBuffer,
+		rootCtx:      ctx,
+		rootCxl:      cancel,
+		userSlots:    make(map[uuid.UUID]int),
+		maxUserSlots: DefaultMaxUserConnections,
 	}
 	for _, o := range opts {
 		o(h)
@@ -339,4 +359,50 @@ func (h *Hub) RoomIfActive(vaultID uuid.UUID, noteID string) *Room {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.rooms[roomKey(vaultID, noteID)]
+}
+
+// TryAcquireUserSlot atomically checks the per-user WS cap and
+// increments the counter on success. Returns false if the cap is
+// already reached. Pair every successful call with ReleaseUserSlot.
+//
+// A zero uuid (anonymous) is allowed without limit — auth gates run
+// before this so anonymous WS arrivals are already rejected; if a
+// caller forgets to thread the user id we'd rather not deny the
+// connection on a missing-userID bug.
+func (h *Hub) TryAcquireUserSlot(userID uuid.UUID) bool {
+	if h.maxUserSlots <= 0 || userID == uuid.Nil {
+		return true
+	}
+	h.slotsMu.Lock()
+	defer h.slotsMu.Unlock()
+	cur := h.userSlots[userID]
+	if cur >= h.maxUserSlots {
+		return false
+	}
+	h.userSlots[userID] = cur + 1
+	return true
+}
+
+// ReleaseUserSlot decrements the per-user counter. Never goes
+// negative; calling on a user with no recorded slot is a no-op.
+func (h *Hub) ReleaseUserSlot(userID uuid.UUID) {
+	if userID == uuid.Nil {
+		return
+	}
+	h.slotsMu.Lock()
+	defer h.slotsMu.Unlock()
+	cur := h.userSlots[userID]
+	if cur <= 1 {
+		delete(h.userSlots, userID)
+		return
+	}
+	h.userSlots[userID] = cur - 1
+}
+
+// UserConnections returns the current count for userID. Intended for
+// telemetry / tests; never returns a negative number.
+func (h *Hub) UserConnections(userID uuid.UUID) int {
+	h.slotsMu.Lock()
+	defer h.slotsMu.Unlock()
+	return h.userSlots[userID]
 }

@@ -503,7 +503,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	members.NewHandlers(membersSvc, membersSvc).Register(authed)
 	audit.NewHandlers(auditStore, membersSvc).Register(authed)
 	notes.NewHandlers(notesSvc).Register(authed)
-	wsync.NewHandler(wsHub, membersSvc).Register(authed)
+	wsync.NewHandler(wsHub, membersSvc, cfg.allowedOrigins).Register(authed)
 
 	// Invites: split between vault-scoped (authed) and public.
 	invites.NewHandlers(invitesSvc).Register(app, authed, membersSvc)

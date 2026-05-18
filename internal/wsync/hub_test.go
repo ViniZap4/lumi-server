@@ -226,6 +226,68 @@ func TestRoomEvictsAfterIdle(t *testing.T) {
 	}
 }
 
+func TestUserSlotCapEnforced(t *testing.T) {
+	repo := newMemRepo()
+	reg := crdt.NewRegistry(repo)
+	hub := NewHub(reg, WithMaxUserConnections(3))
+	defer hub.Close()
+
+	user := uuid.New()
+	for i := 0; i < 3; i++ {
+		if !hub.TryAcquireUserSlot(user) {
+			t.Fatalf("acquire %d rejected unexpectedly", i)
+		}
+	}
+	if hub.TryAcquireUserSlot(user) {
+		t.Fatalf("acquire #4 should have been refused")
+	}
+	if got := hub.UserConnections(user); got != 3 {
+		t.Fatalf("UserConnections = %d, want 3", got)
+	}
+	hub.ReleaseUserSlot(user)
+	if !hub.TryAcquireUserSlot(user) {
+		t.Fatalf("acquire after release should succeed")
+	}
+}
+
+func TestUserSlotZeroUUIDBypass(t *testing.T) {
+	repo := newMemRepo()
+	reg := crdt.NewRegistry(repo)
+	hub := NewHub(reg, WithMaxUserConnections(1))
+	defer hub.Close()
+
+	// Nil uuid means "auth didn't thread a user id"; we bypass the
+	// cap rather than misclassify legitimate-but-unidentified callers
+	// (the auth gate runs upstream and would have rejected an
+	// anonymous request before reaching us).
+	for i := 0; i < 100; i++ {
+		if !hub.TryAcquireUserSlot(uuid.Nil) {
+			t.Fatalf("nil uuid acquire %d rejected", i)
+		}
+	}
+	if got := hub.UserConnections(uuid.Nil); got != 0 {
+		t.Fatalf("UserConnections for nil = %d, want 0 (not counted)", got)
+	}
+}
+
+func TestUserSlotIsolatedPerUser(t *testing.T) {
+	repo := newMemRepo()
+	reg := crdt.NewRegistry(repo)
+	hub := NewHub(reg, WithMaxUserConnections(2))
+	defer hub.Close()
+
+	a := uuid.New()
+	b := uuid.New()
+	hub.TryAcquireUserSlot(a)
+	hub.TryAcquireUserSlot(a)
+	if hub.TryAcquireUserSlot(a) {
+		t.Fatalf("user A should be at cap")
+	}
+	if !hub.TryAcquireUserSlot(b) {
+		t.Fatalf("user B has its own quota")
+	}
+}
+
 func TestRoomAwarenessRelay(t *testing.T) {
 	repo := newMemRepo()
 	reg := crdt.NewRegistry(repo)
