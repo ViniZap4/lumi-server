@@ -170,6 +170,19 @@ func (h *Handler) handleConn(c *websocket.Conn) {
 		}
 	}()
 
+	// Shutdown propagation: when the subscriber's Done channel is
+	// closed (either because Leave was called or because the hub is
+	// tearing down via evict→CloseSubscriber), force the connection
+	// shut. Without this the reader loop below stays blocked on
+	// c.ReadMessage forever — leaking a goroutine per never-disconnecting
+	// client across a server shutdown.
+	closerDone := make(chan struct{})
+	go func() {
+		defer close(closerDone)
+		<-sub.Done
+		_ = c.Close()
+	}()
+
 	// Reader loop.
 	_ = c.SetReadDeadline(time.Now().Add(pongTimeout))
 	c.SetPongHandler(func(string) error {
@@ -196,9 +209,10 @@ func (h *Handler) handleConn(c *websocket.Conn) {
 		h.handleMessage(room, sub, userID, msg)
 	}
 
-	// Read loop exited — tear down the writer pump.
+	// Read loop exited — tear down the writer + closer pumps.
 	sub.CloseSubscriber()
 	<-writerDone
+	<-closerDone
 }
 
 func (h *Handler) handleMessage(room *Room, sub *Subscriber, userID uuid.UUID, msg ParsedMessage) {

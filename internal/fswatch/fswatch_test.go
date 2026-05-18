@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -211,6 +212,58 @@ func TestNewVaultDirAutoWatched(t *testing.T) {
 	}
 	if ev.VaultSlug != "freshvault" {
 		t.Fatalf("slug = %q", ev.VaultSlug)
+	}
+}
+
+func TestManagerCloseIdempotent(t *testing.T) {
+	mgr, _, _, _, teardown := newTestManager(t, WithDebounce(20*time.Millisecond))
+	teardown() // first close via teardown
+	// Idempotent: a second Close must not panic or return an error.
+	if err := mgr.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestManagerCloseStopsRunLoop(t *testing.T) {
+	mgr, _, _, _, _ := newTestManager(t, WithDebounce(20*time.Millisecond))
+
+	// Close should make Run() return promptly. We call Run() directly
+	// to assert it exits, rather than relying on the teardown helper.
+	done := make(chan struct{})
+	go func() {
+		mgr.Run(context.Background())
+		close(done)
+	}()
+	_ = mgr.Close()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("Run did not exit after Close")
+	}
+}
+
+func TestManagerNoGoroutineLeakOnRapidCycles(t *testing.T) {
+	before := runtime.NumGoroutine()
+
+	for i := 0; i < 5; i++ {
+		_, _, root, _, teardown := newTestManager(t, WithDebounce(20*time.Millisecond))
+
+		// Trigger an event that schedules a debounce timer; Close
+		// must cancel pending timers without leaking the goroutine
+		// that AfterFunc would have spawned at fire time.
+		_ = os.WriteFile(filepath.Join(root, "vault", "x.md"), []byte("y"), 0o644)
+		teardown()
+	}
+
+	for i := 0; i < 20; i++ {
+		if runtime.NumGoroutine() <= before+2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	after := runtime.NumGoroutine()
+	if after > before+2 {
+		t.Fatalf("goroutine leak: before=%d after=%d", before, after)
 	}
 }
 

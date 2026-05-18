@@ -182,6 +182,12 @@ func New(root string, fsMgr *fs.Manager, handler Handler, log zerolog.Logger, op
 
 // Close stops the watcher and cancels any pending debounce timers.
 // Idempotent. Returns the watcher's close error if it had one.
+//
+// Ordering note: the closed flag is set BEFORE we touch the debounce
+// map so any concurrent dispatch (an event Run had already pulled
+// from watcher.Events before noticing rootCtx.Done) sees closed=true
+// and returns without writing to the map. Stopped timers stay in
+// place — they're garbage-collected when the Manager is.
 func (m *Manager) Close() error {
 	if !m.closed.CompareAndSwap(false, true) {
 		return nil
@@ -192,7 +198,8 @@ func (m *Manager) Close() error {
 	for _, t := range m.debounce {
 		t.Stop()
 	}
-	m.debounce = nil
+	// Intentionally do NOT nil the map — see dispatch() for the race
+	// rationale. A nil read is fine; a nil write panics.
 	m.debounceMu.Unlock()
 
 	return m.watcher.Close()
@@ -339,6 +346,13 @@ func (m *Manager) expireSuppress() {
 
 // dispatch is the per-event filter and debouncer.
 func (m *Manager) dispatch(ev fsnotify.Event) {
+	// Close → Run-loop-exit is a small race: Close cancels rootCtx
+	// and nils the debounce map, but Run's select may already have
+	// pulled an event from watcher.Events in the same tick. Skip
+	// once closed so we don't write to a nil map.
+	if m.closed.Load() {
+		return
+	}
 	// Directory create: watch it + reconcile.
 	if ev.Op.Has(fsnotify.Create) {
 		if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {

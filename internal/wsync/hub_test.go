@@ -3,6 +3,7 @@ package wsync
 import (
 	"bytes"
 	"context"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -197,6 +198,81 @@ func TestRoomBroadcastsToOthers(t *testing.T) {
 	rows, _ := repo.ListUpdatesSince(context.Background(), vault, note, 0, 0)
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 persisted update, got %d", len(rows))
+	}
+}
+
+func TestHubCloseSignalsSubscribers(t *testing.T) {
+	repo := newMemRepo()
+	reg := crdt.NewRegistry(repo)
+	hub := NewHub(reg)
+
+	vault := uuid.New()
+	subs := make([]*Subscriber, 0, 5)
+	for i := 0; i < 5; i++ {
+		s := hub.NewSubscriber(uuid.New())
+		if _, err := hub.Join(context.Background(), vault, "n", s); err != nil {
+			t.Fatalf("Join %d: %v", i, err)
+		}
+		subs = append(subs, s)
+	}
+
+	hub.Close()
+
+	// Every subscriber's Done channel must be closed within a small
+	// window; this is what allows handleConn's closer-pump to exit.
+	for i, s := range subs {
+		select {
+		case <-s.Done:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("sub %d Done not closed after Hub.Close", i)
+		}
+	}
+}
+
+func TestHubCloseIdempotent(t *testing.T) {
+	repo := newMemRepo()
+	reg := crdt.NewRegistry(repo)
+	hub := NewHub(reg)
+	hub.Close()
+	// Second Close must not panic / double-evict.
+	hub.Close()
+}
+
+func TestHubNoGoroutineLeakAfterClose(t *testing.T) {
+	// Capture baseline AFTER warm-up so we ignore the test runner's
+	// own goroutines.
+	before := runtime.NumGoroutine()
+
+	for cycle := 0; cycle < 3; cycle++ {
+		repo := newMemRepo()
+		reg := crdt.NewRegistry(repo)
+		hub := NewHub(reg, WithIdleTTL(20*time.Millisecond))
+
+		// Spawn rooms + subs to exercise the goroutine surface
+		// (time.AfterFunc idle timers in particular).
+		vault := uuid.New()
+		for i := 0; i < 10; i++ {
+			s := hub.NewSubscriber(uuid.New())
+			room, err := hub.Join(context.Background(), vault, "n"+string(rune('0'+i)), s)
+			if err != nil {
+				t.Fatalf("Join: %v", err)
+			}
+			// Cause one of them to schedule an idle timer.
+			hub.Leave(room, s)
+		}
+		hub.Close()
+	}
+
+	// Allow finalizers + system goroutines to settle.
+	for i := 0; i < 20; i++ {
+		if runtime.NumGoroutine() <= before+2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	after := runtime.NumGoroutine()
+	if after > before+2 {
+		t.Fatalf("goroutine leak: before=%d after=%d", before, after)
 	}
 }
 
