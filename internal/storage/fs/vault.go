@@ -72,6 +72,16 @@ func NewManager(root string) (*Manager, error) {
 		}
 		root = abs
 	}
+	root = filepath.Clean(root)
+	// Resolve symlinks in the root path. SafeJoin compares its
+	// EvalSymlinks-resolved leaf against the stored root; if the
+	// stored root still contains a symlink (e.g. macOS `/tmp` →
+	// `/private/tmp`), the equality checks in callers like
+	// RemoveVaultDir would fail silently and a malformed slug could
+	// fall through to os.RemoveAll on the wrong directory.
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
 	return &Manager{Root: filepath.Clean(root)}, nil
 }
 
