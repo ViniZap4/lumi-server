@@ -27,9 +27,22 @@ const DefaultSendBuffer = 256
 // closes with a "policy violation" code.
 const DefaultMaxUserConnections = 10
 
+// DefaultMirrorDebounce is the per-room delay between the last
+// CRDT update and the FS mirror write. Sized to coalesce a sustained
+// typing burst (each Yjs op arrives independently) into a single FS
+// write per ~500 ms while keeping the file freshness window short
+// enough for TUI / apple clients tailing the dir to feel responsive.
+const DefaultMirrorDebounce = 500 * time.Millisecond
+
 // Origin labels recorded in note_yjs_updates.origin_kind when an
 // update arrives over this transport.
 const OriginLive = "web"
+
+// FSMirrorFunc writes the current CRDT text back to the on-disk
+// markdown file. Wired in main.go to notes.Service.WriteBodyFromCRDT.
+// Nil means "no mirror" — useful for tests and for deployments that
+// do not yet have notes.Service in the dep graph.
+type FSMirrorFunc func(ctx context.Context, vaultID uuid.UUID, noteID, text string) error
 
 // Room is the per-note collaboration channel: it owns a single
 // *crdt.Doc, fans inbound updates out to subscribers, and persists
@@ -48,6 +61,9 @@ type Room struct {
 	idleTimer *time.Timer
 	idleMu    sync.Mutex
 	evicted   atomic.Bool
+
+	mirrorTimer *time.Timer
+	mirrorMu    sync.Mutex
 }
 
 // Subscriber represents a single WebSocket connection within a Room.
@@ -84,6 +100,10 @@ type Hub struct {
 	slotsMu      sync.Mutex
 	userSlots    map[uuid.UUID]int
 	maxUserSlots int
+
+	mirrorMu       sync.RWMutex
+	mirrorFn       FSMirrorFunc
+	mirrorDebounce time.Duration
 }
 
 // HubOption configures Hub at construction.
@@ -106,6 +126,25 @@ func WithMaxUserConnections(n int) HubOption {
 	return func(h *Hub) { h.maxUserSlots = n }
 }
 
+// WithFSMirror installs an FS-mirror callback at construction. Equivalent
+// to calling SetFSMirror right after NewHub.
+func WithFSMirror(fn FSMirrorFunc) HubOption {
+	return func(h *Hub) { h.mirrorFn = fn }
+}
+
+// WithMirrorDebounce overrides DefaultMirrorDebounce.
+func WithMirrorDebounce(d time.Duration) HubOption {
+	return func(h *Hub) { h.mirrorDebounce = d }
+}
+
+// SetFSMirror swaps the active FS-mirror callback. Safe at runtime;
+// nil disables mirroring.
+func (h *Hub) SetFSMirror(fn FSMirrorFunc) {
+	h.mirrorMu.Lock()
+	h.mirrorFn = fn
+	h.mirrorMu.Unlock()
+}
+
 // NewHub constructs a Hub backed by the supplied CRDT registry.
 func NewHub(registry *crdt.Registry, opts ...HubOption) *Hub {
 	if registry == nil {
@@ -113,14 +152,15 @@ func NewHub(registry *crdt.Registry, opts ...HubOption) *Hub {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &Hub{
-		registry:     registry,
-		rooms:        make(map[string]*Room),
-		idleTTL:      DefaultIdleTTL,
-		sendBuf:      DefaultSendBuffer,
-		rootCtx:      ctx,
-		rootCxl:      cancel,
-		userSlots:    make(map[uuid.UUID]int),
-		maxUserSlots: DefaultMaxUserConnections,
+		registry:       registry,
+		rooms:          make(map[string]*Room),
+		idleTTL:        DefaultIdleTTL,
+		sendBuf:        DefaultSendBuffer,
+		rootCtx:        ctx,
+		rootCxl:        cancel,
+		userSlots:      make(map[uuid.UUID]int),
+		maxUserSlots:   DefaultMaxUserConnections,
+		mirrorDebounce: DefaultMirrorDebounce,
 	}
 	for _, o := range opts {
 		o(h)
@@ -265,7 +305,50 @@ func (r *Room) applyAndBroadcastWithOrigin(update []byte, origin *Subscriber, or
 		return err
 	}
 	r.broadcast(EncodeSyncUpdate(update), origin)
+	// Schedule the FS mirror. We do NOT mirror FS-originated updates
+	// — the file is already the source for that change; mirroring
+	// would race the fswatch suppression window.
+	if originKind != OriginFSWatcher {
+		r.scheduleMirror()
+	}
 	return nil
+}
+
+// scheduleMirror starts (or resets) a per-room debounce timer. On
+// fire it reads the doc's current text and invokes the Hub's
+// FSMirror callback. The room's mutex keeps the timer single-shot
+// even under high-frequency update bursts.
+func (r *Room) scheduleMirror() {
+	if r.hub.mirrorDebounce <= 0 {
+		return
+	}
+	r.mirrorMu.Lock()
+	defer r.mirrorMu.Unlock()
+	if r.mirrorTimer != nil {
+		r.mirrorTimer.Stop()
+	}
+	r.mirrorTimer = time.AfterFunc(r.hub.mirrorDebounce, r.fireMirror)
+}
+
+func (r *Room) fireMirror() {
+	if r.evicted.Load() {
+		return
+	}
+	r.hub.mirrorMu.RLock()
+	fn := r.hub.mirrorFn
+	r.hub.mirrorMu.RUnlock()
+	if fn == nil {
+		return
+	}
+	text, err := r.doc.Text()
+	if err != nil {
+		return
+	}
+	// Use the hub's root context so the mirror call survives short-
+	// lived per-handler contexts. notes.Service's WriteBodyFromCRDT
+	// is quick (frontmatter parse + atomic write) so a stale ctx is
+	// fine.
+	_ = fn(r.hub.rootCtx, r.vaultID, r.noteID, text)
 }
 
 // BroadcastAwareness fans out an awareness blob to all subscribers
@@ -324,6 +407,15 @@ func (r *Room) evict() {
 	r.hub.mu.Lock()
 	delete(r.hub.rooms, roomKey(r.vaultID, r.noteID))
 	r.hub.mu.Unlock()
+
+	// Stop the FS mirror timer so we don't fire a stale mirror after
+	// the doc has been closed.
+	r.mirrorMu.Lock()
+	if r.mirrorTimer != nil {
+		r.mirrorTimer.Stop()
+		r.mirrorTimer = nil
+	}
+	r.mirrorMu.Unlock()
 
 	// Signal any remaining subscribers (Close should have drained, but
 	// defensive) and close the doc.

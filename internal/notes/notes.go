@@ -601,6 +601,49 @@ func (s *Service) ApplyDiff(
 	}, nil
 }
 
+// WriteBodyFromCRDT mirrors a CRDT-derived body back to the on-disk
+// markdown file. Called by the WebSocket hub's debounced mirror
+// (slice 4.5) so live-collab edits propagate to FS-reading clients
+// (TUI, apple) without needing an explicit /diff round-trip.
+//
+// Frontmatter is preserved; only the body region is replaced. The FS
+// watcher path is suppressed so we don't bounce our own write back
+// into the CRDT as a synthetic external edit.
+//
+// Errors are returned so the hub can log them; failures here mean
+// the CRDT and FS are temporarily diverged but the CRDT remains
+// authoritative for the active session.
+func (s *Service) WriteBodyFromCRDT(ctx context.Context, vaultID uuid.UUID, noteID, text string) error {
+	n, err := s.notes.Get(ctx, vaultID, noteID)
+	if err != nil {
+		return err
+	}
+	v, err := s.vaults.GetByID(ctx, vaultID)
+	if err != nil {
+		return err
+	}
+	front, _, err := s.fs.ReadNote(v.Slug, n.Path)
+	if err != nil {
+		return err
+	}
+	now := s.now().UTC()
+	front["updated_at"] = now.Format(time.RFC3339)
+	if _, ok := front["id"]; !ok {
+		front["id"] = noteID
+	}
+	s.suppressFSEvent(v.Slug, n.Path)
+	if err := s.fs.WriteNote(v.Slug, n.Path, front, []byte(text)); err != nil {
+		return err
+	}
+	// Bump updated_at in pg so listings reflect the live edit. We
+	// don't add an audit row — the underlying CRDT update already
+	// has one via Hub.ApplyAndBroadcast's PersistChange.
+	updated := n
+	updated.UpdatedAt = now
+	_ = s.notes.Upsert(ctx, updated)
+	return nil
+}
+
 // applyBodyToCRDT is the PATCH-body bridge: load doc, apply diff, persist.
 // Best-effort — caller treats CRDT errors as non-fatal.
 func (s *Service) applyBodyToCRDT(ctx context.Context, vaultID uuid.UUID, id string, newBody string, actor uuid.UUID, originKind string) error {

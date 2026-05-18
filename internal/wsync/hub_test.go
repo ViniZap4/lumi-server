@@ -5,6 +5,7 @@ import (
 	"context"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -361,6 +362,104 @@ func TestUserSlotIsolatedPerUser(t *testing.T) {
 	}
 	if !hub.TryAcquireUserSlot(b) {
 		t.Fatalf("user B has its own quota")
+	}
+}
+
+func TestFSMirrorFiresAfterDebounce(t *testing.T) {
+	repo := newMemRepo()
+	reg := crdt.NewRegistry(repo)
+
+	type mirrorCall struct {
+		vault uuid.UUID
+		note  string
+		text  string
+	}
+	var (
+		mu    sync.Mutex
+		calls []mirrorCall
+	)
+	mirror := func(_ context.Context, v uuid.UUID, n, text string) error {
+		mu.Lock()
+		calls = append(calls, mirrorCall{v, n, text})
+		mu.Unlock()
+		return nil
+	}
+
+	hub := NewHub(
+		reg,
+		WithFSMirror(mirror),
+		WithMirrorDebounce(40*time.Millisecond),
+	)
+	defer hub.Close()
+
+	vault := uuid.New()
+	note := "mirror-test"
+	sub := hub.NewSubscriber(uuid.New())
+	room, err := hub.Join(context.Background(), vault, note, sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Leave(room, sub)
+
+	// First edit.
+	u1, _ := room.Doc().ApplyTextDiff("hello", "test")
+	if err := room.ApplyAndBroadcast(u1, sub, sub.UserID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second edit inside the debounce window must coalesce.
+	time.Sleep(15 * time.Millisecond)
+	u2, _ := room.Doc().ApplyTextDiff("hello world", "test")
+	if err := room.ApplyAndBroadcast(u2, sub, sub.UserID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait past the second debounce.
+	time.Sleep(120 * time.Millisecond)
+
+	mu.Lock()
+	got := append([]mirrorCall(nil), calls...)
+	mu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 coalesced mirror call, got %d: %+v", len(got), got)
+	}
+	if got[0].text != "hello world" {
+		t.Fatalf("expected final text 'hello world', got %q", got[0].text)
+	}
+}
+
+func TestFSMirrorSkipsFSWatcherOrigin(t *testing.T) {
+	repo := newMemRepo()
+	reg := crdt.NewRegistry(repo)
+	var calls atomic.Int64
+	mirror := func(_ context.Context, _ uuid.UUID, _, _ string) error {
+		calls.Add(1)
+		return nil
+	}
+	hub := NewHub(
+		reg,
+		WithFSMirror(mirror),
+		WithMirrorDebounce(20*time.Millisecond),
+	)
+	defer hub.Close()
+
+	vault := uuid.New()
+	note := "fs-origin"
+	sub := hub.NewSubscriber(uuid.New())
+	room, err := hub.Join(context.Background(), vault, note, sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Leave(room, sub)
+
+	u, _ := room.Doc().ApplyTextDiff("external edit", "test")
+	if err := room.ApplyAndBroadcastFromFS(u); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond)
+
+	if calls.Load() != 0 {
+		t.Fatalf("FS-origin update should not trigger mirror; got %d calls", calls.Load())
 	}
 }
 

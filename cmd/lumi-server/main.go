@@ -438,7 +438,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	}
 
 	notesSvc := notes.NewService(noteStore, vaultStore, fsMgr, auditStore, membersSvc, crdtRegistry, fsWatcher)
-	wsHub := wsync.NewHub(crdtRegistry)
+	wsHub := wsync.NewHub(crdtRegistry, wsync.WithFSMirror(notesSvc.WriteBodyFromCRDT))
 
 	fsWatcher.SetHandler(buildFSHandler(zlog, vaultStore, noteStore, fsMgr, crdtRegistry, wsHub))
 	vaultsSvc.SetWatcher(fsWatcher)
