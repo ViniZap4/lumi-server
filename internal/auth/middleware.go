@@ -19,6 +19,10 @@ const (
 
 // queryTokenPathPrefixes is the allow-list for ?token= fallback. Anywhere
 // else a query-string token is ignored to prevent leakage via referer/log.
+// The v2 WebSocket sync endpoint lives under /api/vaults/.../sync; we
+// allow ?token= there because browsers cannot set custom auth headers
+// on a WebSocket upgrade. The path-shape check is tightened in
+// isQueryTokenAllowed so other /api/ routes still reject the fallback.
 var queryTokenPathPrefixes = []string{
 	"/api/files/",
 	"/ws",
@@ -88,6 +92,14 @@ func isQueryTokenAllowed(path string) bool {
 		if prefix == "/ws" && (path == "/ws" || strings.HasPrefix(path, "/ws/") || strings.HasPrefix(path, "/ws?")) {
 			return true
 		}
+	}
+	// v2 WebSocket sync route: /api/vaults/<uuid>/notes/<id>/sync. Strict
+	// suffix + segment match so a stray ?token= on a REST endpoint can't
+	// piggyback the allow-list.
+	if strings.HasPrefix(path, "/api/vaults/") &&
+		strings.Contains(path, "/notes/") &&
+		strings.HasSuffix(path, "/sync") {
+		return true
 	}
 	return false
 }

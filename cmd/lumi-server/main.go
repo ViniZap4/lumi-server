@@ -43,6 +43,7 @@ import (
 	"github.com/ViniZap4/lumi-server/internal/storage/pg"
 	"github.com/ViniZap4/lumi-server/internal/users"
 	"github.com/ViniZap4/lumi-server/internal/vaults"
+	"github.com/ViniZap4/lumi-server/internal/wsync"
 
 	"github.com/google/uuid"
 )
@@ -428,6 +429,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	vaultsSvc := vaults.NewService(vaultStore, roleStore, memberStore, fsMgr, auditStore, membersSvc)
 	usersSvc := users.NewService(userStore, consentStore, auditStore, auditStore, vaultStore)
 	notesSvc := notes.NewService(noteStore, vaultStore, fsMgr, auditStore, membersSvc, crdtRegistry)
+	wsHub := wsync.NewHub(crdtRegistry)
 	invitesSvc := invites.NewService(invites.Deps{
 		Repo:          inviteStore,
 		Users:         userStore,
@@ -485,12 +487,14 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	members.NewHandlers(membersSvc, membersSvc).Register(authed)
 	audit.NewHandlers(auditStore, membersSvc).Register(authed)
 	notes.NewHandlers(notesSvc).Register(authed)
+	wsync.NewHandler(wsHub, membersSvc).Register(authed)
 
 	// Invites: split between vault-scoped (authed) and public.
 	invites.NewHandlers(invitesSvc).Register(app, authed, membersSvc)
 
 	shutdown := func(ctx context.Context) error {
 		_ = ctx
+		wsHub.Close()
 		return nil
 	}
 	return app, shutdown, nil

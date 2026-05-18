@@ -204,6 +204,20 @@ func (d *Doc) StateVectorV1() ([]byte, error) {
 // state of the document. Equivalent to state_diff_v1(nil). Use it for
 // the snapshot row in note_yjs_snapshots.
 func (d *Doc) EncodeStateAsUpdate() ([]byte, error) {
+	return d.encodeDiffSince(nil)
+}
+
+// EncodeDiffSince returns a lib0-v1 update blob containing only the
+// operations the document has that are NOT covered by the supplied
+// state vector. This is the SyncStep2 payload in the Yjs y-protocols
+// wire protocol — server sends one of these in response to a client's
+// SyncStep1 carrying the client's sv. Passing a nil/empty sv is
+// equivalent to EncodeStateAsUpdate (full state).
+func (d *Doc) EncodeDiffSince(sv []byte) ([]byte, error) {
+	return d.encodeDiffSince(sv)
+}
+
+func (d *Doc) encodeDiffSince(sv []byte) ([]byte, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
@@ -215,7 +229,13 @@ func (d *Doc) EncodeStateAsUpdate() ([]byte, error) {
 	}
 	defer C.ytransaction_commit(txn)
 	var n C.uint32_t
-	ptr := C.ytransaction_state_diff_v1(txn, nil, 0, &n)
+	var svPtr *C.char
+	var svLen C.uint32_t
+	if len(sv) > 0 {
+		svPtr = (*C.char)(unsafe.Pointer(&sv[0]))
+		svLen = C.uint32_t(len(sv))
+	}
+	ptr := C.ytransaction_state_diff_v1(txn, svPtr, svLen, &n)
 	if ptr == nil {
 		return []byte{}, nil
 	}
