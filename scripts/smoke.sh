@@ -1,15 +1,25 @@
 #!/usr/bin/env bash
-# scripts/smoke.sh — Phase 1 end-to-end smoke test.
+# scripts/smoke.sh — end-to-end smoke test through v2 Phase 2.
 #
 # Brings up Postgres via docker compose, runs migrations, starts the
-# server in the background, exercises register → login → me → vault
-# create → invite create → invite accept (existing user). Stops the
-# server and Postgres on exit.
+# server in the background, exercises:
 #
-# Requires: docker, docker compose, curl, jq.
+#   Phase 1: register → login → me → vault create → roles → invite
+#            create → invite info → invite accept (signup) → members
+#   Phase 2: notes CRUD (create, list, get, content, patch body,
+#            patch rename, snapshot, diff, delete)
+#
+# WS live-sync (Phase 2.3) is exercised by the in-process Go tests in
+# internal/wsync/; this shell script does not speak the binary Yjs
+# protocol. WS handshake reachability is sanity-checked.
+#
+# Requires: docker, docker compose, curl, jq, and the libyrs static
+# library built locally (`make libyrs`) — the server is run as a
+# native binary against the Docker-only Postgres, NOT inside Docker.
 #
 # Run from the lumi-server repo root:
-#   make smoke       # via the Makefile target
+#   make libyrs            # one-time, builds the cgo dep
+#   make smoke             # via the Makefile target
 #   bash scripts/smoke.sh
 
 set -euo pipefail
@@ -154,5 +164,118 @@ curl -sf -H "X-Lumi-Token: $ALICE_TOKEN" http://127.0.0.1:8080/api/vaults | jq .
 echo "--- members ---"
 curl -sf -H "X-Lumi-Token: $ALICE_TOKEN" \
   "http://127.0.0.1:8080/api/vaults/$VAULT_ID/members" | jq .
+
+# ---- v2 Phase 2: notes ------------------------------------------------------
+
+# 15. Alice creates a note.
+echo "--- create note ---"
+NOTE_JSON=$(
+  curl -sf -X POST "http://127.0.0.1:8080/api/vaults/$VAULT_ID/notes" \
+    -H 'Content-Type: application/json' \
+    -H "X-Lumi-Token: $ALICE_TOKEN" \
+    -d '{"title":"Hello from Alice","body":"# Hello\n\nFirst line.\n","tags":["smoke","phase-2"]}'
+)
+echo "$NOTE_JSON" | jq .
+NOTE_ID=$(echo "$NOTE_JSON" | jq -r .id)
+[[ "$NOTE_ID" == "hello-from-alice" ]] || { echo "unexpected note id: $NOTE_ID"; exit 1; }
+
+# 16. List notes.
+echo "--- list notes ---"
+LIST_JSON=$(
+  curl -sf -H "X-Lumi-Token: $ALICE_TOKEN" \
+    "http://127.0.0.1:8080/api/vaults/$VAULT_ID/notes"
+)
+echo "$LIST_JSON" | jq .
+COUNT=$(echo "$LIST_JSON" | jq '.notes | length')
+[[ "$COUNT" == "1" ]] || { echo "expected 1 note, got $COUNT"; exit 1; }
+
+# 17. Get note metadata.
+echo "--- get note metadata ---"
+curl -sf -H "X-Lumi-Token: $ALICE_TOKEN" \
+  "http://127.0.0.1:8080/api/vaults/$VAULT_ID/notes/$NOTE_ID" | jq .
+
+# 18. Get note content (frontmatter + body).
+echo "--- get note content ---"
+CONTENT_JSON=$(
+  curl -sf -H "X-Lumi-Token: $ALICE_TOKEN" \
+    "http://127.0.0.1:8080/api/vaults/$VAULT_ID/notes/$NOTE_ID/content"
+)
+echo "$CONTENT_JSON" | jq .
+BODY=$(echo "$CONTENT_JSON" | jq -r .body)
+[[ "$BODY" == *"First line."* ]] || { echo "body mismatch: $BODY"; exit 1; }
+
+# 19. PATCH note body.
+echo "--- patch note body ---"
+curl -sf -X PATCH "http://127.0.0.1:8080/api/vaults/$VAULT_ID/notes/$NOTE_ID" \
+  -H 'Content-Type: application/json' \
+  -H "X-Lumi-Token: $ALICE_TOKEN" \
+  -d '{"body":"# Hello\n\nSecond line.\n"}' | jq .
+
+# 20. Snapshot endpoint — text + vector_clock (base64).
+echo "--- snapshot ---"
+SNAP_JSON=$(
+  curl -sf -H "X-Lumi-Token: $ALICE_TOKEN" \
+    "http://127.0.0.1:8080/api/vaults/$VAULT_ID/notes/$NOTE_ID/snapshot"
+)
+echo "$SNAP_JSON" | jq .
+SNAP_TEXT=$(echo "$SNAP_JSON" | jq -r .text)
+[[ "$SNAP_TEXT" == *"Second line."* ]] || { echo "snapshot text mismatch"; exit 1; }
+VECTOR=$(echo "$SNAP_JSON" | jq -r .vector_clock)
+[[ -n "$VECTOR" ]] || { echo "no vector_clock"; exit 1; }
+
+# 21. Diff endpoint — TUI-style snapshot+diff workflow.
+echo "--- apply diff ---"
+DIFF_JSON=$(
+  curl -sf -X POST "http://127.0.0.1:8080/api/vaults/$VAULT_ID/notes/$NOTE_ID/diff" \
+    -H 'Content-Type: application/json' \
+    -H "X-Lumi-Token: $ALICE_TOKEN" \
+    -d "$(jq -n --arg sv "$VECTOR" --arg t '# Hello\n\nThird line.\n' '{base_clock:$sv, text:$t, origin:"tui-diff"}')"
+)
+echo "$DIFF_JSON" | jq .
+DIFF_TEXT=$(echo "$DIFF_JSON" | jq -r .text)
+[[ "$DIFF_TEXT" == *"Third line."* ]] || { echo "diff result mismatch"; exit 1; }
+
+# 22. PATCH rename (path change).
+echo "--- patch rename ---"
+RENAMED_JSON=$(
+  curl -sf -X PATCH "http://127.0.0.1:8080/api/vaults/$VAULT_ID/notes/$NOTE_ID" \
+    -H 'Content-Type: application/json' \
+    -H "X-Lumi-Token: $ALICE_TOKEN" \
+    -d '{"path":"renamed.md"}'
+)
+echo "$RENAMED_JSON" | jq .
+NEW_PATH=$(echo "$RENAMED_JSON" | jq -r .path)
+[[ "$NEW_PATH" == "renamed.md" ]] || { echo "rename path = $NEW_PATH"; exit 1; }
+
+# 23. WS handshake reachability — the actual Yjs protocol roundtrip
+# is exercised by internal/wsync/ unit tests. Here we just confirm
+# the upgrade route returns the expected 426 / 101 path.
+echo "--- ws endpoint reachable ---"
+WS_PROBE_HTTP=$(
+  curl -s -o /dev/null -w '%{http_code}' \
+    -H "X-Lumi-Token: $ALICE_TOKEN" \
+    "http://127.0.0.1:8080/api/vaults/$VAULT_ID/notes/$NOTE_ID/sync"
+)
+# 426 Upgrade Required is what the route returns to a non-upgrade GET.
+[[ "$WS_PROBE_HTTP" == "426" ]] || { echo "WS upgrade route returned $WS_PROBE_HTTP, expected 426"; exit 1; }
+echo "ws upgrade route returns 426 to plain GET (correct)"
+
+# 24. DELETE note.
+echo "--- delete note ---"
+DELETE_HTTP=$(
+  curl -s -o /dev/null -w '%{http_code}' \
+    -X DELETE "http://127.0.0.1:8080/api/vaults/$VAULT_ID/notes/$NOTE_ID" \
+    -H "X-Lumi-Token: $ALICE_TOKEN"
+)
+[[ "$DELETE_HTTP" == "204" ]] || { echo "DELETE returned $DELETE_HTTP, expected 204"; exit 1; }
+
+# 25. List notes is empty again.
+echo "--- list empty ---"
+LIST_FINAL=$(
+  curl -sf -H "X-Lumi-Token: $ALICE_TOKEN" \
+    "http://127.0.0.1:8080/api/vaults/$VAULT_ID/notes"
+)
+COUNT_FINAL=$(echo "$LIST_FINAL" | jq '.notes | length')
+[[ "$COUNT_FINAL" == "0" ]] || { echo "expected 0 notes after delete, got $COUNT_FINAL"; exit 1; }
 
 echo "--- smoke test PASSED ---"
