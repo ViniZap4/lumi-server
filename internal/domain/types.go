@@ -132,5 +132,7 @@ const (
 	ActionConsentAccept      = "consent.accept"
 	ActionConsentUpdate      = "consent.update"
 	ActionNoteCreate         = "note.create"
+	ActionNoteEdit           = "note.edit"
+	ActionNoteMove           = "note.move"
 	ActionNoteDelete         = "note.delete"
 )

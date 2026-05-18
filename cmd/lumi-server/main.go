@@ -36,6 +36,7 @@ import (
 	"github.com/ViniZap4/lumi-server/internal/domain"
 	"github.com/ViniZap4/lumi-server/internal/invites"
 	"github.com/ViniZap4/lumi-server/internal/members"
+	"github.com/ViniZap4/lumi-server/internal/notes"
 	"github.com/ViniZap4/lumi-server/internal/roles"
 	"github.com/ViniZap4/lumi-server/internal/storage/fs"
 	"github.com/ViniZap4/lumi-server/internal/storage/pg"
@@ -367,6 +368,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	roleStore := pg.NewRoleStore(pool)
 	memberStore := pg.NewMemberStore(pool)
 	inviteStore := pg.NewInviteStore(pool)
+	noteStore := pg.NewNoteStore(pool)
 
 	// Auth service.
 	authCfg := auth.Config{
@@ -396,6 +398,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	membersSvc := members.NewService(memberRepoAdapter{memberStore}, auditStore)
 	vaultsSvc := vaults.NewService(vaultStore, roleStore, memberStore, fsMgr, auditStore, membersSvc)
 	usersSvc := users.NewService(userStore, consentStore, auditStore, auditStore, vaultStore)
+	notesSvc := notes.NewService(noteStore, vaultStore, fsMgr, auditStore, membersSvc)
 	invitesSvc := invites.NewService(invites.Deps{
 		Repo:          inviteStore,
 		Users:         userStore,
@@ -410,10 +413,11 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		PublicBaseURL: cfg.publicBaseURL,
 	})
 
-	// Fiber app.
+	// Fiber app. BodyLimit is set to 4 MiB to accommodate note bodies;
+	// auth/admin payloads are < 1 KiB so the larger cap costs nothing.
 	app := fiber.New(fiber.Config{
 		AppName:               "lumi-server " + Version,
-		BodyLimit:             64 << 10,
+		BodyLimit:             4 << 20,
 		ReadTimeout:           30 * time.Second,
 		WriteTimeout:          60 * time.Second,
 		IdleTimeout:           120 * time.Second,
@@ -451,6 +455,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	roles.NewHandlers(rolesSvc, membersSvc).Register(authed)
 	members.NewHandlers(membersSvc, membersSvc).Register(authed)
 	audit.NewHandlers(auditStore, membersSvc).Register(authed)
+	notes.NewHandlers(notesSvc).Register(authed)
 
 	// Invites: split between vault-scoped (authed) and public.
 	invites.NewHandlers(invitesSvc).Register(app, authed, membersSvc)
