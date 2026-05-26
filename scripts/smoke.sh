@@ -235,6 +235,32 @@ echo "$DIFF_JSON" | jq .
 DIFF_TEXT=$(echo "$DIFF_JSON" | jq -r .text)
 [[ "$DIFF_TEXT" == *"Third line."* ]] || { echo "diff result mismatch"; exit 1; }
 
+# 21b. Diff endpoint — Phase H slice 3 dispatch guards. The raw-update
+# happy path needs real lib0-v1 bytes; that's exercised by the
+# apple-client LumiAPIClient + LumiCRDT integration tests (and by the
+# in-process wsync hub tests for the WS fan-out). Here we lock the
+# request-shape validation so a bug in the dispatch can't silently
+# steer a write to the wrong path.
+echo "--- diff dispatch: both text and update set rejects ---"
+BOTH_HTTP=$(
+  curl -s -o /dev/null -w '%{http_code}' \
+    -X POST "http://127.0.0.1:8080/api/vaults/$VAULT_ID/notes/$NOTE_ID/diff" \
+    -H 'Content-Type: application/json' \
+    -H "X-Lumi-Token: $ALICE_TOKEN" \
+    -d '{"text":"hello","update":"AAAA"}'
+)
+[[ "$BOTH_HTTP" == "400" ]] || { echo "both-fields = $BOTH_HTTP, expected 400"; exit 1; }
+
+echo "--- diff dispatch: invalid base64 update rejects ---"
+BADB64_HTTP=$(
+  curl -s -o /dev/null -w '%{http_code}' \
+    -X POST "http://127.0.0.1:8080/api/vaults/$VAULT_ID/notes/$NOTE_ID/diff" \
+    -H 'Content-Type: application/json' \
+    -H "X-Lumi-Token: $ALICE_TOKEN" \
+    -d '{"update":"@@@not-base64@@@"}'
+)
+[[ "$BADB64_HTTP" == "400" ]] || { echo "bad-base64 = $BADB64_HTTP, expected 400"; exit 1; }
+
 # 22. PATCH rename (path change).
 echo "--- patch rename ---"
 RENAMED_JSON=$(
