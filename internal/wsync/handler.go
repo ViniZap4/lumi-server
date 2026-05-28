@@ -100,9 +100,20 @@ func (h *Handler) upgradeGuard(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_note_id"})
 	}
 	uid, _ := capguard.UserIDFrom(c)
+	// Optional presence identity. When the client supplies a valid
+	// UUID we stamp it on the Subscriber so Leave can fan out a
+	// "left" awareness frame. A missing or malformed value is silently
+	// treated as "no presence" — clients without awareness still work.
+	var clientID uuid.UUID
+	if raw := strings.TrimSpace(c.Query("client_id")); raw != "" {
+		if id, err := uuid.Parse(raw); err == nil {
+			clientID = id
+		}
+	}
 	c.Locals("wsync.vault", vaultID)
 	c.Locals("wsync.note", noteID)
 	c.Locals("wsync.user", uid)
+	c.Locals("wsync.client", clientID)
 	return c.Next()
 }
 
@@ -121,6 +132,7 @@ func (h *Handler) handleConn(c *websocket.Conn) {
 		return
 	}
 	userID, _ := c.Locals("wsync.user").(uuid.UUID)
+	clientID, _ := c.Locals("wsync.client").(uuid.UUID)
 
 	// Cap memory growth from a hostile peer. Default is unlimited.
 	c.SetReadLimit(MaxFrameBytes)
@@ -134,7 +146,7 @@ func (h *Handler) handleConn(c *websocket.Conn) {
 	}
 	defer h.hub.ReleaseUserSlot(userID)
 
-	sub := h.hub.NewSubscriber(userID)
+	sub := h.hub.NewSubscriberWithClient(userID, clientID)
 	// websocket.Conn doesn't expose UserContext — use a background ctx
 	// for the synchronous Join call (it returns quickly after LoadDoc).
 	room, err := h.hub.Join(context.Background(), vaultID, noteID, sub)

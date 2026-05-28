@@ -3,6 +3,7 @@ package wsync
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -509,4 +510,118 @@ func TestRoomAwarenessRelay(t *testing.T) {
 		t.Fatalf("A got its own awareness back")
 	case <-time.After(30 * time.Millisecond):
 	}
+}
+
+// TestLeaveBroadcastsPresenceLeaveFrame verifies that when a subscriber
+// with a non-nil ClientID departs, remaining subscribers receive a
+// synthetic awareness frame carrying `{client_id, left: true}`. Without
+// this, peers would only drop the departing presence after the
+// client-side TTL elapses. Post-H follow-up.
+func TestLeaveBroadcastsPresenceLeaveFrame(t *testing.T) {
+	repo := newMemRepo()
+	reg := crdt.NewRegistry(repo)
+	hub := NewHub(reg)
+	defer hub.Close()
+
+	vault := uuid.New()
+	note := "presence-leave"
+
+	leaverClient := uuid.New()
+	leaver := hub.NewSubscriberWithClient(uuid.New(), leaverClient)
+	observer := hub.NewSubscriber(uuid.New())
+
+	room, err := hub.Join(context.Background(), vault, note, leaver)
+	if err != nil {
+		t.Fatalf("Join leaver: %v", err)
+	}
+	if _, err := hub.Join(context.Background(), vault, note, observer); err != nil {
+		t.Fatalf("Join observer: %v", err)
+	}
+	defer hub.Leave(room, observer)
+
+	hub.Leave(room, leaver)
+
+	select {
+	case msg := <-observer.Out:
+		parsed, err := DecodeMessage(msg)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if parsed.Type != MessageAwareness {
+			t.Fatalf("got type %d, want awareness", parsed.Type)
+		}
+		var got struct {
+			ClientID    string `json:"client_id"`
+			Username    string `json:"username"`
+			DisplayName string `json:"display_name"`
+			Color       string `json:"color"`
+			Left        bool   `json:"left"`
+		}
+		if err := json.Unmarshal(parsed.Body, &got); err != nil {
+			t.Fatalf("decode body json: %v", err)
+		}
+		if got.ClientID != leaverClient.String() {
+			t.Fatalf("leave-frame client_id = %q, want %q", got.ClientID, leaverClient.String())
+		}
+		if !got.Left {
+			t.Fatalf("leave-frame left = false, want true")
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("observer did not receive leave frame")
+	}
+}
+
+// TestLeaveSkipsPresenceLeaveFrameForNilClientID confirms that a sub
+// without a declared presence identity does NOT trigger a leave frame —
+// the wire would carry uuid.Nil and peers can't match it to anything
+// useful.
+func TestLeaveSkipsPresenceLeaveFrameForNilClientID(t *testing.T) {
+	repo := newMemRepo()
+	reg := crdt.NewRegistry(repo)
+	hub := NewHub(reg)
+	defer hub.Close()
+
+	vault := uuid.New()
+	note := "anon-leave"
+
+	leaver := hub.NewSubscriber(uuid.New())     // no ClientID
+	observer := hub.NewSubscriber(uuid.New())
+
+	room, err := hub.Join(context.Background(), vault, note, leaver)
+	if err != nil {
+		t.Fatalf("Join leaver: %v", err)
+	}
+	if _, err := hub.Join(context.Background(), vault, note, observer); err != nil {
+		t.Fatalf("Join observer: %v", err)
+	}
+	defer hub.Leave(room, observer)
+
+	hub.Leave(room, leaver)
+
+	select {
+	case msg := <-observer.Out:
+		t.Fatalf("observer unexpectedly got a frame: %v", msg)
+	case <-time.After(50 * time.Millisecond):
+		// good — no broadcast
+	}
+}
+
+// TestLeavePresenceLeaveFrameSuppressedWhenLastSub covers the edge case
+// where the leaving sub is the last in the room. There's no one to
+// notify, so the path must short-circuit without panic/deadlock.
+func TestLeavePresenceLeaveFrameSuppressedWhenLastSub(t *testing.T) {
+	repo := newMemRepo()
+	reg := crdt.NewRegistry(repo)
+	hub := NewHub(reg)
+	defer hub.Close()
+
+	vault := uuid.New()
+	note := "only-me"
+	leaver := hub.NewSubscriberWithClient(uuid.New(), uuid.New())
+	room, err := hub.Join(context.Background(), vault, note, leaver)
+	if err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	// Single sub leaving — must not deadlock or attempt to broadcast.
+	hub.Leave(room, leaver)
 }

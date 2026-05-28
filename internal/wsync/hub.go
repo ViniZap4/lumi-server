@@ -2,6 +2,7 @@ package wsync
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -70,11 +71,20 @@ type Room struct {
 // Out is the outbound message queue: writers should push, the connection
 // pump goroutine ranges over it. Done closes when the subscriber should
 // stop.
+//
+// ClientID is the per-session presence identity declared by the client
+// at connect time via the `?client_id=<uuid>` query param. Optional —
+// uuid.Nil for clients that don't participate in awareness (legacy TUI,
+// internal callers). When non-nil, Leave broadcasts a synthetic
+// awareness "left" frame to remaining subscribers so they can drop the
+// peer from their presence list immediately instead of waiting on the
+// client-side TTL.
 type Subscriber struct {
-	UserID uuid.UUID
-	Out    chan []byte
-	Done   chan struct{}
-	doneCh sync.Once
+	UserID   uuid.UUID
+	ClientID uuid.UUID
+	Out      chan []byte
+	Done     chan struct{}
+	doneCh   sync.Once
 }
 
 // CloseSubscriber closes Done idempotently so the pump goroutine can exit.
@@ -245,7 +255,10 @@ func (h *Hub) Join(ctx context.Context, vaultID uuid.UUID, noteID string, sub *S
 }
 
 // Leave detaches the subscriber and starts the idle timer if it was the
-// last one in the room.
+// last one in the room. If the departing sub had a non-nil ClientID and
+// other subscribers remain, a synthetic "left" awareness frame is
+// broadcast so peers can drop the entry from their presence list right
+// away (without waiting on a TTL).
 func (h *Hub) Leave(room *Room, sub *Subscriber) {
 	if room == nil || sub == nil {
 		return
@@ -256,6 +269,9 @@ func (h *Hub) Leave(room *Room, sub *Subscriber) {
 	room.subsMu.Unlock()
 	sub.CloseSubscriber()
 
+	if !empty && sub.ClientID != uuid.Nil {
+		room.broadcastPresenceLeave(sub.ClientID)
+	}
 	if empty {
 		room.scheduleIdleEviction()
 	}
@@ -357,6 +373,29 @@ func (r *Room) BroadcastAwareness(awareness []byte, origin *Subscriber) {
 	r.broadcast(EncodeAwareness(awareness), origin)
 }
 
+// broadcastPresenceLeave emits a synthetic awareness frame signalling
+// that clientID has departed. The payload mirrors the lumi PresenceState
+// JSON shape with empty user fields and `left: true`. Clients drop the
+// entry from their presence map without waiting on the per-peer TTL.
+//
+// Best-effort: a single Marshal failure (impossible for this fixed
+// shape) silently no-ops. The room mutex isn't held here because
+// broadcast() takes its own RLock and the caller has already removed
+// sub from the map.
+func (r *Room) broadcastPresenceLeave(clientID uuid.UUID) {
+	payload, err := json.Marshal(struct {
+		ClientID    string `json:"client_id"`
+		Username    string `json:"username"`
+		DisplayName string `json:"display_name"`
+		Color       string `json:"color"`
+		Left        bool   `json:"left"`
+	}{ClientID: clientID.String(), Left: true})
+	if err != nil {
+		return
+	}
+	r.broadcast(EncodeAwareness(payload), nil)
+}
+
 // broadcast pushes msg into every subscriber's Out channel except
 // origin. Subscribers whose outbound queue is full are dropped (their
 // Done is closed); the pump will catch up next.
@@ -433,13 +472,23 @@ func (r *Room) evict() {
 }
 
 // NewSubscriber allocates a Subscriber with the configured Hub send
-// buffer.
+// buffer. ClientID defaults to uuid.Nil — pass it via
+// NewSubscriberWithClient when the client declares a presence identity
+// at connect time.
 func (h *Hub) NewSubscriber(userID uuid.UUID) *Subscriber {
 	return &Subscriber{
 		UserID: userID,
 		Out:    make(chan []byte, h.sendBuf),
 		Done:   make(chan struct{}),
 	}
+}
+
+// NewSubscriberWithClient allocates a Subscriber carrying a presence
+// ClientID. Equivalent to NewSubscriber when clientID is uuid.Nil.
+func (h *Hub) NewSubscriberWithClient(userID, clientID uuid.UUID) *Subscriber {
+	s := h.NewSubscriber(userID)
+	s.ClientID = clientID
+	return s
 }
 
 // RoomIfActive returns the live Room for (vaultID, noteID) without
