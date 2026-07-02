@@ -200,6 +200,9 @@ func SuggestAlternatives(base string) []string {
 // ---- Service methods -------------------------------------------------------
 
 type CreateInput struct {
+	// ID pins the vault UUID; zero means mint a new one. Federation uses
+	// this so a follower replica shares the home server's vault id.
+	ID        uuid.UUID
 	Name      string
 	Slug      string
 	CreatedBy uuid.UUID
@@ -236,8 +239,12 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (domain.Vault, err
 		return domain.Vault{}, err
 	}
 
+	id := in.ID
+	if id == uuid.Nil {
+		id = uuid.New()
+	}
 	row := domain.Vault{
-		ID:          uuid.New(),
+		ID:          id,
 		Slug:        slug,
 		Name:        name,
 		CreatedBy:   in.CreatedBy,

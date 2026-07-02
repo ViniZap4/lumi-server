@@ -35,6 +35,7 @@ import (
 	"github.com/ViniZap4/lumi-server/internal/auth"
 	"github.com/ViniZap4/lumi-server/internal/crdt"
 	"github.com/ViniZap4/lumi-server/internal/domain"
+	"github.com/ViniZap4/lumi-server/internal/federation"
 	"github.com/ViniZap4/lumi-server/internal/fswatch"
 	"github.com/ViniZap4/lumi-server/internal/invites"
 	"github.com/ViniZap4/lumi-server/internal/members"
@@ -449,6 +450,18 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		zlog.Warn().Err(err).Msg("fswatch: WatchExistingVaults")
 	}
 	go fsWatcher.Run(ctx)
+	federationSvc, err := federation.NewService(ctx, federation.Deps{
+		Keys:        pg.NewServerKeyStore(pool),
+		Federations: pg.NewFederationStore(pool),
+		Invites:     pg.NewFederationInviteStore(pool),
+		Vaults:      vaultStore,
+		Creator:     vaultsSvc,
+		Audit:       auditStore,
+		BaseURL:     cfg.publicBaseURL,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("federation service: %w", err)
+	}
 	invitesSvc := invites.NewService(invites.Deps{
 		Repo:          inviteStore,
 		Users:         userStore,
@@ -510,6 +523,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 
 	// Invites: split between vault-scoped (authed) and public.
 	invites.NewHandlers(invitesSvc).Register(app, authed, membersSvc)
+	federation.NewHandlers(federationSvc, membersSvc).Register(app, authed)
 
 	shutdown := func(ctx context.Context) error {
 		_ = ctx

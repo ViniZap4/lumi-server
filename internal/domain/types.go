@@ -146,4 +146,35 @@ const (
 	ActionNoteEdit           = "note.edit"
 	ActionNoteMove           = "note.move"
 	ActionNoteDelete         = "note.delete"
+	ActionFederationInvite   = "federation.invite"
+	ActionFederationAccept   = "federation.accept"
+	ActionFederationRevoke   = "federation.revoke"
 )
+
+// Federation binds a vault to a peer server (v3 F1). On the home server the
+// row points at a follower; on a follower it points at home. Content/control
+// replication over this link lands in F2/F3.
+type Federation struct {
+	ID           uuid.UUID
+	VaultID      uuid.UUID
+	Role         string // "home" | "follower" — this server's role for the vault
+	PeerURL      string
+	PeerPubKey   []byte // Ed25519 public key of the peer
+	Jurisdiction *string
+	Status       string // "active" | "revoked" | "severed"
+	CreatedAt    time.Time
+	RevokedAt    *time.Time
+}
+
+// FederationInvite is a single-use token a vault admin hands to another
+// server's operator out-of-band; accepting it federates the vault.
+type FederationInvite struct {
+	Token         string
+	VaultID       uuid.UUID
+	InviterUserID uuid.UUID
+	ServerURLHint string
+	ExpiresAt     time.Time
+	CreatedAt     time.Time
+	UsedAt        *time.Time
+	RevokedAt     *time.Time
+}

@@ -26,9 +26,10 @@ const (
 	CapRolesManage Capability = "roles.manage"
 	CapRolesAll    Capability = "roles.*"
 
-	CapVaultManage Capability = "vault.manage"
-	CapVaultExport Capability = "vault.export"
-	CapVaultAll    Capability = "vault.*"
+	CapVaultManage   Capability = "vault.manage"
+	CapVaultExport   Capability = "vault.export"
+	CapVaultFederate Capability = "vault.federate"
+	CapVaultAll      Capability = "vault.*"
 
 	CapAuditRead Capability = "audit.read"
 )
