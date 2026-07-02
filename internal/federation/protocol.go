@@ -20,6 +20,7 @@ const (
 	frameManifest     uint64 = 1
 	frameNoteSync     uint64 = 2
 	frameNoteAnnounce uint64 = 3
+	frameNoteDelete   uint64 = 4 // varBytes(id) — note removed at the peer
 )
 
 // syncAuthMessagePrefix versions the signed WS-upgrade auth (v3 F2). The
@@ -137,6 +138,12 @@ func EncodeNoteAnnounce(m NoteMeta) []byte {
 	return appendNoteMeta(out, m)
 }
 
+// EncodeNoteDelete propagates a note deletion.
+func EncodeNoteDelete(noteID string) []byte {
+	out := writeVarUint(nil, frameNoteDelete)
+	return writeVarBytes(out, []byte(noteID))
+}
+
 // ---- frame decode ---------------------------------------------------------------
 
 // Frame is one decoded relay frame; exactly one of the payload fields is
@@ -191,6 +198,12 @@ func DecodeFrame(buf []byte) (Frame, error) {
 			return Frame{}, err
 		}
 		return Frame{Type: typ, Note: m}, nil
+	case frameNoteDelete:
+		noteID, _, err := readVarString(body)
+		if err != nil {
+			return Frame{}, err
+		}
+		return Frame{Type: typ, NoteID: noteID}, nil
 	default:
 		return Frame{}, fmt.Errorf("federation: unknown frame type %d", typ)
 	}

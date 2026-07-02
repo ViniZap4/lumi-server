@@ -62,12 +62,17 @@ type RoomLookup interface {
 	RoomIfActive(vaultID uuid.UUID, noteID string) *wsync.Room
 }
 
+// DeleteFunc removes a note (row + file + CRDT cascade) without notifying
+// the federation layer back. Implemented by notes.Service.DeleteFromFederation.
+type DeleteFunc func(ctx context.Context, vaultID uuid.UUID, noteID string) error
+
 // RelayDeps is everything a Session needs to apply and read note state.
 type RelayDeps struct {
 	Registry *crdt.Registry
 	Rooms    RoomLookup
 	Notes    NoteMetaRepo
 	Mirror   MirrorFunc
+	Delete   DeleteFunc
 	Log      zerolog.Logger
 }
 
@@ -158,6 +163,22 @@ func (l *Links) NoteCreated(vaultID uuid.UUID, noteID, path, title string) {
 	for _, s := range sessions {
 		s.send(announce)
 		s.send(update)
+	}
+}
+
+// NoteDeleted is the notes.Service notifier for local deletions: propagate
+// to every link on the vault.
+func (l *Links) NoteDeleted(vaultID uuid.UUID, noteID string) {
+	l.fanDelete(vaultID, noteID, nil)
+}
+
+func (l *Links) fanDelete(vaultID uuid.UUID, noteID string, except *Session) {
+	frame := EncodeNoteDelete(noteID)
+	for _, s := range l.sessionsFor(vaultID) {
+		if s == except {
+			continue
+		}
+		s.send(frame)
 	}
 }
 
@@ -355,6 +376,23 @@ func (s *Session) handleFrame(f Frame) error {
 			return err
 		}
 		s.sendStep1(f.Note.ID)
+		return nil
+
+	case frameNoteDelete:
+		if err := validateNoteID(f.NoteID); err != nil {
+			return err
+		}
+		if s.deps.Delete == nil {
+			return nil
+		}
+		if err := s.deps.Delete(s.ctx, s.vaultID, f.NoteID); err != nil {
+			if errors.Is(err, domain.ErrNotFound) {
+				return nil // idempotent: already gone locally
+			}
+			return err
+		}
+		// Relay onward to the vault's other links, skipping the source.
+		s.links.fanDelete(s.vaultID, f.NoteID, s)
 		return nil
 
 	case frameNoteSync:

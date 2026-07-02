@@ -113,11 +113,13 @@ func NewService(
 	}
 }
 
-// FederationNotifier hears about note creations so the F2 relay can
-// announce them to federated peers (InitFromText bypasses the registry
-// persist hook). Implementations must be fast and non-blocking.
+// FederationNotifier hears about note lifecycle changes the registry
+// persist hook can't see (creation seeds via InitFromText; deletion drops
+// rows) so the F2 relay can propagate them to federated peers.
+// Implementations must be fast and non-blocking.
 type FederationNotifier interface {
 	NoteCreated(vaultID uuid.UUID, noteID, path, title string)
+	NoteDeleted(vaultID uuid.UUID, noteID string)
 }
 
 // SetFederationNotifier wires the relay; nil disables.
@@ -440,6 +442,18 @@ func validateNoteRelPath(raw string) (string, error) {
 // ---- Service: Delete -------------------------------------------------------
 
 func (s *Service) Delete(ctx context.Context, vaultID uuid.UUID, id string, actor uuid.UUID, ip, ua string) error {
+	return s.deleteInternal(ctx, vaultID, id, actor, ip, ua, true)
+}
+
+// DeleteFromFederation applies a deletion relayed from a federated peer.
+// Skips the federation notifier — the relay layer fans the deletion to the
+// *other* links itself, so notifying here would bounce it back to its
+// source.
+func (s *Service) DeleteFromFederation(ctx context.Context, vaultID uuid.UUID, id string) error {
+	return s.deleteInternal(ctx, vaultID, id, uuid.Nil, "", "", false)
+}
+
+func (s *Service) deleteInternal(ctx context.Context, vaultID uuid.UUID, id string, actor uuid.UUID, ip, ua string, notify bool) error {
 	n, err := s.notes.Get(ctx, vaultID, id)
 	if err != nil {
 		return err
@@ -450,6 +464,9 @@ func (s *Service) Delete(ctx context.Context, vaultID uuid.UUID, id string, acto
 	}
 	if err := s.notes.Delete(ctx, vaultID, id); err != nil {
 		return err
+	}
+	if notify && s.fedNotify != nil {
+		s.fedNotify.NoteDeleted(vaultID, id)
 	}
 	s.suppressFSEvent(v.Slug, n.Path)
 	if err := s.fs.DeleteNote(v.Slug, n.Path); err != nil && !errors.Is(err, domain.ErrNotFound) {

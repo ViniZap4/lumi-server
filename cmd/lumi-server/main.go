@@ -470,6 +470,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		Rooms:    wsHub,
 		Notes:    noteStore,
 		Mirror:   notesSvc.WriteBodyFromCRDT,
+		Delete:   notesSvc.DeleteFromFederation,
 		Log:      zlog,
 	})
 	crdtRegistry.SetOnPersist(relayLinks.OnPersist)

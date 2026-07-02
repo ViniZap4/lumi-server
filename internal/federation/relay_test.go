@@ -2,6 +2,7 @@ package federation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -245,6 +246,17 @@ func (m *memNoteRepo) Get(_ context.Context, vaultID uuid.UUID, id string) (doma
 	return n, nil
 }
 
+func (m *memNoteRepo) delete(vaultID uuid.UUID, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := snKey(vaultID, id)
+	if _, ok := m.rows[k]; !ok {
+		return domain.ErrNotFound
+	}
+	delete(m.rows, k)
+	return nil
+}
+
 func (m *memNoteRepo) ListForVault(_ context.Context, vaultID uuid.UUID, limit, offset int) ([]domain.Note, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -308,7 +320,10 @@ func newRelaySide(t *testing.T) *relaySide {
 		Registry: side.registry,
 		Notes:    side.notes,
 		Mirror:   side.mirror.fn,
-		Log:      zerolog.Nop(),
+		Delete: func(_ context.Context, vaultID uuid.UUID, noteID string) error {
+			return side.notes.delete(vaultID, noteID)
+		},
+		Log: zerolog.Nop(),
 	})
 	side.registry.SetOnPersist(side.links.OnPersist)
 	return side
@@ -430,6 +445,16 @@ func TestRelay_EndToEndConvergence(t *testing.T) {
 	if got := home.text(t, vaultID, "beta"); got != "hello from follower, edited" {
 		t.Fatalf("home beta state = %q", got)
 	}
+
+	// Deletion on home propagates to the follower (idempotent on repeat).
+	if err := home.notes.delete(vaultID, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	home.links.NoteDeleted(vaultID, "alpha")
+	waitFor(t, "alpha deletion on follower", func() bool {
+		_, err := follower.notes.Get(context.Background(), vaultID, "alpha")
+		return errors.Is(err, domain.ErrNotFound)
+	})
 }
 
 func TestRelay_NoteCreatedFansOutToPeers(t *testing.T) {
