@@ -30,6 +30,8 @@ type VaultRepo interface {
 	GetBySlug(ctx context.Context, slug string) (domain.Vault, error)
 	ListForUser(ctx context.Context, userID uuid.UUID) ([]domain.Vault, error)
 	UpdateName(ctx context.Context, id uuid.UUID, name string) error
+	UpdateOwner(ctx context.Context, id, newOwner uuid.UUID) error
+	SetCopiedFrom(ctx context.Context, id uuid.UUID, provenance []byte) error
 	Delete(ctx context.Context, id uuid.UUID) error
 }
 
@@ -62,6 +64,12 @@ type Service struct {
 	resolver capguard.Resolver
 	watcher  VaultWatcher
 	now      func() time.Time
+
+	// Ownership + share-a-copy collaborators (v3 Phase O); wired via
+	// SetOwnershipDeps after all services exist.
+	memberDir MemberDirectory
+	users     UserDirectory
+	copier    NoteCopier
 }
 
 func NewService(
@@ -229,11 +237,12 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (domain.Vault, err
 	}
 
 	row := domain.Vault{
-		ID:        uuid.New(),
-		Slug:      slug,
-		Name:      name,
-		CreatedBy: in.CreatedBy,
-		CreatedAt: s.now().UTC(),
+		ID:          uuid.New(),
+		Slug:        slug,
+		Name:        name,
+		CreatedBy:   in.CreatedBy,
+		OwnerUserID: in.CreatedBy,
+		CreatedAt:   s.now().UTC(),
 	}
 	created, err := s.repo.Create(ctx, row)
 	if err != nil {
@@ -376,23 +385,34 @@ func (h *Handlers) Register(r fiber.Router) {
 		capguard.RequireCapability(h.svc.resolver, domain.CapVaultManage),
 		h.delete,
 	)
+	// Owner check happens in the service (only the owner may transfer),
+	// so no capability middleware: a non-owner gets 403 regardless of role.
+	r.Post("/vaults/:vault/transfer-ownership", h.transferOwnership)
+	r.Post("/vaults/:vault/copies",
+		capguard.RequireCapability(h.svc.resolver, domain.CapVaultExport),
+		h.copy,
+	)
 }
 
 type vaultDTO struct {
-	ID        uuid.UUID `json:"id"`
-	Slug      string    `json:"slug"`
-	Name      string    `json:"name"`
-	CreatedBy uuid.UUID `json:"created_by"`
-	CreatedAt string    `json:"created_at"`
+	ID          uuid.UUID       `json:"id"`
+	Slug        string          `json:"slug"`
+	Name        string          `json:"name"`
+	CreatedBy   uuid.UUID       `json:"created_by"`
+	OwnerUserID uuid.UUID       `json:"owner_user_id"`
+	CopiedFrom  json.RawMessage `json:"copied_from,omitempty"`
+	CreatedAt   string          `json:"created_at"`
 }
 
 func toDTO(v domain.Vault) vaultDTO {
 	return vaultDTO{
-		ID:        v.ID,
-		Slug:      v.Slug,
-		Name:      v.Name,
-		CreatedBy: v.CreatedBy,
-		CreatedAt: v.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+		ID:          v.ID,
+		Slug:        v.Slug,
+		Name:        v.Name,
+		CreatedBy:   v.CreatedBy,
+		OwnerUserID: v.OwnerUserID,
+		CopiedFrom:  v.CopiedFrom,
+		CreatedAt:   v.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
 	}
 }
 

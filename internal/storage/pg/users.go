@@ -122,58 +122,50 @@ func (s *UserStore) CountUsers(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// SoleAdminVaultIDs returns vault IDs for which the user is the sole member
-// holding the seed Admin role.
-func (s *UserStore) SoleAdminVaultIDs(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error) {
+// OwnedVaults returns the vaults the user owns. v3 Phase O re-keys the LGPD
+// erasure guard on ownership: owned vaults must be transferred or explicitly
+// force-deleted before the account can be erased.
+func (s *UserStore) OwnedVaults(ctx context.Context, id uuid.UUID) ([]domain.Vault, error) {
 	const q = `
-SELECT vm.vault_id
-  FROM vault_members vm
-  JOIN vault_roles vr ON vr.id = vm.role_id
- WHERE vm.user_id = $1
-   AND vr.is_seed = TRUE
-   AND vr.name = 'Admin'
-   AND NOT EXISTS (
-       SELECT 1
-         FROM vault_members vm2
-         JOIN vault_roles vr2 ON vr2.id = vm2.role_id
-        WHERE vm2.vault_id = vm.vault_id
-          AND vm2.user_id <> vm.user_id
-          AND vr2.is_seed = TRUE
-          AND vr2.name = 'Admin'
-   )`
+SELECT id, slug, name, created_by, owner_user_id, copied_from, created_at
+  FROM vaults
+ WHERE owner_user_id = $1
+ ORDER BY name ASC`
 	rows, err := s.pool.Query(ctx, q, id)
 	if err != nil {
-		return nil, fmt.Errorf("user store: sole admin vaults: %w", errMap(err))
+		return nil, fmt.Errorf("user store: owned vaults: %w", errMap(err))
 	}
 	defer rows.Close()
 
-	var ids []uuid.UUID
+	var out []domain.Vault
 	for rows.Next() {
-		var v uuid.UUID
-		if err := rows.Scan(&v); err != nil {
-			return nil, fmt.Errorf("user store: sole admin vaults scan: %w", err)
+		v, err := scanVault(rows.Scan)
+		if err != nil {
+			return nil, fmt.Errorf("user store: owned vaults scan: %w", err)
 		}
-		ids = append(ids, v)
+		out = append(out, v)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("user store: sole admin vaults rows: %w", err)
+		return nil, fmt.Errorf("user store: owned vaults rows: %w", err)
 	}
-	return ids, nil
+	return out, nil
 }
 
 // Delete erases a user. LGPD-aware: anonymises audit_log rows in the same tx.
-func (s *UserStore) Delete(ctx context.Context, id uuid.UUID, forceDeleteSoleAdminVaults bool) error {
+// The vault guard is owner-based (v3 Phase O): owned vaults block erasure
+// unless forceDeleteOwnedVaults opts into deleting them.
+func (s *UserStore) Delete(ctx context.Context, id uuid.UUID, forceDeleteOwnedVaults bool) error {
 	return runTx(ctx, s.pool, func(tx pgx.Tx) error {
-		soleAdminVaults, err := soleAdminVaultIDsTx(ctx, tx, id)
+		ownedVaults, err := ownedVaultIDsTx(ctx, tx, id)
 		if err != nil {
-			return fmt.Errorf("user store: delete: sole admin probe: %w", err)
+			return fmt.Errorf("user store: delete: owned-vault probe: %w", err)
 		}
-		if len(soleAdminVaults) > 0 {
-			if !forceDeleteSoleAdminVaults {
+		if len(ownedVaults) > 0 {
+			if !forceDeleteOwnedVaults {
 				return fmt.Errorf("user store: delete: %w", domain.ErrSoleAdminVaults)
 			}
 			if _, err := tx.Exec(ctx,
-				`DELETE FROM vaults WHERE id = ANY($1)`, soleAdminVaults,
+				`DELETE FROM vaults WHERE id = ANY($1)`, ownedVaults,
 			); err != nil {
 				return fmt.Errorf("user store: delete: force vaults: %w", errMap(err))
 			}
@@ -194,24 +186,8 @@ func (s *UserStore) Delete(ctx context.Context, id uuid.UUID, forceDeleteSoleAdm
 	})
 }
 
-func soleAdminVaultIDsTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) ([]uuid.UUID, error) {
-	const q = `
-SELECT vm.vault_id
-  FROM vault_members vm
-  JOIN vault_roles vr ON vr.id = vm.role_id
- WHERE vm.user_id = $1
-   AND vr.is_seed = TRUE
-   AND vr.name = 'Admin'
-   AND NOT EXISTS (
-       SELECT 1
-         FROM vault_members vm2
-         JOIN vault_roles vr2 ON vr2.id = vm2.role_id
-        WHERE vm2.vault_id = vm.vault_id
-          AND vm2.user_id <> vm.user_id
-          AND vr2.is_seed = TRUE
-          AND vr2.name = 'Admin'
-   )`
-	rows, err := tx.Query(ctx, q, id)
+func ownedVaultIDsTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := tx.Query(ctx, `SELECT id FROM vaults WHERE owner_user_id = $1`, id)
 	if err != nil {
 		return nil, errMap(err)
 	}

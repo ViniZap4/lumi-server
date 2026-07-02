@@ -35,10 +35,17 @@ type Repo interface {
 	RoleForUser(ctx context.Context, vaultID, userID uuid.UUID) (domain.Role, error)
 }
 
+// VaultOwnerLookup resolves a vault so the owner-protection guards can run.
+// Implemented by *pg.VaultStore; wired via SetVaultLookup.
+type VaultOwnerLookup interface {
+	GetByID(ctx context.Context, id uuid.UUID) (domain.Vault, error)
+}
+
 // Service is the business-logic layer.
 type Service struct {
-	repo  Repo
-	audit audit.Recorder
+	repo   Repo
+	audit  audit.Recorder
+	vaults VaultOwnerLookup
 }
 
 func NewService(r Repo, a audit.Recorder) *Service {
@@ -46,6 +53,23 @@ func NewService(r Repo, a audit.Recorder) *Service {
 		a = audit.Noop{}
 	}
 	return &Service{repo: r, audit: a}
+}
+
+// SetVaultLookup enables the owner-protection guards (v3 Phase O: the owner
+// cannot be removed or demoted below Admin). nil disables — sole-admin
+// protection still applies.
+func (s *Service) SetVaultLookup(v VaultOwnerLookup) { s.vaults = v }
+
+// vaultOwner returns the owner id, or uuid.Nil when the lookup is not wired.
+func (s *Service) vaultOwner(ctx context.Context, vaultID uuid.UUID) (uuid.UUID, error) {
+	if s.vaults == nil {
+		return uuid.Nil, nil
+	}
+	v, err := s.vaults.GetByID(ctx, vaultID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return v.OwnerUserID, nil
 }
 
 // RoleForUser implements capguard.Resolver.
@@ -69,7 +93,7 @@ func (s *Service) Add(ctx context.Context, m domain.Member, ip, ua string) error
 	return nil
 }
 
-// ChangeRole refuses to demote the sole admin.
+// ChangeRole refuses to demote the sole admin or the vault owner.
 func (s *Service) ChangeRole(
 	ctx context.Context,
 	vaultID, userID, newRoleID uuid.UUID,
@@ -83,12 +107,17 @@ func (s *Service) ChangeRole(
 	if current.RoleID == newRoleID {
 		return nil
 	}
+	owner, err := s.vaultOwner(ctx, vaultID)
+	if err != nil {
+		return err
+	}
 	sole, err := s.repo.IsSoleAdmin(ctx, vaultID, userID)
 	if err != nil {
 		return err
 	}
-	if sole {
-		// Verify the new role is also Admin (lookup via role list join).
+	if sole || userID == owner {
+		// The target must land on the seed Admin role: the sole admin (and
+		// always the owner) keeps an Admin-equivalent grant.
 		joined, err := s.repo.ListForVault(ctx, vaultID)
 		if err != nil {
 			return err
@@ -101,6 +130,9 @@ func (s *Service) ChangeRole(
 			}
 		}
 		if newRole == nil || !(newRole.IsSeed && newRole.Name == "Admin") {
+			if userID == owner {
+				return ErrOwnerProtection{VaultID: vaultID, UserID: userID}
+			}
 			return ErrSoleAdminProtection{VaultID: vaultID, UserID: userID}
 		}
 	}
@@ -116,7 +148,7 @@ func (s *Service) ChangeRole(
 	return nil
 }
 
-// Remove refuses to remove the sole admin.
+// Remove refuses to remove the sole admin or the vault owner.
 func (s *Service) Remove(
 	ctx context.Context,
 	vaultID, userID uuid.UUID,
@@ -125,6 +157,13 @@ func (s *Service) Remove(
 ) error {
 	if _, err := s.repo.Get(ctx, vaultID, userID); err != nil {
 		return err
+	}
+	owner, err := s.vaultOwner(ctx, vaultID)
+	if err != nil {
+		return err
+	}
+	if userID == owner {
+		return ErrOwnerProtection{VaultID: vaultID, UserID: userID}
 	}
 	sole, err := s.repo.IsSoleAdmin(ctx, vaultID, userID)
 	if err != nil {
@@ -155,6 +194,25 @@ func (e ErrSoleAdminProtection) Unwrap() error { return domain.ErrConflict }
 
 func IsSoleAdminProtection(err error) bool {
 	var t ErrSoleAdminProtection
+	return errors.As(err, &t)
+}
+
+// ErrOwnerProtection is returned when a mutation would strip the vault owner
+// of their Admin-equivalent grant (removal, or demotion below Admin). Only
+// transfer-ownership changes who the owner is.
+type ErrOwnerProtection struct {
+	VaultID uuid.UUID
+	UserID  uuid.UUID
+}
+
+func (e ErrOwnerProtection) Error() string {
+	return fmt.Sprintf("user %s owns vault %s; transfer ownership first", e.UserID, e.VaultID)
+}
+
+func (e ErrOwnerProtection) Unwrap() error { return domain.ErrConflict }
+
+func IsOwnerProtection(err error) bool {
+	var t ErrOwnerProtection
 	return errors.As(err, &t)
 }
 
@@ -298,6 +356,11 @@ func (h *Handlers) remove(c *fiber.Ctx) error {
 
 func mapError(c *fiber.Ctx, err error) error {
 	switch {
+	case IsOwnerProtection(err):
+		return c.Status(http.StatusConflict).JSON(fiber.Map{
+			"error":   "owner_protected",
+			"message": err.Error(),
+		})
 	case IsSoleAdminProtection(err):
 		return c.Status(http.StatusConflict).JSON(fiber.Map{
 			"error":   "sole_admin",

@@ -31,8 +31,15 @@ type Repo interface {
 	GetByID(ctx context.Context, id uuid.UUID) (domain.User, error)
 	GetByUsername(ctx context.Context, username string) (domain.User, error)
 	UpdateDisplayName(ctx context.Context, id uuid.UUID, name string) error
-	Delete(ctx context.Context, id uuid.UUID, forceDeleteSoleAdminVaults bool) error
-	SoleAdminVaultIDs(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error)
+	Delete(ctx context.Context, id uuid.UUID, forceDeleteOwnedVaults bool) error
+	OwnedVaults(ctx context.Context, id uuid.UUID) ([]domain.Vault, error)
+}
+
+// VaultDirRemover removes a vault's on-disk directory. Implemented by
+// *fs.Manager; wired via SetVaultDirRemover so erasure can clean up the
+// filesystem side of force-deleted owned vaults.
+type VaultDirRemover interface {
+	RemoveVaultDir(slug string) error
 }
 
 // ConsentReader exposes the consent ledger for export.
@@ -58,12 +65,13 @@ type PasswordChecker interface {
 
 // Service orchestrates user CRUD plus the two LGPD endpoints.
 type Service struct {
-	repo     Repo
-	consents ConsentReader
-	audit    AuditReader
-	recorder audit.Recorder
-	vaults   VaultLister
-	now      func() time.Time
+	repo      Repo
+	consents  ConsentReader
+	audit     AuditReader
+	recorder  audit.Recorder
+	vaults    VaultLister
+	vaultDirs VaultDirRemover
+	now       func() time.Time
 }
 
 func NewService(repo Repo, consents ConsentReader, auditR AuditReader, recorder audit.Recorder, vaults VaultLister) *Service {
@@ -105,28 +113,45 @@ func (s *Service) UpdateDisplayName(ctx context.Context, id uuid.UUID, name stri
 	return nil
 }
 
+// SetVaultDirRemover wires the FS side of erasure. Pass nil to disable
+// (row deletion still succeeds; directories are then orphaned until an
+// operator sweep).
+func (s *Service) SetVaultDirRemover(r VaultDirRemover) { s.vaultDirs = r }
+
 // SoleAdminError carries the offending vault ids when the caller hasn't
-// opted into deleting them.
+// opted into deleting them. The name (and the wire error it maps to,
+// "sole_admin_vaults") predates v3's owner re-key; since the owner always
+// holds an Admin grant the two sets coincide for callers, so the API shape
+// is kept stable while the guard is now ownership-based.
 type SoleAdminError struct{ VaultIDs []uuid.UUID }
 
 func (e SoleAdminError) Error() string {
-	return fmt.Sprintf("sole admin of %d vault(s)", len(e.VaultIDs))
+	return fmt.Sprintf("owner of %d vault(s)", len(e.VaultIDs))
 }
 func (e SoleAdminError) Unwrap() error { return domain.ErrSoleAdminVaults }
 
-// Delete enacts LGPD right of erasure.
+// Delete enacts LGPD right of erasure. Owned vaults block erasure unless
+// forceVaults opts into deleting them (rows in-tx, directories after).
 func (s *Service) Delete(ctx context.Context, id uuid.UUID, forceVaults bool, ip, ua *string) error {
-	soleAdmin, err := s.repo.SoleAdminVaultIDs(ctx, id)
+	owned, err := s.repo.OwnedVaults(ctx, id)
 	if err != nil {
-		return fmt.Errorf("sole-admin check: %w", err)
+		return fmt.Errorf("owned-vault check: %w", err)
 	}
-	if len(soleAdmin) > 0 && !forceVaults {
-		return SoleAdminError{VaultIDs: soleAdmin}
+	if len(owned) > 0 && !forceVaults {
+		ids := make([]uuid.UUID, len(owned))
+		for i, v := range owned {
+			ids[i] = v.ID
+		}
+		return SoleAdminError{VaultIDs: ids}
 	}
 
+	ownedIDs := make([]uuid.UUID, len(owned))
+	for i, v := range owned {
+		ownedIDs[i] = v.ID
+	}
 	payload, _ := json.Marshal(map[string]any{
-		"force_delete_sole_admin_vaults": forceVaults,
-		"sole_admin_vault_ids":           soleAdmin,
+		"force_delete_owned_vaults": forceVaults,
+		"owned_vault_ids":           ownedIDs,
 	})
 	if err := s.recorder.Record(ctx, domain.AuditEntry{
 		UserID:    &id,
@@ -139,7 +164,18 @@ func (s *Service) Delete(ctx context.Context, id uuid.UUID, forceVaults bool, ip
 		return fmt.Errorf("audit user.delete: %w", err)
 	}
 
-	return s.repo.Delete(ctx, id, forceVaults)
+	if err := s.repo.Delete(ctx, id, forceVaults); err != nil {
+		return err
+	}
+	// Rows are gone; remove the on-disk directories of the force-deleted
+	// owned vaults. Failures are non-fatal (the DB is authoritative and
+	// the operator can sweep orphans), matching vaults.Service.Delete.
+	if forceVaults && s.vaultDirs != nil {
+		for _, v := range owned {
+			_ = s.vaultDirs.RemoveVaultDir(v.Slug)
+		}
+	}
+	return nil
 }
 
 // CanExportNow returns false if the most recent user.export_request audit

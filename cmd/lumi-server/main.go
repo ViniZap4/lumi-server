@@ -427,8 +427,10 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	// Domain services.
 	rolesSvc := roles.NewService(roleStore, auditStore)
 	membersSvc := members.NewService(memberRepoAdapter{memberStore}, auditStore)
+	membersSvc.SetVaultLookup(vaultStore)
 	vaultsSvc := vaults.NewService(vaultStore, roleStore, memberStore, fsMgr, auditStore, membersSvc)
 	usersSvc := users.NewService(userStore, consentStore, auditStore, auditStore, vaultStore)
+	usersSvc.SetVaultDirRemover(fsMgr)
 	// FS watcher. Handler is set below once the WS hub exists; the
 	// silencer side (SkipNext) is what notes.Service needs at this
 	// point, and that surface is available immediately.
@@ -442,6 +444,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 
 	fsWatcher.SetHandler(buildFSHandler(zlog, vaultStore, noteStore, fsMgr, crdtRegistry, wsHub))
 	vaultsSvc.SetWatcher(fsWatcher)
+	vaultsSvc.SetOwnershipDeps(memberStore, userStore, notesSvc)
 	if err := fsWatcher.WatchExistingVaults(); err != nil {
 		zlog.Warn().Err(err).Msg("fswatch: WatchExistingVaults")
 	}

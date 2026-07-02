@@ -30,12 +30,21 @@ type Session struct {
 
 // Vault is the unit of organisation. May be local-only on disk or
 // server-bound. Server-side rows exist only for server-bound vaults.
+//
+// OwnerUserID is the single owner (v3 Phase O): always holds an
+// Admin-equivalent grant that members.manage cannot revoke; transferable via
+// the transfer-ownership endpoint. CreatedBy is historical provenance and is
+// nullified (uuid.Nil) when the creator exercises LGPD erasure after
+// transferring ownership away. CopiedFrom is non-nil JSON provenance when the
+// vault was created by share-a-copy.
 type Vault struct {
-	ID        uuid.UUID
-	Slug      string
-	Name      string
-	CreatedBy uuid.UUID
-	CreatedAt time.Time
+	ID          uuid.UUID
+	Slug        string
+	Name        string
+	CreatedBy   uuid.UUID
+	OwnerUserID uuid.UUID
+	CopiedFrom  []byte
+	CreatedAt   time.Time
 }
 
 // Role is a named capability set scoped to a single vault. Seed roles
@@ -119,6 +128,8 @@ const (
 	ActionVaultCreate        = "vault.create"
 	ActionVaultDelete        = "vault.delete"
 	ActionVaultUpdate        = "vault.update"
+	ActionVaultTransfer      = "vault.transfer"
+	ActionVaultCopy          = "vault.copy"
 	ActionMemberInvite       = "member.invite"
 	ActionMemberAdd          = "member.add"
 	ActionMemberRemove       = "member.remove"
