@@ -462,6 +462,23 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	if err != nil {
 		return nil, nil, fmt.Errorf("federation service: %w", err)
 	}
+	// F2 content relay: live sessions registry + follower dial loops. The
+	// registry persist hook is the fan-out point for every write path;
+	// note creations get their own nudge (InitFromText bypasses the hook).
+	relayLinks := federation.NewLinks(ctx, federation.RelayDeps{
+		Registry: crdtRegistry,
+		Rooms:    wsHub,
+		Notes:    noteStore,
+		Mirror:   notesSvc.WriteBodyFromCRDT,
+		Log:      zlog,
+	})
+	crdtRegistry.SetOnPersist(relayLinks.OnPersist)
+	notesSvc.SetFederationNotifier(relayLinks)
+	relayManager := federation.NewManager(federationSvc, relayLinks, nil, zlog)
+	federationSvc.SetLinkController(relayManager)
+	if err := relayManager.Start(ctx); err != nil {
+		zlog.Warn().Err(err).Msg("federation: relay manager start")
+	}
 	invitesSvc := invites.NewService(invites.Deps{
 		Repo:          inviteStore,
 		Users:         userStore,
@@ -524,6 +541,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	// Invites: split between vault-scoped (authed) and public.
 	invites.NewHandlers(invitesSvc).Register(app, authed, membersSvc)
 	federation.NewHandlers(federationSvc, membersSvc).Register(app, authed)
+	federation.NewRelayHandlers(federationSvc, relayLinks, zlog).Register(app)
 
 	shutdown := func(ctx context.Context) error {
 		_ = ctx

@@ -306,6 +306,16 @@ func (r *Room) ApplyAndBroadcastFromFS(update []byte) error {
 	return r.applyAndBroadcastWithOrigin(update, nil, uuid.Nil, OriginFSWatcher)
 }
 
+// ApplyAndBroadcastFederation applies an update relayed from a federated
+// peer server (v3 F2). Broadcasts to ALL local subscribers (the change has
+// no local WS origin to suppress) and schedules the FS mirror — unlike an
+// FS-origin update, the local file does not yet reflect this change.
+// originKind is "federation:<peer-url>" so the registry persist hook can
+// suppress echoing the update back to its source link.
+func (r *Room) ApplyAndBroadcastFederation(update []byte, originKind string) error {
+	return r.applyAndBroadcastWithOrigin(update, nil, uuid.Nil, originKind)
+}
+
 func (r *Room) applyAndBroadcastWithOrigin(update []byte, origin *Subscriber, originUser uuid.UUID, originKind string) error {
 	if r.evicted.Load() {
 		return fmt.Errorf("wsync: room evicted")

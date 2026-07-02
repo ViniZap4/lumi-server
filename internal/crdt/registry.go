@@ -3,6 +3,7 @@ package crdt
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/google/uuid"
 )
@@ -50,7 +51,17 @@ type UpdateRow struct {
 // (live Yjs sync) introduces an LRU keyed by (vault_id, note_id).
 type Registry struct {
 	store SnapshotRepo
+
+	hookMu    sync.RWMutex
+	onPersist PersistHook
 }
+
+// PersistHook observes every successfully-appended update (v3 F2: the
+// federation relay fans updates out to peer servers from here — the one
+// choke point every write path crosses: live WS, REST diff, FS watcher,
+// and inbound federation itself). Implementations MUST be fast and
+// non-blocking; they run synchronously on the write path.
+type PersistHook func(vaultID uuid.UUID, noteID string, update []byte, originKind string)
 
 // NewRegistry constructs a Registry around the storage. store must not
 // be nil.
@@ -59,6 +70,22 @@ func NewRegistry(store SnapshotRepo) *Registry {
 		panic("crdt.NewRegistry: store is required")
 	}
 	return &Registry{store: store}
+}
+
+// SetOnPersist installs the persist hook. Pass nil to remove.
+func (r *Registry) SetOnPersist(h PersistHook) {
+	r.hookMu.Lock()
+	defer r.hookMu.Unlock()
+	r.onPersist = h
+}
+
+func (r *Registry) firePersistHook(vaultID uuid.UUID, noteID string, update []byte, originKind string) {
+	r.hookMu.RLock()
+	h := r.onPersist
+	r.hookMu.RUnlock()
+	if h != nil {
+		h(vaultID, noteID, update, originKind)
+	}
 }
 
 // LoadDoc fetches the persisted snapshot (if any) plus every update in
@@ -113,6 +140,7 @@ func (r *Registry) PersistChange(
 	if _, err := r.store.AppendUpdate(ctx, vaultID, noteID, update, originUserID, originKind); err != nil {
 		return err
 	}
+	r.firePersistHook(vaultID, noteID, update, originKind)
 
 	count, bytes, err := r.store.CountUpdates(ctx, vaultID, noteID)
 	if err != nil {

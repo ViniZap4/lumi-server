@@ -74,6 +74,25 @@ func (f *fakeFedRepo) ListForVault(_ context.Context, vaultID uuid.UUID) ([]doma
 	return out, nil
 }
 
+func (f *fakeFedRepo) ListActiveByRole(_ context.Context, role string) ([]domain.Federation, error) {
+	var out []domain.Federation
+	for _, fed := range f.rows {
+		if fed.Role == role && fed.Status == "active" {
+			out = append(out, fed)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeFedRepo) GetActiveByVaultAndPeer(_ context.Context, vaultID uuid.UUID, peerURL string) (domain.Federation, error) {
+	for _, fed := range f.rows {
+		if fed.VaultID == vaultID && fed.PeerURL == peerURL && fed.Status == "active" {
+			return fed, nil
+		}
+	}
+	return domain.Federation{}, domain.ErrNotFound
+}
+
 func (f *fakeFedRepo) UpdateStatus(_ context.Context, id uuid.UUID, status string, at time.Time) error {
 	fed, ok := f.rows[id]
 	if !ok {
@@ -165,6 +184,9 @@ type fakeHome struct {
 func (f *fakeHome) Identity(context.Context, string) (Identity, error) { return f.identity, nil }
 func (f *fakeHome) Accept(_ context.Context, _ string, req AcceptRequest) (AcceptResponse, error) {
 	return f.accept(req)
+}
+func (f *fakeHome) SyncChallenge(context.Context, string, uuid.UUID, string) (string, error) {
+	return "", errors.New("not implemented in fake")
 }
 
 // ---- harness -----------------------------------------------------------------

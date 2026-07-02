@@ -86,7 +86,32 @@ func (s *FederationStore) Get(ctx context.Context, id uuid.UUID) (domain.Federat
 
 func (s *FederationStore) ListForVault(ctx context.Context, vaultID uuid.UUID) ([]domain.Federation, error) {
 	q := `SELECT ` + federationCols + ` FROM vault_federations WHERE vault_id = $1 ORDER BY created_at ASC`
-	rows, err := s.pool.Query(ctx, q, vaultID)
+	return s.list(ctx, q, vaultID)
+}
+
+// ListActiveByRole feeds the relay manager's boot sweep ('follower') and
+// any future home-side bookkeeping.
+func (s *FederationStore) ListActiveByRole(ctx context.Context, role string) ([]domain.Federation, error) {
+	q := `SELECT ` + federationCols + ` FROM vault_federations WHERE role = $1 AND status = 'active' ORDER BY created_at ASC`
+	return s.list(ctx, q, role)
+}
+
+// GetActiveByVaultAndPeer authenticates relay challenges/upgrades.
+func (s *FederationStore) GetActiveByVaultAndPeer(ctx context.Context, vaultID uuid.UUID, peerURL string) (domain.Federation, error) {
+	q := `SELECT ` + federationCols + ` FROM vault_federations WHERE vault_id = $1 AND peer_url = $2 AND status = 'active'`
+	row := s.pool.QueryRow(ctx, q, vaultID, peerURL)
+	f, err := scanFederation(row.Scan)
+	if err != nil {
+		if errors.Is(errMap(err), domain.ErrNotFound) {
+			return domain.Federation{}, fmt.Errorf("federation store: %w", domain.ErrNotFound)
+		}
+		return domain.Federation{}, fmt.Errorf("federation store: get by peer: %w", errMap(err))
+	}
+	return f, nil
+}
+
+func (s *FederationStore) list(ctx context.Context, q string, args ...any) ([]domain.Federation, error) {
+	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("federation store: list: %w", errMap(err))
 	}

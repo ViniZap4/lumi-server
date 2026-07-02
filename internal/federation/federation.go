@@ -48,6 +48,8 @@ type FederationRepo interface {
 	Insert(ctx context.Context, f domain.Federation) (domain.Federation, error)
 	Get(ctx context.Context, id uuid.UUID) (domain.Federation, error)
 	ListForVault(ctx context.Context, vaultID uuid.UUID) ([]domain.Federation, error)
+	ListActiveByRole(ctx context.Context, role string) ([]domain.Federation, error)
+	GetActiveByVaultAndPeer(ctx context.Context, vaultID uuid.UUID, peerURL string) (domain.Federation, error)
 	UpdateStatus(ctx context.Context, id uuid.UUID, status string, at time.Time) error
 }
 
@@ -69,11 +71,12 @@ type VaultCreator interface {
 	Create(ctx context.Context, in vaults.CreateInput) (domain.Vault, error)
 }
 
-// HomeClient talks to the home server during join. Implemented by httpClient;
-// faked in tests.
+// HomeClient talks to the home server during join and relay setup.
+// Implemented by httpClient; faked in tests.
 type HomeClient interface {
 	Identity(ctx context.Context, homeURL string) (Identity, error)
 	Accept(ctx context.Context, homeURL string, req AcceptRequest) (AcceptResponse, error)
+	SyncChallenge(ctx context.Context, homeURL string, vaultID uuid.UUID, peerURL string) (nonce string, err error)
 }
 
 // ---- wire shapes (shared by handlers and client) ------------------------------
@@ -118,6 +121,7 @@ type Service struct {
 	client      HomeClient
 	audit       audit.Recorder
 	baseURL     string
+	relay       LinkController
 	now         func() time.Time
 }
 
@@ -428,6 +432,11 @@ func (s *Service) Join(ctx context.Context, in JoinInput) (domain.Vault, domain.
 		return domain.Vault{}, domain.Federation{}, err
 	}
 
+	// Kick the F2 relay so content starts flowing without a restart.
+	if s.relay != nil {
+		s.relay.StartLink(context.WithoutCancel(ctx), replica.ID, homeURL)
+	}
+
 	s.recordAudit(ctx, &in.Actor, replica.ID, domain.ActionFederationAccept, in.IP, in.UserAgent, map[string]any{
 		"role":     "follower",
 		"peer_url": homeURL,
@@ -441,9 +450,21 @@ func (s *Service) ListFederations(ctx context.Context, vaultID uuid.UUID) ([]dom
 	return s.federations.ListForVault(ctx, vaultID)
 }
 
-// RevokeFederation severs a link from this side. Signed revocation events to
-// the peer are F3; for F1 the row flips to revoked and F2's relay will refuse
-// non-active links.
+// LinkController is the relay-manager surface the service pokes on
+// lifecycle changes: start a follower loop after Join, tear a link down on
+// revoke. Wired via SetLinkController; nil-safe.
+type LinkController interface {
+	StartLink(ctx context.Context, vaultID uuid.UUID, homeURL string)
+	StopLink(vaultID uuid.UUID, peerURL string)
+}
+
+// SetLinkController wires the F2 relay manager. Called by the composition
+// root after both objects exist (they reference each other).
+func (s *Service) SetLinkController(lc LinkController) { s.relay = lc }
+
+// RevokeFederation severs a link from this side: the row flips to revoked,
+// the live relay session (if any) is closed, and reconnect loops stop.
+// Signed revocation events to the peer are F3.
 func (s *Service) RevokeFederation(ctx context.Context, vaultID, fedID, actor uuid.UUID, ip, ua string) error {
 	f, err := s.federations.Get(ctx, fedID)
 	if err != nil {
@@ -457,6 +478,9 @@ func (s *Service) RevokeFederation(ctx context.Context, vaultID, fedID, actor uu
 	}
 	if err := s.federations.UpdateStatus(ctx, fedID, "revoked", s.now().UTC()); err != nil {
 		return err
+	}
+	if s.relay != nil {
+		s.relay.StopLink(vaultID, f.PeerURL)
 	}
 	s.recordAudit(ctx, &actor, vaultID, domain.ActionFederationRevoke, ip, ua, map[string]any{
 		"kind":     "federation",

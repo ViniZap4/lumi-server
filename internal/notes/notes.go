@@ -72,14 +72,15 @@ func (nopSilencer) SkipNext(string) {}
 // return 503 but the rest of the surface keeps working. This lets the
 // server boot in environments without libyrs (smoke tests, fallback).
 type Service struct {
-	notes    NoteRepo
-	vaults   VaultLookup
-	fs       *fs.Manager
-	audit    audit.Recorder
-	resolver capguard.Resolver
-	crdt     *crdt.Registry
-	silencer FSEventSilencer
-	now      func() time.Time
+	notes     NoteRepo
+	vaults    VaultLookup
+	fs        *fs.Manager
+	audit     audit.Recorder
+	resolver  capguard.Resolver
+	crdt      *crdt.Registry
+	silencer  FSEventSilencer
+	fedNotify FederationNotifier
+	now       func() time.Time
 }
 
 func NewService(
@@ -111,6 +112,16 @@ func NewService(
 		now:      time.Now,
 	}
 }
+
+// FederationNotifier hears about note creations so the F2 relay can
+// announce them to federated peers (InitFromText bypasses the registry
+// persist hook). Implementations must be fast and non-blocking.
+type FederationNotifier interface {
+	NoteCreated(vaultID uuid.UUID, noteID, path, title string)
+}
+
+// SetFederationNotifier wires the relay; nil disables.
+func (s *Service) SetFederationNotifier(n FederationNotifier) { s.fedNotify = n }
 
 // suppressFSEvent computes the absolute on-disk path for (slug, rel)
 // and registers it in the watcher's skip map. Cheap; safe to call
@@ -225,6 +236,11 @@ func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput)
 	// lazily fill in on the next write.
 	if s.crdt != nil {
 		_ = s.crdt.InitFromText(ctx, vaultID, id, in.Body, in.Actor, "snapshot-init")
+	}
+	// InitFromText bypasses PersistChange, so federated peers need an
+	// explicit nudge for brand-new notes (v3 F2).
+	if s.fedNotify != nil {
+		s.fedNotify.NoteCreated(vaultID, id, relPath, title)
 	}
 
 	s.recordAudit(ctx, in.Actor, vaultID, domain.ActionNoteCreate, in.IP, in.UA, map[string]any{

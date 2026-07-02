@@ -8,6 +8,9 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	fws "github.com/fasthttp/websocket"
+	"github.com/google/uuid"
 )
 
 // httpClient is the default HomeClient: plain JSON over HTTP(S) with tight
@@ -40,6 +43,34 @@ func (h *httpClient) Accept(ctx context.Context, homeURL string, req AcceptReque
 		return AcceptResponse{}, err
 	}
 	return out, nil
+}
+
+func (h *httpClient) SyncChallenge(ctx context.Context, homeURL string, vaultID uuid.UUID, peerURL string) (string, error) {
+	var out struct {
+		Nonce string `json:"nonce"`
+	}
+	req := map[string]string{"vault_id": vaultID.String(), "peer_url": peerURL}
+	if err := h.postJSON(ctx, homeURL+"/api/federation/sync-challenge", req, &out); err != nil {
+		return "", err
+	}
+	if out.Nonce == "" {
+		return "", fmt.Errorf("federation: home returned empty nonce")
+	}
+	return out.Nonce, nil
+}
+
+// defaultDialer opens the relay WebSocket via fasthttp/websocket (the same
+// stack the server side uses).
+func defaultDialer(ctx context.Context, wsURL string) (wsConn, error) {
+	d := &fws.Dialer{HandshakeTimeout: 15 * time.Second}
+	conn, resp, err := d.DialContext(ctx, wsURL, nil)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 func (h *httpClient) getJSON(ctx context.Context, url string, out any) error {
