@@ -66,6 +66,19 @@ type RoomLookup interface {
 // the federation layer back. Implemented by notes.Service.DeleteFromFederation.
 type DeleteFunc func(ctx context.Context, vaultID uuid.UUID, noteID string) error
 
+// F3 control-plane callbacks; all nil-safe (F2-only setups skip them).
+type (
+	// ControlCurrentFunc returns home's signed control document for
+	// session-open push. Implemented by Service.CurrentControlState.
+	ControlCurrentFunc func(ctx context.Context, vaultID uuid.UUID) (state, sig []byte, ok bool)
+	// ControlApplyFunc verifies+stores a document on the follower and
+	// returns the applied cursor. Implemented by Service.ApplyControlState.
+	ControlApplyFunc func(ctx context.Context, vaultID uuid.UUID, peerURL string, state, sig []byte) (int64, error)
+	// ControlAckedFunc records follower progress on the home side.
+	// Implemented by Service.RecordControlAck.
+	ControlAckedFunc func(vaultID uuid.UUID, peerURL string, seq int64)
+)
+
 // RelayDeps is everything a Session needs to apply and read note state.
 type RelayDeps struct {
 	Registry *crdt.Registry
@@ -74,6 +87,10 @@ type RelayDeps struct {
 	Mirror   MirrorFunc
 	Delete   DeleteFunc
 	Log      zerolog.Logger
+
+	ControlCurrent ControlCurrentFunc
+	ControlApply   ControlApplyFunc
+	ControlAcked   ControlAckedFunc
 }
 
 // ---- Links: the live-session registry -------------------------------------------
@@ -170,6 +187,17 @@ func (l *Links) NoteCreated(vaultID uuid.UUID, noteID, path, title string) {
 // to every link on the vault.
 func (l *Links) NoteDeleted(vaultID uuid.UUID, noteID string) {
 	l.fanDelete(vaultID, noteID, nil)
+}
+
+// PushControl fans a fresh signed control document to every home-role link
+// on the vault (only home authors control state).
+func (l *Links) PushControl(vaultID uuid.UUID, state, sig []byte) {
+	frame := EncodeControlState(state, sig)
+	for _, s := range l.sessionsFor(vaultID) {
+		if s.role == "home" {
+			s.send(frame)
+		}
+	}
 }
 
 func (l *Links) fanDelete(vaultID uuid.UUID, noteID string, except *Session) {
@@ -290,9 +318,9 @@ func (s *Session) writePump() {
 	}
 }
 
-// sendOpening (home): manifest of every note, then a Step1 per note so the
+// sendOpening (home): manifest of every note, a Step1 per note so the
 // follower can send us what we're missing while we send Step2s with what
-// they're missing.
+// they're missing, then the current signed control state (F3).
 func (s *Session) sendOpening() error {
 	metas, err := s.listAllNotes()
 	if err != nil {
@@ -301,6 +329,11 @@ func (s *Session) sendOpening() error {
 	s.send(EncodeManifest(metas))
 	for _, m := range metas {
 		s.sendStep1(m.ID)
+	}
+	if s.deps.ControlCurrent != nil {
+		if state, sig, ok := s.deps.ControlCurrent(s.ctx, s.vaultID); ok {
+			s.send(EncodeControlState(state, sig))
+		}
 	}
 	return nil
 }
@@ -393,6 +426,26 @@ func (s *Session) handleFrame(f Frame) error {
 		}
 		// Relay onward to the vault's other links, skipping the source.
 		s.links.fanDelete(s.vaultID, f.NoteID, s)
+		return nil
+
+	case frameControlState:
+		// Only followers accept control state, and only from their home.
+		if s.role != "follower" || s.deps.ControlApply == nil {
+			return nil
+		}
+		seq, err := s.deps.ControlApply(s.ctx, s.vaultID, s.peerURL, f.Payload, f.Sig)
+		if err != nil {
+			// Verification failure means a hostile or misconfigured
+			// peer: drop the link rather than run on unverified state.
+			return fmt.Errorf("federation: control state rejected: %w", err)
+		}
+		s.send(EncodeControlAck(seq))
+		return nil
+
+	case frameControlAck:
+		if s.role == "home" && s.deps.ControlAcked != nil {
+			s.deps.ControlAcked(s.vaultID, s.peerURL, f.Seq)
+		}
 		return nil
 
 	case frameNoteSync:

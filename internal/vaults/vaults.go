@@ -70,6 +70,9 @@ type Service struct {
 	memberDir MemberDirectory
 	users     UserDirectory
 	copier    NoteCopier
+
+	// F3 control plane; nil disables.
+	controlNotify ControlPlaneNotifier
 }
 
 func NewService(
@@ -101,6 +104,15 @@ func NewService(
 // to disable. Called by the composition root once both the vaults
 // service and the fswatch manager exist.
 func (s *Service) SetWatcher(w VaultWatcher) { s.watcher = w }
+
+// ControlPlaneNotifier hears about vault renames so the federation control
+// plane can re-push signed state to followers (v3 F3).
+type ControlPlaneNotifier interface {
+	ControlChanged(vaultID uuid.UUID)
+}
+
+// SetControlNotifier wires the federation control plane; nil disables.
+func (s *Service) SetControlNotifier(n ControlPlaneNotifier) { s.controlNotify = n }
 
 // ---- Slug ------------------------------------------------------------------
 
@@ -334,6 +346,12 @@ func (s *Service) UpdateName(ctx context.Context, vaultID uuid.UUID, newName str
 		"vault_id": vaultID,
 		"name":     name,
 	})
+	// Renames replicate through the federation control state. Skip the
+	// notify for control-applied renames (actor == Nil) to avoid a
+	// rebuild loop on followers.
+	if actor != uuid.Nil && s.controlNotify != nil {
+		s.controlNotify.ControlChanged(vaultID)
+	}
 	return nil
 }
 

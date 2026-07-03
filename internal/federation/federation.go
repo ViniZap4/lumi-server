@@ -123,6 +123,11 @@ type Service struct {
 	baseURL     string
 	relay       LinkController
 	now         func() time.Time
+
+	// F3 control plane (nil = disabled).
+	control       *ControlPlaneDeps
+	renamer       VaultRenamer
+	resolverCache *resolverCache
 }
 
 type Deps struct {

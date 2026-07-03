@@ -65,13 +65,15 @@ type PasswordChecker interface {
 
 // Service orchestrates user CRUD plus the two LGPD endpoints.
 type Service struct {
-	repo      Repo
-	consents  ConsentReader
-	audit     AuditReader
-	recorder  audit.Recorder
-	vaults    VaultLister
-	vaultDirs VaultDirRemover
-	now       func() time.Time
+	repo          Repo
+	consents      ConsentReader
+	audit         AuditReader
+	recorder      audit.Recorder
+	vaults        VaultLister
+	vaultDirs     VaultDirRemover
+	controlNotify ControlPlaneNotifier
+	federations   FederationLister
+	now           func() time.Time
 }
 
 func NewService(repo Repo, consents ConsentReader, auditR AuditReader, recorder audit.Recorder, vaults VaultLister) *Service {
@@ -117,6 +119,16 @@ func (s *Service) UpdateDisplayName(ctx context.Context, id uuid.UUID, name stri
 // (row deletion still succeeds; directories are then orphaned until an
 // operator sweep).
 func (s *Service) SetVaultDirRemover(r VaultDirRemover) { s.vaultDirs = r }
+
+// ControlPlaneNotifier propagates erasure to federated followers (v3 F3):
+// the erased user's memberships vanish from the re-pushed control state,
+// revoking their access on every follower server.
+type ControlPlaneNotifier interface {
+	ControlChanged(vaultID uuid.UUID)
+}
+
+// SetControlNotifier wires the federation control plane; nil disables.
+func (s *Service) SetControlNotifier(n ControlPlaneNotifier) { s.controlNotify = n }
 
 // SoleAdminError carries the offending vault ids when the caller hasn't
 // opted into deleting them. The name (and the wire error it maps to,
@@ -164,6 +176,14 @@ func (s *Service) Delete(ctx context.Context, id uuid.UUID, forceVaults bool, ip
 		return fmt.Errorf("audit user.delete: %w", err)
 	}
 
+	// Capture memberships BEFORE deletion: the FK cascade silently drops
+	// them, and federated followers must hear the resulting control-state
+	// change (LGPD erasure propagation).
+	var memberVaults []domain.Vault
+	if s.controlNotify != nil {
+		memberVaults, _ = s.vaults.ListForUser(ctx, id)
+	}
+
 	if err := s.repo.Delete(ctx, id, forceVaults); err != nil {
 		return err
 	}
@@ -173,6 +193,14 @@ func (s *Service) Delete(ctx context.Context, id uuid.UUID, forceVaults bool, ip
 	if forceVaults && s.vaultDirs != nil {
 		for _, v := range owned {
 			_ = s.vaultDirs.RemoveVaultDir(v.Slug)
+		}
+	}
+	// Re-push control state for every vault the user belonged to (owned
+	// vaults were deleted outright; surviving shared vaults lose the
+	// member entry).
+	if s.controlNotify != nil {
+		for _, v := range memberVaults {
+			s.controlNotify.ControlChanged(v.ID)
 		}
 	}
 	return nil
@@ -216,7 +244,26 @@ type ManifestVault struct {
 	ID   uuid.UUID `json:"id"`
 	Slug string    `json:"slug"`
 	Name string    `json:"name"`
+	// LGPD right of access: where this vault's data is replicated to
+	// (federated peer servers), when the control plane is wired.
+	Federations []ManifestFederation `json:"federations,omitempty"`
 }
+
+// ManifestFederation is one peer server a vault's data flows to/from.
+type ManifestFederation struct {
+	PeerURL      string  `json:"peer_url"`
+	Role         string  `json:"role"` // this server's role: home | follower
+	Status       string  `json:"status"`
+	Jurisdiction *string `json:"jurisdiction,omitempty"`
+}
+
+// FederationLister exposes vault federation links for the export manifest.
+type FederationLister interface {
+	ListForVault(ctx context.Context, vaultID uuid.UUID) ([]domain.Federation, error)
+}
+
+// SetFederationLister wires federation visibility into exports; nil disables.
+func (s *Service) SetFederationLister(f FederationLister) { s.federations = f }
 
 // Export builds a zip in memory and returns it. Phase 1 keeps it simple
 // (manifest + consents + audit + vault metadata; not note bodies). Phase 2
@@ -241,7 +288,20 @@ func (s *Service) Export(ctx context.Context, id uuid.UUID) ([]byte, error) {
 
 	mvs := make([]ManifestVault, 0, len(vaultList))
 	for _, v := range vaultList {
-		mvs = append(mvs, ManifestVault{ID: v.ID, Slug: v.Slug, Name: v.Name})
+		mv := ManifestVault{ID: v.ID, Slug: v.Slug, Name: v.Name}
+		if s.federations != nil {
+			if feds, err := s.federations.ListForVault(ctx, v.ID); err == nil {
+				for _, f := range feds {
+					mv.Federations = append(mv.Federations, ManifestFederation{
+						PeerURL:      f.PeerURL,
+						Role:         f.Role,
+						Status:       f.Status,
+						Jurisdiction: f.Jurisdiction,
+					})
+				}
+			}
+		}
+		mvs = append(mvs, mv)
 	}
 
 	manifest := Manifest{

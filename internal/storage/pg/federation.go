@@ -52,7 +52,7 @@ func NewFederationStore(pool *pgxpool.Pool) *FederationStore {
 	return &FederationStore{pool: pool}
 }
 
-const federationCols = `id, vault_id, role, peer_url, peer_pubkey, jurisdiction, status, created_at, revoked_at`
+const federationCols = `id, vault_id, role, peer_url, peer_pubkey, jurisdiction, status, last_acked_seq, created_at, revoked_at`
 
 func (s *FederationStore) Insert(ctx context.Context, f domain.Federation) (domain.Federation, error) {
 	const q = `
@@ -143,7 +143,7 @@ func (s *FederationStore) UpdateStatus(ctx context.Context, id uuid.UUID, status
 
 func scanFederation(scan func(dest ...any) error) (domain.Federation, error) {
 	var f domain.Federation
-	if err := scan(&f.ID, &f.VaultID, &f.Role, &f.PeerURL, &f.PeerPubKey, &f.Jurisdiction, &f.Status, &f.CreatedAt, &f.RevokedAt); err != nil {
+	if err := scan(&f.ID, &f.VaultID, &f.Role, &f.PeerURL, &f.PeerPubKey, &f.Jurisdiction, &f.Status, &f.LastAckedSeq, &f.CreatedAt, &f.RevokedAt); err != nil {
 		return domain.Federation{}, err
 	}
 	return f, nil

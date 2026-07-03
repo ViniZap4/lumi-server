@@ -48,6 +48,7 @@ var knownCaps = map[domain.Capability]struct{}{
 	domain.CapRolesManage:   {},
 	domain.CapVaultManage:   {},
 	domain.CapVaultExport:   {},
+	domain.CapVaultFederate: {},
 	domain.CapAuditRead:     {},
 }
 
@@ -61,8 +62,9 @@ var knownWildcardPrefixes = map[string]struct{}{
 
 // Service is the business-logic layer.
 type Service struct {
-	repo  Repo
-	audit audit.Recorder
+	repo          Repo
+	audit         audit.Recorder
+	controlNotify ControlPlaneNotifier
 }
 
 func NewService(r Repo, a audit.Recorder) *Service {
@@ -70,6 +72,21 @@ func NewService(r Repo, a audit.Recorder) *Service {
 		a = audit.Noop{}
 	}
 	return &Service{repo: r, audit: a}
+}
+
+// ControlPlaneNotifier hears about role changes so the federation control
+// plane can re-push signed state to followers (v3 F3).
+type ControlPlaneNotifier interface {
+	ControlChanged(vaultID uuid.UUID)
+}
+
+// SetControlNotifier wires the federation control plane; nil disables.
+func (s *Service) SetControlNotifier(n ControlPlaneNotifier) { s.controlNotify = n }
+
+func (s *Service) notifyControl(vaultID uuid.UUID) {
+	if s.controlNotify != nil {
+		s.controlNotify.ControlChanged(vaultID)
+	}
 }
 
 func (s *Service) Get(ctx context.Context, vaultID, roleID uuid.UUID) (domain.Role, error) {
@@ -114,6 +131,7 @@ func (s *Service) Create(
 		"role_name":    created.Name,
 		"capabilities": created.Capabilities,
 	})
+	s.notifyControl(vaultID)
 	return created, nil
 }
 
@@ -160,6 +178,7 @@ func (s *Service) Update(
 		"role_name":    updated.Name,
 		"capabilities": updated.Capabilities,
 	})
+	s.notifyControl(vaultID)
 	return nil
 }
 
@@ -191,6 +210,7 @@ func (s *Service) Delete(
 		"role_id":   current.ID.String(),
 		"role_name": current.Name,
 	})
+	s.notifyControl(vaultID)
 	return nil
 }
 

@@ -43,9 +43,10 @@ type VaultOwnerLookup interface {
 
 // Service is the business-logic layer.
 type Service struct {
-	repo   Repo
-	audit  audit.Recorder
-	vaults VaultOwnerLookup
+	repo          Repo
+	audit         audit.Recorder
+	vaults        VaultOwnerLookup
+	controlNotify ControlPlaneNotifier
 }
 
 func NewService(r Repo, a audit.Recorder) *Service {
@@ -59,6 +60,22 @@ func NewService(r Repo, a audit.Recorder) *Service {
 // cannot be removed or demoted below Admin). nil disables — sole-admin
 // protection still applies.
 func (s *Service) SetVaultLookup(v VaultOwnerLookup) { s.vaults = v }
+
+// ControlPlaneNotifier hears about membership changes so the federation
+// control plane can re-push signed state to followers (v3 F3). Must be
+// fast/non-blocking; implementations rebuild asynchronously.
+type ControlPlaneNotifier interface {
+	ControlChanged(vaultID uuid.UUID)
+}
+
+// SetControlNotifier wires the federation control plane; nil disables.
+func (s *Service) SetControlNotifier(n ControlPlaneNotifier) { s.controlNotify = n }
+
+func (s *Service) notifyControl(vaultID uuid.UUID) {
+	if s.controlNotify != nil {
+		s.controlNotify.ControlChanged(vaultID)
+	}
+}
 
 // vaultOwner returns the owner id, or uuid.Nil when the lookup is not wired.
 func (s *Service) vaultOwner(ctx context.Context, vaultID uuid.UUID) (uuid.UUID, error) {
@@ -90,6 +107,7 @@ func (s *Service) Add(ctx context.Context, m domain.Member, ip, ua string) error
 		"member_user_id": m.UserID.String(),
 		"role_id":        m.RoleID.String(),
 	})
+	s.notifyControl(m.VaultID)
 	return nil
 }
 
@@ -145,6 +163,7 @@ func (s *Service) ChangeRole(
 		"role_id_old":    current.RoleID.String(),
 		"role_id_new":    newRoleID.String(),
 	})
+	s.notifyControl(vaultID)
 	return nil
 }
 
@@ -178,6 +197,7 @@ func (s *Service) Remove(
 	s.recordAudit(ctx, domain.ActionMemberRemove, actorID, vaultID, ip, ua, map[string]any{
 		"member_user_id": userID.String(),
 	})
+	s.notifyControl(vaultID)
 	return nil
 }
 

@@ -37,6 +37,16 @@ func (h *Handlers) Register(app *fiber.App, authed fiber.Router) {
 	authed.Get("/vaults/:vault/federations", h.listFederations)
 	authed.Delete("/vaults/:vault/federations/:id",
 		capguard.RequireCapability(h.resolver, domain.CapVaultFederate), h.revokeFederation)
+
+	// F3: cross-server member grants (home side). member_key travels in
+	// the body — it contains a URL, which has no business in a path.
+	authed.Get("/vaults/:vault/federated-members", h.listFederatedMembers)
+	authed.Post("/vaults/:vault/federated-members",
+		capguard.RequireCapability(h.resolver, domain.CapMembersManage), h.addFederatedMember)
+	authed.Patch("/vaults/:vault/federated-members",
+		capguard.RequireCapability(h.resolver, domain.CapMembersManage), h.changeFederatedMember)
+	authed.Delete("/vaults/:vault/federated-members",
+		capguard.RequireCapability(h.resolver, domain.CapMembersManage), h.removeFederatedMember)
 }
 
 // ---- public --------------------------------------------------------------------
@@ -195,6 +205,91 @@ func (h *Handlers) revokeFederation(c *fiber.Ctx) error {
 	return c.SendStatus(http.StatusNoContent)
 }
 
+// ---- federated members (F3) -------------------------------------------------------
+
+type federatedMemberReq struct {
+	MemberKey string    `json:"member_key"`
+	RoleID    uuid.UUID `json:"role_id"`
+}
+
+func (h *Handlers) listFederatedMembers(c *fiber.Ctx) error {
+	vid, err := capguard.WithVaultID(c)
+	if err != nil {
+		return nil
+	}
+	if err := capguard.RequireMembership(c, h.resolver, vid); err != nil {
+		return nil
+	}
+	rows, err := h.svc.ListFederatedMembers(c.UserContext(), vid)
+	if err != nil {
+		return mapErr(c, err)
+	}
+	out := make([]fiber.Map, 0, len(rows))
+	for _, m := range rows {
+		out = append(out, fiber.Map{
+			"member_key": m.MemberKey,
+			"role_id":    m.RoleID,
+			"role_name":  m.RoleName,
+			"joined_at":  m.JoinedAt.UTC().Format(time.RFC3339),
+		})
+	}
+	return c.JSON(fiber.Map{"federated_members": out})
+}
+
+func (h *Handlers) addFederatedMember(c *fiber.Ctx) error {
+	vid, err := capguard.WithVaultID(c)
+	if err != nil {
+		return nil
+	}
+	actor, _ := capguard.UserIDFrom(c)
+	var req federatedMemberReq
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid_body"})
+	}
+	if req.RoleID == uuid.Nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "role_id_required"})
+	}
+	if err := h.svc.AddFederatedMember(c.UserContext(), vid, req.MemberKey, req.RoleID, actor, c.IP(), string(c.Request().Header.UserAgent())); err != nil {
+		return mapErr(c, err)
+	}
+	return c.SendStatus(http.StatusCreated)
+}
+
+func (h *Handlers) changeFederatedMember(c *fiber.Ctx) error {
+	vid, err := capguard.WithVaultID(c)
+	if err != nil {
+		return nil
+	}
+	actor, _ := capguard.UserIDFrom(c)
+	var req federatedMemberReq
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid_body"})
+	}
+	if req.RoleID == uuid.Nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "role_id_required"})
+	}
+	if err := h.svc.ChangeFederatedMemberRole(c.UserContext(), vid, req.MemberKey, req.RoleID, actor, c.IP(), string(c.Request().Header.UserAgent())); err != nil {
+		return mapErr(c, err)
+	}
+	return c.SendStatus(http.StatusNoContent)
+}
+
+func (h *Handlers) removeFederatedMember(c *fiber.Ctx) error {
+	vid, err := capguard.WithVaultID(c)
+	if err != nil {
+		return nil
+	}
+	actor, _ := capguard.UserIDFrom(c)
+	var req federatedMemberReq
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid_body"})
+	}
+	if err := h.svc.RemoveFederatedMember(c.UserContext(), vid, req.MemberKey, actor, c.IP(), string(c.Request().Header.UserAgent())); err != nil {
+		return mapErr(c, err)
+	}
+	return c.SendStatus(http.StatusNoContent)
+}
+
 // ---- DTOs ----------------------------------------------------------------------
 
 func toInviteDTO(inv domain.FederationInvite) fiber.Map {
@@ -211,12 +306,13 @@ func toInviteDTO(inv domain.FederationInvite) fiber.Map {
 
 func toFederationDTO(f domain.Federation) fiber.Map {
 	out := fiber.Map{
-		"id":         f.ID,
-		"vault_id":   f.VaultID,
-		"role":       f.Role,
-		"peer_url":   f.PeerURL,
-		"status":     f.Status,
-		"created_at": f.CreatedAt.UTC().Format(time.RFC3339),
+		"id":             f.ID,
+		"vault_id":       f.VaultID,
+		"role":           f.Role,
+		"peer_url":       f.PeerURL,
+		"status":         f.Status,
+		"last_acked_seq": f.LastAckedSeq,
+		"created_at":     f.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if f.Jurisdiction != nil {
 		out["jurisdiction"] = *f.Jurisdiction

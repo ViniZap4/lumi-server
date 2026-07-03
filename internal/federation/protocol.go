@@ -21,6 +21,8 @@ const (
 	frameNoteSync     uint64 = 2
 	frameNoteAnnounce uint64 = 3
 	frameNoteDelete   uint64 = 4 // varBytes(id) — note removed at the peer
+	frameControlState uint64 = 5 // varBytes(stateJSON) varBytes(sig) — home → follower
+	frameControlAck   uint64 = 6 // varUint(seq) — follower → home
 )
 
 // syncAuthMessagePrefix versions the signed WS-upgrade auth (v3 F2). The
@@ -144,6 +146,19 @@ func EncodeNoteDelete(noteID string) []byte {
 	return writeVarBytes(out, []byte(noteID))
 }
 
+// EncodeControlState carries home's signed control document.
+func EncodeControlState(stateJSON, sig []byte) []byte {
+	out := writeVarUint(nil, frameControlState)
+	out = writeVarBytes(out, stateJSON)
+	return writeVarBytes(out, sig)
+}
+
+// EncodeControlAck reports the follower's applied control-state cursor.
+func EncodeControlAck(seq int64) []byte {
+	out := writeVarUint(nil, frameControlAck)
+	return writeVarUint(out, uint64(seq))
+}
+
 // ---- frame decode ---------------------------------------------------------------
 
 // Frame is one decoded relay frame; exactly one of the payload fields is
@@ -152,8 +167,10 @@ type Frame struct {
 	Type     uint64
 	Manifest []NoteMeta // frameManifest
 	Note     NoteMeta   // frameNoteAnnounce
-	NoteID   string     // frameNoteSync
-	Payload  []byte     // frameNoteSync: y-protocols sync message
+	NoteID   string     // frameNoteSync / frameNoteDelete
+	Payload  []byte     // frameNoteSync: y-protocols message; frameControlState: state JSON
+	Sig      []byte     // frameControlState
+	Seq      int64      // frameControlAck
 }
 
 func DecodeFrame(buf []byte) (Frame, error) {
@@ -204,6 +221,22 @@ func DecodeFrame(buf []byte) (Frame, error) {
 			return Frame{}, err
 		}
 		return Frame{Type: typ, NoteID: noteID}, nil
+	case frameControlState:
+		state, n, err := readVarBytes(body)
+		if err != nil {
+			return Frame{}, err
+		}
+		sig, _, err := readVarBytes(body[n:])
+		if err != nil {
+			return Frame{}, err
+		}
+		return Frame{Type: typ, Payload: state, Sig: sig}, nil
+	case frameControlAck:
+		seq, _, err := readVarUint(body)
+		if err != nil {
+			return Frame{}, err
+		}
+		return Frame{Type: typ, Seq: int64(seq)}, nil
 	default:
 		return Frame{}, fmt.Errorf("federation: unknown frame type %d", typ)
 	}

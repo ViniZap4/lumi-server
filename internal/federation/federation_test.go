@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -191,6 +192,37 @@ func (f *fakeHome) SyncChallenge(context.Context, string, uuid.UUID, string) (st
 
 // ---- harness -----------------------------------------------------------------
 
+type captureRecorder struct {
+	mu      sync.Mutex
+	entries []domain.AuditEntry
+}
+
+func (c *captureRecorder) Record(_ context.Context, e domain.AuditEntry) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = append(c.entries, e)
+	return nil
+}
+
+func (c *captureRecorder) actions() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.entries))
+	for i, e := range c.entries {
+		out[i] = e.Action
+	}
+	return out
+}
+
+func containsAction(actions []string, want string) bool {
+	for _, a := range actions {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
 type fedFixture struct {
 	svc     *Service
 	keys    *fakeKeyStore
@@ -198,6 +230,7 @@ type fedFixture struct {
 	invites *fakeInviteRepo
 	vaults  *fakeVaultLookup
 	creator *fakeCreator
+	audit   *captureRecorder
 	vault   domain.Vault
 }
 
@@ -208,6 +241,7 @@ func newFedFixture(t *testing.T, baseURL string) *fedFixture {
 		feds:    newFakeFedRepo(),
 		invites: newFakeInviteRepo(),
 		creator: &fakeCreator{},
+		audit:   &captureRecorder{},
 	}
 	fx.vault = domain.Vault{ID: uuid.New(), Slug: "team", Name: "Team", OwnerUserID: uuid.New()}
 	fx.vaults = &fakeVaultLookup{rows: map[uuid.UUID]domain.Vault{fx.vault.ID: fx.vault}}
@@ -218,6 +252,7 @@ func newFedFixture(t *testing.T, baseURL string) *fedFixture {
 		Invites:     fx.invites,
 		Vaults:      fx.vaults,
 		Creator:     fx.creator,
+		Audit:       fx.audit,
 		BaseURL:     baseURL,
 	})
 	if err != nil {

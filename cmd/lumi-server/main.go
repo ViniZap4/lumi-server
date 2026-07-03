@@ -86,6 +86,27 @@ func (a crdtRepoAdapter) ListUpdatesSince(ctx context.Context, vaultID uuid.UUID
 	return out, nil
 }
 
+// fedMemberAdapter bridges pg.FederatedMemberStore to
+// federation.FederatedMemberRepo (DTO type conversion only).
+type fedMemberAdapter struct{ *pg.FederatedMemberStore }
+
+func (a fedMemberAdapter) ListForVault(ctx context.Context, vaultID uuid.UUID) ([]federation.FederatedMember, error) {
+	rows, err := a.FederatedMemberStore.ListForVault(ctx, vaultID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]federation.FederatedMember, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, federation.FederatedMember{
+			MemberKey: r.MemberKey,
+			RoleID:    r.RoleID,
+			RoleName:  r.RoleName,
+			JoinedAt:  r.JoinedAt,
+		})
+	}
+	return out, nil
+}
+
 // memberRepoAdapter bridges pg.MemberStore to members.Repo. Same reason.
 type memberRepoAdapter struct{ *pg.MemberStore }
 
@@ -429,7 +450,12 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	rolesSvc := roles.NewService(roleStore, auditStore)
 	membersSvc := members.NewService(memberRepoAdapter{memberStore}, auditStore)
 	membersSvc.SetVaultLookup(vaultStore)
-	vaultsSvc := vaults.NewService(vaultStore, roleStore, memberStore, fsMgr, auditStore, membersSvc)
+	// F3: capability checks route through the federation-aware resolver —
+	// for vaults this server follows, authorization comes from home's
+	// replicated control state. Bound to the federation service below;
+	// until then it transparently delegates to membersSvc.
+	fedResolver := federation.NewControlResolver(membersSvc, userStore)
+	vaultsSvc := vaults.NewService(vaultStore, roleStore, memberStore, fsMgr, auditStore, fedResolver)
 	usersSvc := users.NewService(userStore, consentStore, auditStore, auditStore, vaultStore)
 	usersSvc.SetVaultDirRemover(fsMgr)
 	// FS watcher. Handler is set below once the WS hub exists; the
@@ -440,7 +466,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		return nil, nil, fmt.Errorf("fswatch: %w", err)
 	}
 
-	notesSvc := notes.NewService(noteStore, vaultStore, fsMgr, auditStore, membersSvc, crdtRegistry, fsWatcher)
+	notesSvc := notes.NewService(noteStore, vaultStore, fsMgr, auditStore, fedResolver, crdtRegistry, fsWatcher)
 	wsHub := wsync.NewHub(crdtRegistry, wsync.WithFSMirror(notesSvc.WriteBodyFromCRDT))
 
 	fsWatcher.SetHandler(buildFSHandler(zlog, vaultStore, noteStore, fsMgr, crdtRegistry, wsHub))
@@ -472,11 +498,35 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		Mirror:   notesSvc.WriteBodyFromCRDT,
 		Delete:   notesSvc.DeleteFromFederation,
 		Log:      zlog,
+
+		ControlCurrent: federationSvc.CurrentControlState,
+		ControlApply:   federationSvc.ApplyControlState,
+		ControlAcked:   federationSvc.RecordControlAck,
 	})
 	crdtRegistry.SetOnPersist(relayLinks.OnPersist)
 	notesSvc.SetFederationNotifier(relayLinks)
 	relayManager := federation.NewManager(federationSvc, relayLinks, nil, zlog)
 	federationSvc.SetLinkController(relayManager)
+
+	// F3 control plane.
+	fedStore := pg.NewFederationStore(pool)
+	federationSvc.SetControlPlane(federation.ControlPlaneDeps{
+		States:     pg.NewControlStateStore(pool),
+		Replicated: pg.NewReplicatedControlStore(pool),
+		FedMembers: fedMemberAdapter{pg.NewFederatedMemberStore(pool)},
+		Members:    membersSvc,
+		Roles:      roleStore,
+		Acks:       fedStore,
+		Pusher:     relayLinks,
+	})
+	federationSvc.SetVaultRenamer(vaultsSvc)
+	fedResolver.Bind(federationSvc)
+	membersSvc.SetControlNotifier(federationSvc)
+	rolesSvc.SetControlNotifier(federationSvc)
+	vaultsSvc.SetControlNotifier(federationSvc)
+	usersSvc.SetControlNotifier(federationSvc)
+	usersSvc.SetFederationLister(fedStore)
+
 	if err := relayManager.Start(ctx); err != nil {
 		zlog.Warn().Err(err).Msg("federation: relay manager start")
 	}
@@ -533,15 +583,15 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 
 	users.NewHandlers(usersSvc, authSvc).Register(authed)
 	vaults.NewHandlers(vaultsSvc).Register(authed)
-	roles.NewHandlers(rolesSvc, membersSvc).Register(authed)
-	members.NewHandlers(membersSvc, membersSvc).Register(authed)
-	audit.NewHandlers(auditStore, membersSvc).Register(authed)
+	roles.NewHandlers(rolesSvc, fedResolver).Register(authed)
+	members.NewHandlers(membersSvc, fedResolver).Register(authed)
+	audit.NewHandlers(auditStore, fedResolver).Register(authed)
 	notes.NewHandlers(notesSvc).Register(authed)
-	wsync.NewHandler(wsHub, membersSvc, cfg.allowedOrigins).Register(authed)
+	wsync.NewHandler(wsHub, fedResolver, cfg.allowedOrigins).Register(authed)
 
 	// Invites: split between vault-scoped (authed) and public.
-	invites.NewHandlers(invitesSvc).Register(app, authed, membersSvc)
-	federation.NewHandlers(federationSvc, membersSvc).Register(app, authed)
+	invites.NewHandlers(invitesSvc).Register(app, authed, fedResolver)
+	federation.NewHandlers(federationSvc, fedResolver).Register(app, authed)
 	federation.NewRelayHandlers(federationSvc, relayLinks, zlog).Register(app)
 
 	shutdown := func(ctx context.Context) error {

@@ -162,6 +162,7 @@ type Federation struct {
 	PeerPubKey   []byte // Ed25519 public key of the peer
 	Jurisdiction *string
 	Status       string // "active" | "revoked" | "severed"
+	LastAckedSeq int64  // home side: follower's confirmed control-state cursor
 	CreatedAt    time.Time
 	RevokedAt    *time.Time
 }
