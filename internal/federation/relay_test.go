@@ -323,6 +323,14 @@ func newRelaySide(t *testing.T) *relaySide {
 		Delete: func(_ context.Context, vaultID uuid.UUID, noteID string) error {
 			return side.notes.delete(vaultID, noteID)
 		},
+		Move: func(ctx context.Context, vaultID uuid.UUID, noteID, newPath, newTitle string) error {
+			n, err := side.notes.Get(ctx, vaultID, noteID)
+			if err != nil {
+				return err
+			}
+			n.Path, n.Title = newPath, newTitle
+			return side.notes.Upsert(ctx, n)
+		},
 		Log: zerolog.Nop(),
 	})
 	side.registry.SetOnPersist(side.links.OnPersist)
@@ -445,6 +453,13 @@ func TestRelay_EndToEndConvergence(t *testing.T) {
 	if got := home.text(t, vaultID, "beta"); got != "hello from follower, edited" {
 		t.Fatalf("home beta state = %q", got)
 	}
+
+	// Rename on home propagates to the follower.
+	home.links.NoteMoved(vaultID, "alpha", "renamed/alpha.md", "Alpha Renamed")
+	waitFor(t, "alpha rename on follower", func() bool {
+		n, err := follower.notes.Get(context.Background(), vaultID, "alpha")
+		return err == nil && n.Path == "renamed/alpha.md" && n.Title == "Alpha Renamed"
+	})
 
 	// Deletion on home propagates to the follower (idempotent on repeat).
 	if err := home.notes.delete(vaultID, "alpha"); err != nil {

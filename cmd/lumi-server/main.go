@@ -497,6 +497,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		Notes:    noteStore,
 		Mirror:   notesSvc.WriteBodyFromCRDT,
 		Delete:   notesSvc.DeleteFromFederation,
+		Move:     notesSvc.MoveFromFederation,
 		Log:      zlog,
 
 		ControlCurrent: federationSvc.CurrentControlState,

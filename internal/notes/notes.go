@@ -115,11 +115,12 @@ func NewService(
 
 // FederationNotifier hears about note lifecycle changes the registry
 // persist hook can't see (creation seeds via InitFromText; deletion drops
-// rows) so the F2 relay can propagate them to federated peers.
-// Implementations must be fast and non-blocking.
+// rows; moves/renames touch only metadata) so the F2 relay can propagate
+// them to federated peers. Implementations must be fast and non-blocking.
 type FederationNotifier interface {
 	NoteCreated(vaultID uuid.UUID, noteID, path, title string)
 	NoteDeleted(vaultID uuid.UUID, noteID string)
+	NoteMoved(vaultID uuid.UUID, noteID, newPath, newTitle string)
 }
 
 // SetFederationNotifier wires the relay; nil disables.
@@ -403,6 +404,11 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 	}
 	if err := s.notes.Upsert(ctx, updated); err != nil {
 		return domain.Note{}, err
+	}
+	// Path/title changes are metadata-only: the CRDT persist hook never
+	// sees them, so federated peers need an explicit nudge.
+	if (moved || newTitle != n.Title) && s.fedNotify != nil {
+		s.fedNotify.NoteMoved(vaultID, id, newPath, newTitle)
 	}
 
 	switch {

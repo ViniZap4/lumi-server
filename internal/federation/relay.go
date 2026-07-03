@@ -66,6 +66,10 @@ type RoomLookup interface {
 // the federation layer back. Implemented by notes.Service.DeleteFromFederation.
 type DeleteFunc func(ctx context.Context, vaultID uuid.UUID, noteID string) error
 
+// MoveFunc applies a rename/move without notifying the federation layer
+// back. Implemented by notes.Service.MoveFromFederation.
+type MoveFunc func(ctx context.Context, vaultID uuid.UUID, noteID, newPath, newTitle string) error
+
 // F3 control-plane callbacks; all nil-safe (F2-only setups skip them).
 type (
 	// ControlCurrentFunc returns home's signed control document for
@@ -86,6 +90,7 @@ type RelayDeps struct {
 	Notes    NoteMetaRepo
 	Mirror   MirrorFunc
 	Delete   DeleteFunc
+	Move     MoveFunc
 	Log      zerolog.Logger
 
 	ControlCurrent ControlCurrentFunc
@@ -187,6 +192,21 @@ func (l *Links) NoteCreated(vaultID uuid.UUID, noteID, path, title string) {
 // to every link on the vault.
 func (l *Links) NoteDeleted(vaultID uuid.UUID, noteID string) {
 	l.fanDelete(vaultID, noteID, nil)
+}
+
+// NoteMoved is the notes.Service notifier for local renames/moves.
+func (l *Links) NoteMoved(vaultID uuid.UUID, noteID, newPath, newTitle string) {
+	l.fanMove(vaultID, NoteMeta{ID: noteID, Path: newPath, Title: newTitle}, nil)
+}
+
+func (l *Links) fanMove(vaultID uuid.UUID, m NoteMeta, except *Session) {
+	frame := EncodeNoteMove(m)
+	for _, s := range l.sessionsFor(vaultID) {
+		if s == except {
+			continue
+		}
+		s.send(frame)
+	}
 }
 
 // PushControl fans a fresh signed control document to every home-role link
@@ -426,6 +446,25 @@ func (s *Session) handleFrame(f Frame) error {
 		}
 		// Relay onward to the vault's other links, skipping the source.
 		s.links.fanDelete(s.vaultID, f.NoteID, s)
+		return nil
+
+	case frameNoteMove:
+		if err := validateNoteID(f.Note.ID); err != nil {
+			return err
+		}
+		if err := validateRelPath(f.Note.Path); err != nil {
+			return err
+		}
+		if s.deps.Move == nil {
+			return nil
+		}
+		if err := s.deps.Move(s.ctx, s.vaultID, f.Note.ID, f.Note.Path, f.Note.Title); err != nil {
+			if errors.Is(err, domain.ErrNotFound) {
+				return nil // note never landed here; announce will bring it
+			}
+			return err
+		}
+		s.links.fanMove(s.vaultID, f.Note, s)
 		return nil
 
 	case frameControlState:

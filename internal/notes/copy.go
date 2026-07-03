@@ -5,13 +5,67 @@ package notes
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
+
+	"github.com/ViniZap4/lumi-server/internal/domain"
 )
 
 // copyPageSize bounds each metadata page while walking the source vault.
 const copyPageSize = 200
+
+// MoveFromFederation applies a rename/move relayed from a federated peer:
+// row + file update, no notifier re-fire (the relay fans it onward itself).
+// Tolerant of a missing source file (the mirrored content may not have
+// landed yet) and idempotent when the note already matches.
+func (s *Service) MoveFromFederation(ctx context.Context, vaultID uuid.UUID, id, newPath, newTitle string) error {
+	cleaned, err := validateNoteRelPath(newPath)
+	if err != nil {
+		return err
+	}
+	n, err := s.notes.Get(ctx, vaultID, id)
+	if err != nil {
+		return err
+	}
+	v, err := s.vaults.GetByID(ctx, vaultID)
+	if err != nil {
+		return err
+	}
+	title := strings.TrimSpace(newTitle)
+	if title == "" {
+		title = n.Title
+	}
+	if cleaned == n.Path && title == n.Title {
+		return nil
+	}
+	if cleaned != n.Path {
+		if other, err := s.notes.GetByPath(ctx, vaultID, cleaned); err == nil && other.ID != id {
+			return fmt.Errorf("%w: path %q already exists", domain.ErrConflict, cleaned)
+		}
+		s.suppressFSEvent(v.Slug, n.Path)
+		s.suppressFSEvent(v.Slug, cleaned)
+		if err := s.fs.MoveNote(v.Slug, n.Path, cleaned); err != nil && !errors.Is(err, domain.ErrNotFound) {
+			return err
+		}
+	}
+	updated := n
+	updated.Path = cleaned
+	updated.Title = title
+	updated.UpdatedAt = s.now().UTC()
+	if err := s.notes.Upsert(ctx, updated); err != nil {
+		return err
+	}
+	s.recordAudit(ctx, uuid.Nil, vaultID, domain.ActionNoteMove, "", "", map[string]any{
+		"note_id":  id,
+		"old_path": n.Path,
+		"new_path": cleaned,
+		"origin":   "federation",
+	})
+	return nil
+}
 
 // CopyVaultNotes copies file content, note metadata rows, and CRDT seed
 // state from srcVaultID into dstVaultID. Note IDs and relative paths are

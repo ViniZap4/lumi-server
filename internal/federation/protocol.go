@@ -23,6 +23,7 @@ const (
 	frameNoteDelete   uint64 = 4 // varBytes(id) — note removed at the peer
 	frameControlState uint64 = 5 // varBytes(stateJSON) varBytes(sig) — home → follower
 	frameControlAck   uint64 = 6 // varUint(seq) — follower → home
+	frameNoteMove     uint64 = 7 // noteMeta — note renamed/moved at the peer
 )
 
 // syncAuthMessagePrefix versions the signed WS-upgrade auth (v3 F2). The
@@ -146,6 +147,12 @@ func EncodeNoteDelete(noteID string) []byte {
 	return writeVarBytes(out, []byte(noteID))
 }
 
+// EncodeNoteMove propagates a rename/move (new path/title for an id).
+func EncodeNoteMove(m NoteMeta) []byte {
+	out := writeVarUint(nil, frameNoteMove)
+	return appendNoteMeta(out, m)
+}
+
 // EncodeControlState carries home's signed control document.
 func EncodeControlState(stateJSON, sig []byte) []byte {
 	out := writeVarUint(nil, frameControlState)
@@ -209,7 +216,7 @@ func DecodeFrame(buf []byte) (Frame, error) {
 			return Frame{}, err
 		}
 		return Frame{Type: typ, NoteID: noteID, Payload: payload}, nil
-	case frameNoteAnnounce:
+	case frameNoteAnnounce, frameNoteMove:
 		m, _, err := readNoteMeta(body)
 		if err != nil {
 			return Frame{}, err
