@@ -80,7 +80,15 @@ type Doc struct {
 // allocation through its own internal txn, which is fine — we just
 // can't hold our own.
 func NewDoc() *Doc {
-	d := &Doc{ptr: C.ydoc_new()}
+	// Text offsets must be UTF-16 code units: that is what ApplyTextDiff
+	// computes (Yjs / JavaScript string semantics). yffi's default is
+	// Y_OFFSET_BYTES, under which any non-ASCII edit removes/inserts at
+	// the wrong position (e.g. "a😀b" → "a😁b" used to yield "a😁").
+	// The offset kind only affects local index interpretation, never the
+	// update wire format.
+	opts := C.yoptions()
+	opts.encoding = C.Y_OFFSET_UTF16
+	d := &Doc{ptr: C.ydoc_new_with_options(opts)}
 	if d.ptr == nil {
 		panic("crdt: ydoc_new returned NULL")
 	}
