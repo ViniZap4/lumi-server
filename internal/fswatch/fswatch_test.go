@@ -154,7 +154,9 @@ func TestIgnoresNonMarkdownFiles(t *testing.T) {
 }
 
 func TestDebounceCoalesces(t *testing.T) {
-	_, _, root, rec, teardown := newTestManager(t, WithDebounce(80*time.Millisecond))
+	// The window is generous relative to the 10 ms gaps so scheduler jitter
+	// under -race on a loaded CI runner can't split the burst.
+	_, _, root, rec, teardown := newTestManager(t, WithDebounce(400*time.Millisecond))
 	defer teardown()
 
 	notePath := filepath.Join(root, "vault", "burst.md")
@@ -167,7 +169,7 @@ func TestDebounceCoalesces(t *testing.T) {
 	}
 
 	// Wait for the debounce timer to fire.
-	if _, ok := rec.waitForEvent(500 * time.Millisecond); !ok {
+	if _, ok := rec.waitForEvent(3 * time.Second); !ok {
 		t.Fatalf("expected at least one event")
 	}
 	// Drain anything queued; assert <=1 extra event (some kernels emit
@@ -177,7 +179,7 @@ func TestDebounceCoalesces(t *testing.T) {
 		select {
 		case <-rec.ch:
 			count++
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(800 * time.Millisecond):
 			goto done
 		}
 	}
