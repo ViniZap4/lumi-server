@@ -23,6 +23,8 @@ func NewUserStore(pool *pgxpool.Pool) *UserStore {
 	return &UserStore{pool: pool}
 }
 
+const userCols = `id, username, password_hash, display_name, created_at, disabled_at, failed_logins, locked_until`
+
 // CreateUserInput satisfies internal/auth.CreateUserInput shape.
 type CreateUserInput struct {
 	Username     string
@@ -67,16 +69,16 @@ func (s *UserStore) CreateUserDirect(ctx context.Context, u domain.User) error {
 }
 
 func (s *UserStore) GetByID(ctx context.Context, id uuid.UUID) (domain.User, error) {
-	const q = `
-SELECT id, username, password_hash, display_name, created_at
+	q := `
+SELECT ` + userCols + `
   FROM users
  WHERE id = $1`
 	return s.scanOne(ctx, q, id)
 }
 
 func (s *UserStore) GetByUsername(ctx context.Context, username string) (domain.User, error) {
-	const q = `
-SELECT id, username, password_hash, display_name, created_at
+	q := `
+SELECT ` + userCols + `
   FROM users
  WHERE username = $1`
 	return s.scanOne(ctx, q, username)
@@ -208,6 +210,7 @@ func (s *UserStore) scanOne(ctx context.Context, q string, args ...any) (domain.
 	var u domain.User
 	err := s.pool.QueryRow(ctx, q, args...).Scan(
 		&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &u.CreatedAt,
+		&u.DisabledAt, &u.FailedLogins, &u.LockedUntil,
 	)
 	if err != nil {
 		if errors.Is(errMap(err), domain.ErrNotFound) {
@@ -216,4 +219,35 @@ func (s *UserStore) scanOne(ctx context.Context, q string, args ...any) (domain.
 		return domain.User{}, fmt.Errorf("user store: get: %w", errMap(err))
 	}
 	return u, nil
+}
+
+// RecordLoginFailure counts one wrong password for an existing account.
+// Once failed_logins reaches threshold, locked_until is pushed out by
+// 2^(n-threshold) seconds, capped at maxLock: the lock never becomes
+// permanent, so an attacker cannot keep the owner out for longer than the
+// cap after stopping. Attempts that arrive while the account is locked
+// are refused before the password is checked and never reach here.
+func (s *UserStore) RecordLoginFailure(ctx context.Context, id uuid.UUID, threshold int, maxLock time.Duration) error {
+	const q = `
+UPDATE users SET
+  failed_logins = LEAST(failed_logins + 1, 1000),
+  locked_until = CASE WHEN failed_logins + 1 >= $2
+    THEN NOW() + make_interval(secs => LEAST(power(2, LEAST(failed_logins + 1 - $2, 20)), $3))
+    ELSE locked_until END
+ WHERE id = $1`
+	if _, err := s.pool.Exec(ctx, q, id, threshold, maxLock.Seconds()); err != nil {
+		return fmt.Errorf("user store: record login failure: %w", errMap(err))
+	}
+	return nil
+}
+
+// ResetLoginFailures clears the lockout counters after a successful login.
+func (s *UserStore) ResetLoginFailures(ctx context.Context, id uuid.UUID) error {
+	const q = `
+UPDATE users SET failed_logins = 0, locked_until = NULL
+ WHERE id = $1 AND (failed_logins <> 0 OR locked_until IS NOT NULL)`
+	if _, err := s.pool.Exec(ctx, q, id); err != nil {
+		return fmt.Errorf("user store: reset login failures: %w", errMap(err))
+	}
+	return nil
 }

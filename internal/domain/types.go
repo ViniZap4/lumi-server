@@ -10,12 +10,19 @@ import (
 
 // User represents a server-scoped account. Identity is independent per server
 // (no central identity provider). See SPEC.md "Identity".
+//
+// DisabledAt, FailedLogins and LockedUntil are operator-managed account
+// state (docs/ADMIN.md): a disabled account cannot log in or use any
+// session; a locked one refuses logins until LockedUntil.
 type User struct {
 	ID           uuid.UUID
 	Username     string
 	PasswordHash string
 	DisplayName  string
 	CreatedAt    time.Time
+	DisabledAt   *time.Time
+	FailedLogins int
+	LockedUntil  *time.Time
 }
 
 // Session is a bearer credential issued at login. Validated via constant-time
