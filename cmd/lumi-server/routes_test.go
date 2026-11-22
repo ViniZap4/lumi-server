@@ -85,3 +85,30 @@ func TestRegisterRoutes_PublicRoutesBypassAuth(t *testing.T) {
 		})
 	}
 }
+
+// The WS sync route authenticates itself (close codes 4401/4403/4404), so
+// it is mounted with the public routes; the auth middleware must not answer
+// it with HTTP 401 (which browsers surface as an opaque 1006).
+func TestRegisterRoutes_SyncRouteBypassesAuthMiddleware(t *testing.T) {
+	app := fiber.New()
+	authCalls := 0
+	requireAuth := func(c *fiber.Ctx) error {
+		authCalls++
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	sync := func(r fiber.Router) {
+		r.Group("/api").Get("/vaults/:vault/notes/:id/sync", func(c *fiber.Ctx) error {
+			return c.SendStatus(fiber.StatusUpgradeRequired)
+		})
+	}
+	registerRoutes(app, requireAuth, []func(fiber.Router){sync}, []func(fiber.Router){
+		func(r fiber.Router) { r.Get("/vaults/:vault/notes", func(c *fiber.Ctx) error { return nil }) },
+	})
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/api/vaults/v/notes/n/sync", nil), -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != fiber.StatusUpgradeRequired || authCalls != 0 {
+		t.Fatalf("status=%d authCalls=%d, want 426 without auth middleware", resp.StatusCode, authCalls)
+	}
+}

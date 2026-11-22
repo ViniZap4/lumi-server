@@ -66,6 +66,12 @@ func Optional(svc *Service) fiber.Handler {
 	}
 }
 
+// ExtractToken returns the session token from the request (header, bearer,
+// or ?token= on the allow-listed WebSocket paths). Exposed for handlers
+// that authenticate themselves, e.g. the WS sync upgrade, which must
+// complete the upgrade to report auth failures as close codes.
+func ExtractToken(c *fiber.Ctx) string { return extractToken(c) }
+
 func extractToken(c *fiber.Ctx) string {
 	if t := strings.TrimSpace(c.Get(HeaderToken)); t != "" {
 		return t

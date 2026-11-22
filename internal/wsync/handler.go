@@ -11,6 +11,7 @@ import (
 	"github.com/gofiber/websocket/v2"
 	"github.com/google/uuid"
 
+	"github.com/ViniZap4/lumi-server/internal/auth"
 	"github.com/ViniZap4/lumi-server/internal/capguard"
 	"github.com/ViniZap4/lumi-server/internal/domain"
 )
@@ -40,30 +41,65 @@ const HandshakeTimeout = 10 * time.Second
 // legitimate users hitting it.
 const MaxUserConnections = 10
 
+// Close codes for rejected or revoked sync sessions (CRDT client
+// protocol §5, §10 S6). Browsers cannot read the status of a failed HTTP
+// upgrade (they report close 1006), so the server completes the upgrade
+// and closes immediately with one of these:
+//
+//	4401 token missing, invalid or expired → client clears session, re-login
+//	4403 caller lacks note.edit on the vault → read-only, stop reconnecting
+//	4404 vault or note does not exist      → stop reconnecting
+//	1008 per-user concurrent-socket cap    (policy violation)
+//	1011 internal error while authorising  (transient, may retry)
+//
+// Long-lived sockets are re-authorised every RevalidateInterval and
+// closed with 4401/4403/4404 once the session or capability is gone.
+const (
+	CloseUnauthorized = 4401
+	CloseForbidden    = 4403
+	CloseNotFound     = 4404
+)
+
+// RevalidateInterval is how often a live socket re-checks its session and
+// note.edit capability.
+var RevalidateInterval = 2 * time.Minute
+
+// Authenticator validates a session token and returns the user id. It
+// should wrap domain.ErrTokenInvalid / ErrTokenExpired for bad tokens;
+// any other error is treated as an internal failure.
+type Authenticator func(ctx context.Context, token string) (uuid.UUID, error)
+
+// NoteLookup reports whether the note exists (domain.ErrNotFound if not).
+type NoteLookup func(ctx context.Context, vaultID uuid.UUID, noteID string) error
+
 // Handler bundles the dependencies a WS sync endpoint needs.
 type Handler struct {
-	hub             *Hub
-	resolver        capguard.Resolver
-	allowedOrigins  []string
+	hub            *Hub
+	resolver       capguard.Resolver
+	allowedOrigins []string
+	authenticate   Authenticator
+	noteExists     NoteLookup
 }
 
 // NewHandler constructs a Handler. resolver is the capguard resolver
-// (typically the members service) used for the note.edit gate at
-// upgrade time. allowedOrigins is the WS Origin allow-list; pass an
-// empty slice to allow any origin (dev/loopback). Browsers send
-// Origin on WS upgrades; native clients (apple, tui) typically do
-// not — empty Origin is always allowed because the auth token gate
-// is the primary defense for those.
-func NewHandler(hub *Hub, resolver capguard.Resolver, allowedOrigins []string) *Handler {
-	if hub == nil || resolver == nil {
+// (typically the members service) used for the note.edit gate.
+// authenticate validates the session token itself: the route must be
+// mounted OUTSIDE the auth-middleware group so failures become close
+// codes instead of HTTP 401s. noteExists may be nil (no existence check).
+// allowedOrigins is the WS Origin allow-list; pass an empty slice to
+// allow any origin (dev/loopback). Browsers send Origin on WS upgrades;
+// native clients (apple, tui) typically do not — empty Origin is always
+// allowed because the auth token gate is the primary defense for those.
+func NewHandler(hub *Hub, resolver capguard.Resolver, allowedOrigins []string, authenticate Authenticator, noteExists NoteLookup) *Handler {
+	if hub == nil || resolver == nil || authenticate == nil {
 		panic("wsync.NewHandler: missing dependency")
 	}
-	return &Handler{hub: hub, resolver: resolver, allowedOrigins: allowedOrigins}
+	return &Handler{hub: hub, resolver: resolver, allowedOrigins: allowedOrigins, authenticate: authenticate, noteExists: noteExists}
 }
 
 // Register attaches the upgrade route and the WebSocket handler to the
-// supplied router. The route is intentionally a plain GET so Fiber's
-// upgrade negotiation runs through the existing middleware chain.
+// supplied router (expected to be rooted at /api and NOT behind the auth
+// middleware — the handler authenticates on its own).
 func (h *Handler) Register(r fiber.Router) {
 	const path = "/vaults/:vault/notes/:id/sync"
 	cfg := websocket.Config{
@@ -79,37 +115,81 @@ func (h *Handler) Register(r fiber.Router) {
 	r.Get(path, websocket.New(h.handleConn, cfg))
 }
 
-// upgradeGuard runs before the WS upgrade. Rejects non-WS requests,
-// enforces the note.edit capability (write access is required to send
-// updates; the few read-only viewers can still poll /content), and
-// reflects the vault+note params + user id into Locals so the WS
-// handler has them.
+type rejection struct {
+	code   int
+	reason string
+}
+
+// authorize runs every gate and returns the user id or the close code.
+func (h *Handler) authorize(ctx context.Context, token string, vaultID uuid.UUID, noteID string) (uuid.UUID, *rejection) {
+	if token == "" {
+		return uuid.Nil, &rejection{CloseUnauthorized, "unauthorized"}
+	}
+	uid, err := h.authenticate(ctx, token)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrTokenExpired):
+			return uuid.Nil, &rejection{CloseUnauthorized, "token_expired"}
+		case errors.Is(err, domain.ErrTokenInvalid), errors.Is(err, domain.ErrUnauthorized), errors.Is(err, domain.ErrNotFound):
+			return uuid.Nil, &rejection{CloseUnauthorized, "unauthorized"}
+		default:
+			return uuid.Nil, &rejection{websocket.CloseInternalServerErr, "auth_unavailable"}
+		}
+	}
+	role, err := h.resolver.RoleForUser(ctx, vaultID, uid)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return uuid.Nil, &rejection{CloseForbidden, "capability_missing"}
+		}
+		return uuid.Nil, &rejection{websocket.CloseInternalServerErr, "authz_unavailable"}
+	}
+	if !role.Capabilities.Has(domain.CapNoteEdit) {
+		return uuid.Nil, &rejection{CloseForbidden, "capability_missing"}
+	}
+	if h.noteExists != nil {
+		if err := h.noteExists(ctx, vaultID, noteID); err != nil {
+			if errors.Is(err, domain.ErrNotFound) {
+				return uuid.Nil, &rejection{CloseNotFound, "note_not_found"}
+			}
+			return uuid.Nil, &rejection{websocket.CloseInternalServerErr, "lookup_failed"}
+		}
+	}
+	return uid, nil
+}
+
+// upgradeGuard runs before the WS upgrade. Non-WS requests get 426. For
+// WS requests every auth/permission/existence failure is recorded and the
+// upgrade proceeds, so handleConn can close with the specific code.
 func (h *Handler) upgradeGuard(c *fiber.Ctx) error {
 	if !websocket.IsWebSocketUpgrade(c) {
 		return fiber.ErrUpgradeRequired
 	}
-	vaultID, err := capguard.WithVaultID(c)
-	if err != nil {
-		return nil
-	}
-	if err := capguard.Require(c, h.resolver, vaultID, domain.CapNoteEdit); err != nil {
-		return nil
-	}
+	token := auth.ExtractToken(c)
 	noteID := strings.TrimSpace(c.Params("id"))
-	if noteID == "" || strings.ContainsAny(noteID, "/\\") {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_note_id"})
+	vaultID, verr := uuid.Parse(c.Params("vault"))
+	var rej *rejection
+	var uid uuid.UUID
+	switch {
+	case verr != nil, noteID == "", strings.ContainsAny(noteID, "/\\"):
+		// Still require a valid token first so the code doesn't leak
+		// existence to anonymous callers.
+		if _, r := h.authorizeTokenOnly(c.UserContext(), token); r != nil {
+			rej = r
+		} else {
+			rej = &rejection{CloseNotFound, "note_not_found"}
+		}
+	default:
+		uid, rej = h.authorize(c.UserContext(), token, vaultID, noteID)
 	}
-	uid, _ := capguard.UserIDFrom(c)
-	// Optional presence identity. When the client supplies a valid
-	// UUID we stamp it on the Subscriber so Leave can fan out a
-	// "left" awareness frame. A missing or malformed value is silently
-	// treated as "no presence" — clients without awareness still work.
+	// Optional presence identity (legacy JSON presence).
 	var clientID uuid.UUID
 	if raw := strings.TrimSpace(c.Query("client_id")); raw != "" {
 		if id, err := uuid.Parse(raw); err == nil {
 			clientID = id
 		}
 	}
+	c.Locals("wsync.reject", rej)
+	c.Locals("wsync.token", token)
 	c.Locals("wsync.vault", vaultID)
 	c.Locals("wsync.note", noteID)
 	c.Locals("wsync.user", uid)
@@ -117,15 +197,34 @@ func (h *Handler) upgradeGuard(c *fiber.Ctx) error {
 	return c.Next()
 }
 
+func (h *Handler) authorizeTokenOnly(ctx context.Context, token string) (uuid.UUID, *rejection) {
+	if token == "" {
+		return uuid.Nil, &rejection{CloseUnauthorized, "unauthorized"}
+	}
+	uid, err := h.authenticate(ctx, token)
+	if err != nil {
+		if errors.Is(err, domain.ErrTokenExpired) {
+			return uuid.Nil, &rejection{CloseUnauthorized, "token_expired"}
+		}
+		return uuid.Nil, &rejection{CloseUnauthorized, "unauthorized"}
+	}
+	return uid, nil
+}
+
 // handleConn is the per-connection lifecycle: join the room, send our
 // initial SyncStep1, spawn a writer pump, then drain inbound messages
 // until the connection closes.
 func (h *Handler) handleConn(c *websocket.Conn) {
+	if rej, _ := c.Locals("wsync.reject").(*rejection); rej != nil {
+		_ = writeCloseCode(c, rej.code, rej.reason)
+		return
+	}
 	vaultID, ok := c.Locals("wsync.vault").(uuid.UUID)
 	if !ok {
 		_ = c.Close()
 		return
 	}
+	token, _ := c.Locals("wsync.token").(string)
 	noteID, _ := c.Locals("wsync.note").(string)
 	if noteID == "" {
 		_ = c.Close()
@@ -195,6 +294,33 @@ func (h *Handler) handleConn(c *websocket.Conn) {
 		_ = c.Close()
 	}()
 
+	// Periodic re-authorisation: a revoked session, removed capability or
+	// deleted note ends the socket with the matching close code.
+	revalDone := make(chan struct{})
+	go func() {
+		defer close(revalDone)
+		if RevalidateInterval <= 0 {
+			return
+		}
+		t := time.NewTicker(RevalidateInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-sub.Done:
+				return
+			case <-t.C:
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_, rej := h.authorize(ctx, token, vaultID, noteID)
+				cancel()
+				if rej != nil && rej.code != websocket.CloseInternalServerErr {
+					_ = writeCloseCode(c, rej.code, rej.reason)
+					sub.CloseSubscriber()
+					return
+				}
+			}
+		}
+	}()
+
 	// Reader loop.
 	_ = c.SetReadDeadline(time.Now().Add(pongTimeout))
 	c.SetPongHandler(func(string) error {
@@ -225,6 +351,7 @@ func (h *Handler) handleConn(c *websocket.Conn) {
 	sub.CloseSubscriber()
 	<-writerDone
 	<-closerDone
+	<-revalDone
 }
 
 func (h *Handler) handleMessage(room *Room, sub *Subscriber, userID uuid.UUID, msg ParsedMessage) {
