@@ -1151,9 +1151,37 @@ type diffReq struct {
 	// When set, the server applies the update directly — no text
 	// re-diff. Mutually exclusive with `Text`.
 	Update string `json:"update,omitempty"`
-	// Origin labels the source ("tui-diff", "apple-diff", "web", etc).
-	// Defaults to "tui-diff" when omitted.
+	// Origin labels the source; must be one of clientOriginAllowlist
+	// ("tui-diff", "apple-diff", "web", "web-diff"). Defaults to
+	// "tui-diff" when omitted.
 	Origin string `json:"origin,omitempty"`
+}
+
+// clientOriginAllowlist is the set of origin labels a REST client may
+// claim. origin_kind steers server behaviour — "federation:<peer>" suppresses
+// fan-out to that peer (relay echo guard) and "fs-watcher" changes broadcast
+// semantics — so arbitrary client strings must never reach it.
+var clientOriginAllowlist = map[string]struct{}{
+	"tui-diff":   {},
+	"apple-diff": {},
+	"web":        {},
+	"web-diff":   {},
+}
+
+// defaultClientOrigin is used when the client omits origin.
+const defaultClientOrigin = "tui-diff"
+
+// clientOrigin validates a client-supplied origin label against the
+// allowlist; empty means defaultClientOrigin.
+func clientOrigin(raw string) (string, error) {
+	o := strings.TrimSpace(raw)
+	if o == "" {
+		return defaultClientOrigin, nil
+	}
+	if _, ok := clientOriginAllowlist[o]; !ok {
+		return "", fmt.Errorf("%w: origin %q is not an allowed client origin", domain.ErrValidation, o)
+	}
+	return o, nil
 }
 
 // applyDiff — POST /api/vaults/:vault/notes/:id/diff
@@ -1177,9 +1205,12 @@ func (h *Handlers) applyDiff(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid_body"})
 	}
-	origin := strings.TrimSpace(req.Origin)
-	if origin == "" {
-		origin = "tui-diff"
+	origin, err := clientOrigin(req.Origin)
+	if err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error":  "invalid_origin",
+			"detail": err.Error(),
+		})
 	}
 	uid, _ := capguard.UserIDFrom(c)
 
