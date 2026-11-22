@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ViniZap4/lumi-server/internal/crdt"
+	"github.com/ViniZap4/lumi-server/internal/domain"
 )
 
 // memRepo is a minimal in-memory SnapshotRepo for tests. Not safe for
@@ -114,18 +115,9 @@ func (m *memRepo) HighestUpdateID(_ context.Context, v uuid.UUID, n string) (int
 	return max, nil
 }
 
-// errNotFound matches the sentinel the registry expects. We do not
-// import domain here to avoid pulling more dependencies; the registry's
-// errors.Is check on ErrNotFound returns nil for the wrong type, in
-// which case the registry treats it as a transient error. For these
-// tests we simply route GetSnapshot misses through this same path —
-// the registry then proceeds with no initial state, exactly what an
-// empty repo should produce.
-var errNotFound = &repoError{msg: "not found"}
-
-type repoError struct{ msg string }
-
-func (e *repoError) Error() string { return e.msg }
+// errNotFound is the storage "no row" sentinel the registry recognises.
+// Any other GetSnapshot error is treated as a real failure.
+var errNotFound = domain.ErrNotFound
 
 // ---- Tests -----------------------------------------------------------------
 

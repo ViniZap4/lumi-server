@@ -40,6 +40,7 @@ package crdt
 import "C"
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"runtime"
@@ -274,6 +275,110 @@ func (d *Doc) ApplyUpdate(update []byte) error {
 		return fmt.Errorf("crdt: ytransaction_apply failed with code %d", int(rc))
 	}
 	return nil
+}
+
+// ApplyUpdateChanged applies update like ApplyUpdate and additionally
+// reports whether the document actually changed. The comparison uses the
+// yrs snapshot descriptor (state vector + delete set) taken before and
+// after the apply, plus the pending (not yet integrable) update, inside
+// the same lock so no other writer can interleave.
+//
+// y-websocket answers the server's SyncStep1 with a SyncStep2 that is the
+// two-byte empty update [0,0] for an up-to-date (or empty) client. Those,
+// and re-deliveries of already-integrated updates, report changed=false so
+// the caller can skip persistence, federation fan-out and the disk mirror.
+//
+// An update whose dependencies are missing is parked by yrs as "pending";
+// it changes the pending fingerprint and is reported as changed so it is
+// persisted (dropping it would lose it once the dependency arrives).
+func (d *Doc) ApplyUpdateChanged(update []byte) (bool, error) {
+	if isEmptyUpdateV1(update) {
+		return false, nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return false, errClosed
+	}
+	before, err := fingerprintLocked(d.ptr)
+	if err != nil {
+		return false, err
+	}
+	txn := C.ydoc_write_transaction(d.ptr, 0, nil)
+	if txn == nil {
+		return false, errors.New("crdt: write transaction unavailable")
+	}
+	cdata := (*C.char)(unsafe.Pointer(&update[0]))
+	rc := C.ytransaction_apply(txn, cdata, C.uint32_t(len(update)))
+	C.ytransaction_commit(txn)
+	if rc != 0 {
+		return false, fmt.Errorf("crdt: ytransaction_apply failed with code %d", int(rc))
+	}
+	after, err := fingerprintLocked(d.ptr)
+	if err != nil {
+		// The update was applied; err on the side of persisting it.
+		return true, nil
+	}
+	return !bytes.Equal(before, after), nil
+}
+
+// HasPending reports whether the document holds update data that could
+// not be integrated because of missing dependencies.
+func (d *Doc) HasPending() (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return false, errClosed
+	}
+	txn := C.ydoc_read_transaction(d.ptr)
+	if txn == nil {
+		return false, errors.New("crdt: read transaction unavailable")
+	}
+	defer C.ytransaction_commit(txn)
+	if pu := C.ytransaction_pending_update(txn); pu != nil {
+		C.ypending_update_destroy(pu)
+		return true, nil
+	}
+	if ds := C.ytransaction_pending_ds(txn); ds != nil {
+		C.ydelete_set_destroy(ds)
+		return true, nil
+	}
+	return false, nil
+}
+
+// fingerprintLocked returns snapshot(sv+ds) || pending-update bytes ||
+// pending-ds marker. Caller holds d.mu.
+func fingerprintLocked(doc *C.YDoc) ([]byte, error) {
+	txn := C.ydoc_read_transaction(doc)
+	if txn == nil {
+		return nil, errors.New("crdt: read transaction unavailable")
+	}
+	defer C.ytransaction_commit(txn)
+	var out []byte
+	var n C.uint32_t
+	if ptr := C.ytransaction_snapshot(txn, &n); ptr != nil {
+		out = append(out, C.GoBytes(unsafe.Pointer(ptr), C.int(n))...)
+		C.ybinary_destroy(ptr, n)
+	}
+	out = append(out, 0xff)
+	if pu := C.ytransaction_pending_update(txn); pu != nil {
+		if pu.update_v1 != nil && pu.update_len > 0 {
+			out = append(out, C.GoBytes(unsafe.Pointer(pu.update_v1), C.int(pu.update_len))...)
+		}
+		C.ypending_update_destroy(pu)
+	}
+	out = append(out, 0xff)
+	if ds := C.ytransaction_pending_ds(txn); ds != nil {
+		C.ydelete_set_destroy(ds)
+		out = append(out, 1)
+	}
+	return out, nil
+}
+
+// isEmptyUpdateV1 reports whether update is the canonical lib0-v1 empty
+// update: zero struct groups followed by an empty delete set ([0,0]).
+func isEmptyUpdateV1(update []byte) bool {
+	return len(update) == 0 || (len(update) == 2 && update[0] == 0 && update[1] == 0)
 }
 
 // ---- Textual diff application ----------------------------------------------

@@ -2,10 +2,14 @@ package crdt
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"sync"
 
 	"github.com/google/uuid"
+
+	"github.com/ViniZap4/lumi-server/internal/domain"
 )
 
 // Compaction thresholds. The update log is folded into a new snapshot
@@ -46,14 +50,18 @@ type UpdateRow struct {
 }
 
 // Registry orchestrates snapshot + update-log persistence around a yrs
-// document. Phase 2.2 ships without an in-memory document cache: each
-// public method loads the doc, performs work, closes the doc. Slice 2.3
-// (live Yjs sync) introduces an LRU keyed by (vault_id, note_id).
+// document. It holds no in-memory document cache: the authoritative
+// in-memory doc for a note is owned by the wsync.Hub room, and every
+// mutation must go through it (see wsync.Hub.ApplyUpdate / ApplyText).
+// Direct LoadDoc + PersistChange is only safe where no Hub exists.
 type Registry struct {
 	store SnapshotRepo
 
-	hookMu    sync.RWMutex
-	onPersist PersistHook
+	hookMu     sync.RWMutex
+	onPersist  PersistHook
+	initSource InitSource
+
+	seedLocks [64]sync.Mutex
 }
 
 // PersistHook observes every successfully-appended update (v3 F2: the
@@ -88,6 +96,43 @@ func (r *Registry) firePersistHook(vaultID uuid.UUID, noteID string, update []by
 	}
 }
 
+// InitSource returns the on-disk body of an existing note so the registry
+// can seed a CRDT document that has never been initialised (legacy notes,
+// notes whose create-time seeding failed). It must return ("", nil) when
+// the note has no body on disk yet (e.g. a federation replica waiting for
+// its first mirrored update) and a non-nil error only for real failures.
+type InitSource func(ctx context.Context, vaultID uuid.UUID, noteID string) (string, error)
+
+// SetInitSource installs the lazy-init body source. nil disables lazy
+// initialisation (LoadDoc then returns an empty doc for unknown notes).
+//
+// Single-seeder invariant (CRDT client protocol §10 S5): only the server
+// that is home for a note may seed it from text. Federation replicas
+// receive the home's state instead; their notes never reach lazy init
+// with a non-empty body because the file only lands on disk through the
+// mirror of that state.
+func (r *Registry) SetInitSource(fn InitSource) {
+	r.hookMu.Lock()
+	defer r.hookMu.Unlock()
+	r.initSource = fn
+}
+
+func (r *Registry) getInitSource() InitSource {
+	r.hookMu.RLock()
+	defer r.hookMu.RUnlock()
+	return r.initSource
+}
+
+// noteLock returns the striped mutex serialising seeding for a note, so
+// two concurrent first loads cannot each insert the body under their own
+// clientID (which would merge as a duplicated body, vector V2).
+func (r *Registry) noteLock(vaultID uuid.UUID, noteID string) *sync.Mutex {
+	h := fnv.New32a()
+	_, _ = h.Write(vaultID[:])
+	_, _ = h.Write([]byte(noteID))
+	return &r.seedLocks[h.Sum32()%uint32(len(r.seedLocks))]
+}
+
 // LoadDoc fetches the persisted snapshot (if any) plus every update in
 // the log and returns a freshly-allocated yrs document reflecting their
 // merged state. The caller owns Close().
@@ -96,30 +141,80 @@ func (r *Registry) firePersistHook(vaultID uuid.UUID, noteID string, update []by
 // the snapshot": Yjs CRDT merges are idempotent, so feeding the doc an
 // update it has already absorbed is a no-op. Avoiding the bookkeeping
 // keeps the storage schema simple.
+//
+// When neither a snapshot nor any update exists and an InitSource is
+// installed, the document is seeded from the note's on-disk body and the
+// seed is stored as the snapshot (lazy init, protocol §10 S4).
 func (r *Registry) LoadDoc(ctx context.Context, vaultID uuid.UUID, noteID string) (*Doc, error) {
+	doc, empty, err := r.loadPersisted(ctx, vaultID, noteID)
+	if err != nil || !empty {
+		return doc, err
+	}
+	src := r.getInitSource()
+	if src == nil {
+		return doc, nil
+	}
+	_ = doc.Close()
+
+	mu := r.noteLock(vaultID, noteID)
+	mu.Lock()
+	defer mu.Unlock()
+	// Re-check under the lock: a concurrent loader may have seeded.
+	doc, empty, err = r.loadPersisted(ctx, vaultID, noteID)
+	if err != nil || !empty {
+		return doc, err
+	}
+	body, err := src(ctx, vaultID, noteID)
+	if err != nil {
+		_ = doc.Close()
+		return nil, fmt.Errorf("crdt registry: lazy init read body: %w", err)
+	}
+	if body == "" {
+		return doc, nil
+	}
+	_ = doc.Close()
+	seeded, err := r.seed(ctx, vaultID, noteID, body, "lazy-init")
+	if err != nil {
+		return nil, err
+	}
+	return seeded, nil
+}
+
+// loadPersisted rebuilds the doc from snapshot + log. empty reports that
+// nothing at all is persisted for the note.
+func (r *Registry) loadPersisted(ctx context.Context, vaultID uuid.UUID, noteID string) (*Doc, bool, error) {
 	var initial []byte
+	haveSnap := false
 	snap, err := r.store.GetSnapshot(ctx, vaultID, noteID)
-	if err == nil {
+	switch {
+	case err == nil:
 		initial = snap.State
+		haveSnap = true
+	case errors.Is(err, domain.ErrNotFound):
+	default:
+		// A transient storage error must not masquerade as "no state":
+		// the caller would then seed or edit an empty doc and the next
+		// mirror would overwrite the file.
+		return nil, false, fmt.Errorf("crdt registry: get snapshot: %w", err)
 	}
 
 	doc, err := LoadDoc(initial)
 	if err != nil {
-		return nil, fmt.Errorf("crdt registry: load snapshot: %w", err)
+		return nil, false, fmt.Errorf("crdt registry: load snapshot: %w", err)
 	}
 
 	updates, err := r.store.ListUpdatesSince(ctx, vaultID, noteID, 0, 0)
 	if err != nil {
 		_ = doc.Close()
-		return nil, fmt.Errorf("crdt registry: list updates: %w", err)
+		return nil, false, fmt.Errorf("crdt registry: list updates: %w", err)
 	}
 	for _, u := range updates {
 		if err := doc.ApplyUpdate(u.Update); err != nil {
 			_ = doc.Close()
-			return nil, fmt.Errorf("crdt registry: replay update %d: %w", u.ID, err)
+			return nil, false, fmt.Errorf("crdt registry: replay update %d: %w", u.ID, err)
 		}
 	}
-	return doc, nil
+	return doc, !haveSnap && len(updates) == 0, nil
 }
 
 // PersistChange appends an update produced by a transaction on doc, then
@@ -155,9 +250,9 @@ func (r *Registry) PersistChange(
 }
 
 // InitFromText creates a fresh doc, applies `body` as the initial text,
-// stores the resulting state as a snapshot, and persists the single
-// generative update against an empty document. Use during note create
-// to seed the CRDT log so subsequent diff updates have a base state.
+// and stores the resulting state as the snapshot. Use during note create
+// (and vault copy / federation import, on the home server only) to seed
+// the CRDT so subsequent updates have a base state.
 //
 // originUserID may be uuid.Nil; originKind is typically
 // "snapshot-init".
@@ -167,24 +262,39 @@ func (r *Registry) InitFromText(
 	body string,
 	originUserID uuid.UUID, originKind string,
 ) error {
+	_ = originUserID
+	mu := r.noteLock(vaultID, noteID)
+	mu.Lock()
+	defer mu.Unlock()
+	doc, err := r.seed(ctx, vaultID, noteID, body, originKind)
+	if err != nil {
+		return err
+	}
+	_ = doc.Close()
+	return nil
+}
+
+// seed builds a doc holding body and stores it as the snapshot. No log
+// row is appended: the snapshot is the full base state. Caller holds the
+// note's seed lock and owns the returned doc.
+func (r *Registry) seed(ctx context.Context, vaultID uuid.UUID, noteID, body, originKind string) (*Doc, error) {
 	doc := NewDoc()
-	defer doc.Close()
 	if body != "" {
 		if _, err := doc.ApplyTextDiff(body, originKind); err != nil {
-			return fmt.Errorf("crdt registry: seed text: %w", err)
+			_ = doc.Close()
+			return nil, fmt.Errorf("crdt registry: seed text: %w", err)
 		}
 	}
 	state, err := doc.EncodeStateAsUpdate()
 	if err != nil {
-		return fmt.Errorf("crdt registry: encode initial state: %w", err)
+		_ = doc.Close()
+		return nil, fmt.Errorf("crdt registry: encode initial state: %w", err)
 	}
 	if err := r.store.UpsertSnapshot(ctx, vaultID, noteID, state); err != nil {
-		return err
+		_ = doc.Close()
+		return nil, err
 	}
-	// We do not append an entry to the update log: the snapshot now is
-	// the full base state. Subsequent diffs (web, tui-diff) will append
-	// against it.
-	return nil
+	return doc, nil
 }
 
 // compact captures the current doc state as a new snapshot and deletes
