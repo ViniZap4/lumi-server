@@ -480,6 +480,9 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	// until then it transparently delegates to membersSvc.
 	fedResolver := federation.NewControlResolver(membersSvc, userStore)
 	membersSvc.SetGrantResolver(fedResolver)
+	// No-escalation for roles.manage: role capabilities must be covered
+	// by the actor's own role (owner exempt).
+	rolesSvc.SetGrantDeps(fedResolver, vaultStore)
 	vaultsSvc := vaults.NewService(vaultStore, roleStore, memberStore, fsMgr, auditStore, fedResolver)
 	usersSvc := users.NewService(userStore, consentStore, auditStore, auditStore, vaultStore)
 	usersSvc.SetVaultDirRemover(fsMgr)

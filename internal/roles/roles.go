@@ -65,6 +65,38 @@ type Service struct {
 	repo          Repo
 	audit         audit.Recorder
 	controlNotify ControlPlaneNotifier
+
+	grants capguard.Resolver
+	vaults VaultLookup
+}
+
+// VaultLookup resolves the vault (for its owner) during the
+// no-escalation check. Implemented by *pg.VaultStore.
+type VaultLookup interface {
+	GetByID(ctx context.Context, id uuid.UUID) (domain.Vault, error)
+}
+
+// SetGrantDeps wires the no-escalation check: resolver reads the ACTOR's
+// role (federation-aware resolver in production), vaults gives the owner.
+// Without both, creating or editing role capabilities is refused.
+func (s *Service) SetGrantDeps(resolver capguard.Resolver, vaults VaultLookup) {
+	s.grants = resolver
+	s.vaults = vaults
+}
+
+// authorizeCaps enforces that a non-owner actor (roles.manage) can only
+// put capabilities on a role that they themselves hold — otherwise a
+// roles.manage holder could mint a "*" role and grant it via an invite or
+// a role edit of their own role.
+func (s *Service) authorizeCaps(ctx context.Context, vaultID, actorID uuid.UUID, caps domain.CapabilitySet) error {
+	if s.grants == nil || s.vaults == nil {
+		return fmt.Errorf("%w: role capability changes require grant checks to be configured", domain.ErrForbidden)
+	}
+	v, err := s.vaults.GetByID(ctx, vaultID)
+	if err != nil {
+		return err
+	}
+	return capguard.AuthorizeGrant(ctx, s.grants, v, actorID, domain.Role{VaultID: vaultID, Capabilities: caps})
 }
 
 func NewService(r Repo, a audit.Recorder) *Service {
@@ -114,6 +146,9 @@ func (s *Service) Create(
 		return domain.Role{}, fmt.Errorf("%w: %q is a reserved seed-role name", domain.ErrValidation, name)
 	}
 	if err := validateCapabilities(caps); err != nil {
+		return domain.Role{}, err
+	}
+	if err := s.authorizeCaps(ctx, vaultID, actorID, caps); err != nil {
 		return domain.Role{}, err
 	}
 	role := domain.Role{
@@ -166,6 +201,14 @@ func (s *Service) Update(
 	}
 	if newCaps != nil {
 		if err := validateCapabilities(*newCaps); err != nil {
+			return err
+		}
+		// The actor must cover both the new set (no escalation) and the
+		// current one (no stripping a role that outranks them).
+		if err := s.authorizeCaps(ctx, vaultID, actorID, *newCaps); err != nil {
+			return err
+		}
+		if err := s.authorizeCaps(ctx, vaultID, actorID, current.Capabilities); err != nil {
 			return err
 		}
 		updated.Capabilities = dedupeCaps(*newCaps)

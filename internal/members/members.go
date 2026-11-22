@@ -253,6 +253,23 @@ func (s *Service) Remove(
 	if sole {
 		return ErrSoleAdminProtection{VaultID: vaultID, UserID: userID}
 	}
+	// No removing a superior: a non-owner actor (members.manage) may only
+	// remove a member whose role they cover. Leaving (self-removal) is
+	// always allowed.
+	if actorID != userID && (owner == uuid.Nil || actorID != owner) {
+		target, err := s.repo.Get(ctx, vaultID, userID)
+		if err != nil {
+			return err
+		}
+		targetRole, err := s.lookupRole(ctx, vaultID, target.RoleID)
+		if err != nil {
+			return fmt.Errorf("%w: cannot resolve the member's role: %v", domain.ErrForbidden, err)
+		}
+		vault := domain.Vault{ID: vaultID, OwnerUserID: owner}
+		if err := capguard.AuthorizeGrant(ctx, s.grantResolver(), vault, actorID, targetRole); err != nil {
+			return err
+		}
+	}
 	if err := s.repo.Remove(ctx, vaultID, userID); err != nil {
 		return err
 	}
