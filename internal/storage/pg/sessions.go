@@ -2,6 +2,8 @@ package pg
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -12,7 +14,19 @@ import (
 	"github.com/ViniZap4/lumi-server/internal/domain"
 )
 
-// SessionStore persists bearer tokens.
+// hashSessionToken is the at-rest form of a session bearer token: lowercase
+// hex SHA-256. Tokens are 256-bit random values, so an unsalted fast hash
+// is sufficient (no dictionary to attack) and keeps lookup O(1) by index.
+// Must match migration 0005's encode(sha256(convert_to(t,'UTF8')),'hex').
+func hashSessionToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// SessionStore persists bearer tokens. Only token hashes touch the
+// database; the raw token exists solely client-side and in the request
+// being served. Returned domain.Session values carry the caller's raw
+// token back (never the stored hash).
 type SessionStore struct {
 	pool *pgxpool.Pool
 }
@@ -24,10 +38,10 @@ func NewSessionStore(pool *pgxpool.Pool) *SessionStore {
 // Create / CreateSession (alias) inserts a new session row.
 func (s *SessionStore) Create(ctx context.Context, sess domain.Session) error {
 	const q = `
-INSERT INTO sessions (token, user_id, created_at, expires_at, last_used_at)
+INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at)
 VALUES ($1, $2, $3, $4, $5)`
 	_, err := s.pool.Exec(ctx, q,
-		sess.Token, sess.UserID, sess.CreatedAt, sess.ExpiresAt, sess.LastUsedAt,
+		hashSessionToken(sess.Token), sess.UserID, sess.CreatedAt, sess.ExpiresAt, sess.LastUsedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("session store: create: %w", errMap(err))
@@ -46,19 +60,20 @@ func (s *SessionStore) Get(ctx context.Context, token string) (domain.Session, e
 	const q = `
 UPDATE sessions
    SET last_used_at = NOW()
- WHERE token = $1
+ WHERE token_hash = $1
    AND expires_at > NOW()
-RETURNING token, user_id, created_at, expires_at, last_used_at`
+RETURNING user_id, created_at, expires_at, last_used_at`
 
-	var out domain.Session
-	err := s.pool.QueryRow(ctx, q, token).Scan(
-		&out.Token, &out.UserID, &out.CreatedAt, &out.ExpiresAt, &out.LastUsedAt,
+	h := hashSessionToken(token)
+	out := domain.Session{Token: token}
+	err := s.pool.QueryRow(ctx, q, h).Scan(
+		&out.UserID, &out.CreatedAt, &out.ExpiresAt, &out.LastUsedAt,
 	)
 	if err != nil {
 		if errors.Is(errMap(err), domain.ErrNotFound) {
 			var exists bool
 			lookupErr := s.pool.QueryRow(ctx,
-				`SELECT TRUE FROM sessions WHERE token = $1`, token,
+				`SELECT TRUE FROM sessions WHERE token_hash = $1`, h,
 			).Scan(&exists)
 			if lookupErr == nil && exists {
 				return domain.Session{}, fmt.Errorf("session store: get: %w", domain.ErrTokenExpired)
@@ -75,12 +90,12 @@ RETURNING token, user_id, created_at, expires_at, last_used_at`
 // that explicitly via TouchSession.
 func (s *SessionStore) GetSession(ctx context.Context, token string) (domain.Session, error) {
 	const q = `
-SELECT token, user_id, created_at, expires_at, last_used_at
+SELECT user_id, created_at, expires_at, last_used_at
   FROM sessions
- WHERE token = $1`
-	var out domain.Session
-	err := s.pool.QueryRow(ctx, q, token).Scan(
-		&out.Token, &out.UserID, &out.CreatedAt, &out.ExpiresAt, &out.LastUsedAt,
+ WHERE token_hash = $1`
+	out := domain.Session{Token: token}
+	err := s.pool.QueryRow(ctx, q, hashSessionToken(token)).Scan(
+		&out.UserID, &out.CreatedAt, &out.ExpiresAt, &out.LastUsedAt,
 	)
 	if err != nil {
 		if errors.Is(errMap(err), domain.ErrNotFound) {
@@ -96,8 +111,8 @@ func (s *SessionStore) TouchSession(ctx context.Context, token string, lastUsedA
 	const q = `
 UPDATE sessions
    SET last_used_at = $2, expires_at = $3
- WHERE token = $1`
-	tag, err := s.pool.Exec(ctx, q, token, lastUsedAt, expiresAt)
+ WHERE token_hash = $1`
+	tag, err := s.pool.Exec(ctx, q, hashSessionToken(token), lastUsedAt, expiresAt)
 	if err != nil {
 		return fmt.Errorf("session store: touch: %w", errMap(err))
 	}
@@ -108,8 +123,8 @@ UPDATE sessions
 }
 
 func (s *SessionStore) Delete(ctx context.Context, token string) error {
-	const q = `DELETE FROM sessions WHERE token = $1`
-	tag, err := s.pool.Exec(ctx, q, token)
+	const q = `DELETE FROM sessions WHERE token_hash = $1`
+	tag, err := s.pool.Exec(ctx, q, hashSessionToken(token))
 	if err != nil {
 		return fmt.Errorf("session store: delete: %w", errMap(err))
 	}
@@ -121,8 +136,8 @@ func (s *SessionStore) Delete(ctx context.Context, token string) error {
 
 // DeleteSession is the alias matching internal/auth.SessionStore. Idempotent.
 func (s *SessionStore) DeleteSession(ctx context.Context, token string) error {
-	const q = `DELETE FROM sessions WHERE token = $1`
-	if _, err := s.pool.Exec(ctx, q, token); err != nil {
+	const q = `DELETE FROM sessions WHERE token_hash = $1`
+	if _, err := s.pool.Exec(ctx, q, hashSessionToken(token)); err != nil {
 		return fmt.Errorf("session store: delete: %w", errMap(err))
 	}
 	return nil
