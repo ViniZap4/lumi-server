@@ -384,9 +384,12 @@ func isEmptyUpdateV1(update []byte) bool {
 // ---- Textual diff application ----------------------------------------------
 
 // ApplyTextDiff replaces the document content with newText, expressed as
-// a single (remove_range, insert) pair at the boundary of the longest
-// common prefix and suffix. Returns the lib0-v1 update blob describing
-// exactly this change — persist it in note_yjs_updates.
+// minimal ranged (remove_range, insert) operations — one per changed
+// block found by a line-level Myers diff, each trimmed to the differing
+// runes — applied right to left in a single transaction. Text between two
+// distant edits is left untouched, so concurrent edits there survive.
+// Returns the lib0-v1 update blob describing exactly this change —
+// persist it in note_yjs_updates.
 //
 // origin is a short label (e.g. "tui-diff", "web") that yrs tags onto
 // the produced update; it surfaces in the awareness/observer APIs for
@@ -409,15 +412,11 @@ func (d *Doc) ApplyTextDiff(newText string, origin string) ([]byte, error) {
 	// Snapshot state vector for the post-write diff. Same caveat.
 	svBefore := stateVectorUnderReadTxn(d.ptr)
 
-	// Compute the minimal middle slice that changed.
-	prefixRunes, suffixRunes, oldMid, newMid := diffSlice(current, newText)
-	if oldMid == "" && newMid == "" {
+	// Compute the changed ranges (Myers over lines, trimmed per hunk).
+	hunks := diffHunks(current, newText)
+	if len(hunks) == 0 {
 		return []byte{}, nil
 	}
-
-	insertIndex := utf16Len(prefixRunes)
-	removeLen := utf16Len(oldMid)
-	_ = suffixRunes // suffix length isn't needed; we operate at insertIndex
 
 	// Open the write transaction, mutate the content branch, capture the
 	// produced update, commit.
@@ -433,14 +432,18 @@ func (d *Doc) ApplyTextDiff(newText string, origin string) ([]byte, error) {
 		return nil, errors.New("crdt: write transaction unavailable")
 	}
 
+	// Apply right to left so earlier indices stay valid.
 	branch := d.contentB
-	if removeLen > 0 {
-		C.ytext_remove_range(branch, txn, C.uint32_t(insertIndex), C.uint32_t(removeLen))
-	}
-	if newMid != "" {
-		cval := C.CString(newMid)
-		defer C.free(unsafe.Pointer(cval))
-		C.ytext_insert(branch, txn, C.uint32_t(insertIndex), cval, nil)
+	for i := len(hunks) - 1; i >= 0; i-- {
+		h := hunks[i]
+		if h.DelLen > 0 {
+			C.ytext_remove_range(branch, txn, C.uint32_t(h.Index), C.uint32_t(h.DelLen))
+		}
+		if h.Insert != "" {
+			cval := C.CString(h.Insert)
+			C.ytext_insert(branch, txn, C.uint32_t(h.Index), cval, nil)
+			C.free(unsafe.Pointer(cval))
+		}
 	}
 
 	// Capture the update for this transaction. With a nil sv we'd get
