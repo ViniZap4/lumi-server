@@ -27,7 +27,20 @@ type Service struct {
 	rlIP   *RateLimiter
 
 	dummyHash string
+
+	listener SessionListener
 }
+
+// SessionListener hears about sessions ending so long-lived streams (the
+// account feed) close at once instead of at their next re-check.
+// Implementations must not block. Reasons: "revoked", "expired", "deleted".
+type SessionListener interface {
+	SessionEnded(token, reason string)
+	UserSessionsEnded(userID uuid.UUID, reason string)
+}
+
+// SetSessionListener wires the listener; nil disables.
+func (s *Service) SetSessionListener(l SessionListener) { s.listener = l }
 
 func NewService(users UserRepo, sessions SessionStore, consents ConsentStore, audit AuditRecorder, cfg Config) (*Service, error) {
 	if users == nil || sessions == nil || consents == nil || audit == nil {
@@ -256,6 +269,9 @@ func (s *Service) Logout(ctx context.Context, token string) error {
 	if err := s.sessions.DeleteSession(ctx, token); err != nil {
 		return fmt.Errorf("auth: logout delete: %w", err)
 	}
+	if s.listener != nil {
+		s.listener.SessionEnded(token, "revoked")
+	}
 	uid := sess.UserID
 	s.recordAudit(ctx, domain.AuditEntry{
 		UserID: &uid,
@@ -303,6 +319,9 @@ func (s *Service) ChangePassword(ctx context.Context, userID uuid.UUID, oldPassw
 	}
 	if _, err := s.sessions.DeleteSessionsForUser(ctx, userID); err != nil {
 		s.cfg.Logger.Warn().Err(err).Str("user_id", userID.String()).Msg("auth: failed to revoke sessions after password change")
+	}
+	if s.listener != nil {
+		s.listener.UserSessionsEnded(userID, "revoked")
 	}
 	s.recordAudit(ctx, domain.AuditEntry{
 		UserID: &userID,
@@ -360,6 +379,34 @@ func (s *Service) Validate(ctx context.Context, token string) (domain.Session, d
 		s.cfg.Logger.Warn().Err(err).Msg("auth: session touch failed")
 	}
 	return sess, user, nil
+}
+
+// Check reports whether token is still a live session WITHOUT sliding its
+// TTL (Validate does slide). Used by the account feed's periodic re-check.
+// reason is "" while valid, else "revoked" (unknown token: logged out or
+// revoked), "expired" or "deleted" (user erased). err is a transient
+// lookup failure.
+func (s *Service) Check(ctx context.Context, token string) (reason string, err error) {
+	if token == "" {
+		return "revoked", nil
+	}
+	sess, err := s.sessions.GetSession(ctx, token)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return "revoked", nil
+		}
+		return "", fmt.Errorf("auth: check lookup: %w", err)
+	}
+	if !sess.ExpiresAt.After(time.Now().UTC()) {
+		return "expired", nil
+	}
+	if _, err := s.users.GetByID(ctx, sess.UserID); err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return "deleted", nil
+		}
+		return "", fmt.Errorf("auth: check user: %w", err)
+	}
+	return "", nil
 }
 
 func (s *Service) issueSession(ctx context.Context, userID uuid.UUID) (domain.Session, error) {
