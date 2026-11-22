@@ -66,12 +66,17 @@ func ParseFrontmatter(data []byte) (map[string]any, []byte, error) {
 	} else {
 		body = body[consumed:]
 	}
+	// WriteFrontmatter separates the fence from the body with exactly one
+	// blank line; strip exactly one so body round-trips byte for byte.
+	// Without this every read gained a leading "\n", which the fs-watcher
+	// then merged into the CRDT and lazy init seeded into new docs.
+	body = trimOneNewline(body)
 	return front, body, nil
 }
 
 // WriteFrontmatter renders front as a YAML document delimited by "---"
 // fences and concatenates body. The output always ends the frontmatter
-// block with "---\n" and starts the body on the next line.
+// block with "---\n"; a non-empty body follows after one blank line.
 func WriteFrontmatter(front map[string]any, body []byte) ([]byte, error) {
 	var out bytes.Buffer
 	out.WriteString(frontmatterDelim)
@@ -101,9 +106,9 @@ func WriteFrontmatter(front map[string]any, body []byte) ([]byte, error) {
 	if len(body) == 0 {
 		return out.Bytes(), nil
 	}
-	if body[0] != '\n' {
-		out.WriteByte('\n')
-	}
+	// Always exactly one separator line (ParseFrontmatter strips exactly
+	// one), so a body that itself starts with a newline keeps it.
+	out.WriteByte('\n')
 	out.Write(body)
 	return out.Bytes(), nil
 }

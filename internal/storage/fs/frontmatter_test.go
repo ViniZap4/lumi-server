@@ -121,3 +121,25 @@ func TestFrontmatter_EmptyBody(t *testing.T) {
 		t.Fatalf("expected empty body, got %q", gotBody)
 	}
 }
+
+func TestFrontmatter_BodyRoundTripsExactly(t *testing.T) {
+	front := map[string]any{"id": "x"}
+	for _, body := range []string{"hello", "\nleading newline", "\n\ntwo", "a\n", "# h\n\n---\n"} {
+		enc, err := WriteFrontmatter(front, []byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, got, err := ParseFrontmatter(enc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != body {
+			t.Errorf("round trip %q -> %q", body, got)
+		}
+	}
+	// Files written by other tools without the blank line parse the same.
+	_, got, err := ParseFrontmatter([]byte("---\nid: x\n---\nbody"))
+	if err != nil || string(got) != "body" {
+		t.Fatalf("no-blank-line file: %q %v", got, err)
+	}
+}
