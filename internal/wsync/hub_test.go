@@ -119,6 +119,27 @@ func (m *memRepo) HighestUpdateID(_ context.Context, v uuid.UUID, n string) (int
 // Any other GetSnapshot error is treated as a real failure.
 var errNotFound = domain.ErrNotFound
 
+// clientUpdate simulates a remote client: fork the room's current state
+// into a separate replica, edit it there, and return the resulting update
+// (what the client would send as Sync/Update).
+func clientUpdate(t *testing.T, room *Room, newText string) []byte {
+	t.Helper()
+	state, err := room.Doc().EncodeStateAsUpdate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replica, err := crdt.LoadDoc(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replica.Close()
+	u, err := replica.ApplyTextDiff(newText, "client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
 // ---- Tests -----------------------------------------------------------------
 
 func TestRoomBroadcastsToOthers(t *testing.T) {
@@ -149,13 +170,8 @@ func TestRoomBroadcastsToOthers(t *testing.T) {
 		t.Fatalf("expected shared room, got distinct")
 	}
 
-	// A makes an edit on the shared doc via ApplyTextDiff so we have
-	// a real update blob and a doc state that B should learn about.
-	doc := roomA.Doc()
-	update, err := doc.ApplyTextDiff("Hello from A", "test")
-	if err != nil {
-		t.Fatalf("ApplyTextDiff: %v", err)
-	}
+	// A's client computes an edit on its own replica.
+	update := clientUpdate(t, roomA, "Hello from A")
 
 	// Simulate a client of A having computed `update` (above) and
 	// sending it back through the hub — this is what handleMessage
@@ -395,14 +411,14 @@ func TestFSMirrorFiresAfterDebounce(t *testing.T) {
 	defer hub.Leave(room, sub)
 
 	// First edit.
-	u1, _ := room.Doc().ApplyTextDiff("hello", "test")
+	u1 := clientUpdate(t, room, "hello")
 	if err := room.ApplyAndBroadcast(u1, sub, sub.UserID); err != nil {
 		t.Fatal(err)
 	}
 
 	// Second edit inside the debounce window must coalesce.
 	time.Sleep(15 * time.Millisecond)
-	u2, _ := room.Doc().ApplyTextDiff("hello world", "test")
+	u2 := clientUpdate(t, room, "hello world")
 	if err := room.ApplyAndBroadcast(u2, sub, sub.UserID); err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +461,7 @@ func TestFSMirrorSkipsFSWatcherOrigin(t *testing.T) {
 	}
 	defer hub.Leave(room, sub)
 
-	u, _ := room.Doc().ApplyTextDiff("external edit", "test")
+	u := clientUpdate(t, room, "external edit")
 	if err := room.ApplyAndBroadcastFromFS(u); err != nil {
 		t.Fatal(err)
 	}

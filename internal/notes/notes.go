@@ -29,6 +29,7 @@ import (
 	"github.com/ViniZap4/lumi-server/internal/crdt"
 	"github.com/ViniZap4/lumi-server/internal/domain"
 	"github.com/ViniZap4/lumi-server/internal/storage/fs"
+	"github.com/ViniZap4/lumi-server/internal/wsync"
 )
 
 // ---- Dependencies ----------------------------------------------------------
@@ -78,6 +79,7 @@ type Service struct {
 	audit     audit.Recorder
 	resolver  capguard.Resolver
 	crdt      *crdt.Registry
+	docs      LiveDocs
 	silencer  FSEventSilencer
 	fedNotify FederationNotifier
 	now       func() time.Time
@@ -125,6 +127,45 @@ type FederationNotifier interface {
 
 // SetFederationNotifier wires the relay; nil disables.
 func (s *Service) SetFederationNotifier(n FederationNotifier) { s.fedNotify = n }
+
+// LiveDocs is the single authority over each note's in-memory CRDT doc
+// (implemented by *wsync.Hub). Every CRDT mutation made by this service
+// goes through it so live WebSocket clients receive the change and the
+// room's debounced mirror never writes stale text (protocol §10 S2).
+type LiveDocs interface {
+	ApplyUpdate(ctx context.Context, vaultID uuid.UUID, noteID string, update []byte, opts wsync.ApplyOptions) (wsync.ApplyResult, error)
+	ApplyText(ctx context.Context, vaultID uuid.UUID, noteID, newText string, expectSV []byte, opts wsync.ApplyOptions) (wsync.ApplyResult, error)
+	View(ctx context.Context, vaultID uuid.UUID, noteID string, fn func(*crdt.Doc) error) error
+}
+
+// SetLiveDocs wires the doc authority. Without it the CRDT write
+// endpoints answer crdt_unavailable and PATCH body skips the CRDT.
+func (s *Service) SetLiveDocs(d LiveDocs) { s.docs = d }
+
+// CRDTInitBody returns a note's on-disk body for lazy CRDT seeding
+// (crdt.InitSource). Unknown notes and notes without a file yet (e.g. a
+// federation replica awaiting its first mirrored update) yield "".
+func (s *Service) CRDTInitBody(ctx context.Context, vaultID uuid.UUID, noteID string) (string, error) {
+	n, err := s.notes.Get(ctx, vaultID, noteID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return "", nil
+		}
+		return "", err
+	}
+	v, err := s.vaults.GetByID(ctx, vaultID)
+	if err != nil {
+		return "", err
+	}
+	_, body, err := s.fs.ReadNote(v.Slug, n.Path)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return "", nil
+		}
+		return "", err
+	}
+	return string(body), nil
+}
 
 // suppressFSEvent computes the absolute on-disk path for (slug, rel)
 // and registers it in the watcher's skip map. Cheap; safe to call
@@ -381,13 +422,16 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 		if err := s.fs.WriteNote(v.Slug, newPath, front, body); err != nil {
 			return domain.Note{}, err
 		}
-		// Mirror body edits into the CRDT log so /snapshot and /diff
-		// remain in sync with FS. Best-effort: a CRDT failure here
-		// doesn't roll back the FS write — the note is still readable
-		// via /content, and slice 2.4 (fsnotify watcher) will close
-		// the gap.
-		if in.Body != nil && s.crdt != nil {
-			_ = s.applyBodyToCRDT(ctx, vaultID, id, *in.Body, in.Actor, "web-patch")
+		// Route the body into the note's authoritative CRDT doc (the
+		// live room's when one is open) so connected editors receive it
+		// and the room mirror cannot later overwrite the file with stale
+		// text. PATCH body is whole-text replacement: anything a live
+		// editor typed that the caller did not see is replaced (LWW).
+		// Best-effort: a CRDT failure doesn't roll back the FS write.
+		if in.Body != nil && s.docs != nil {
+			_, _ = s.docs.ApplyText(ctx, vaultID, id, *in.Body, nil, wsync.ApplyOptions{
+				Actor: in.Actor, Origin: "web-patch", Mirror: wsync.MirrorNow,
+			})
 		}
 	}
 
@@ -504,156 +548,144 @@ func (s *Service) deleteInternal(ctx context.Context, vaultID uuid.UUID, id stri
 // intentionally disabled).
 var errCRDTUnavailable = fmt.Errorf("%w: crdt not available", domain.ErrValidation)
 
-// SnapshotResult is the wire shape of GET /snapshot — text + opaque
-// state vector (lib0 v1). The handler base64-encodes the vector.
+// errBaseRequired: a text /diff without a usable base (protocol §10 S1).
+var errBaseRequired = fmt.Errorf("%w: base_required", domain.ErrConflict)
+
+// SnapshotResult is the wire shape of GET /snapshot and POST /diff —
+// text + opaque state vector (lib0 v1) + full encoded state. The handler
+// base64-encodes the binary fields.
 type SnapshotResult struct {
 	NoteID      string
 	Path        string
 	Text        string
 	VectorClock []byte
+	// State is the full lib0-v1 encoded document (EncodeStateAsUpdate).
+	// Opaque-editor clients keep it as the base for a 3-way /diff.
+	State []byte
 }
 
-// GetSnapshot loads the CRDT doc for the note and returns the current
-// merged text + its state vector. The on-disk file is NOT consulted —
-// the CRDT is the canonical "what would two concurrent writers see?"
-// answer for slice 2.2.
+// GetSnapshot returns the note's current CRDT text, state vector and full
+// state, read from the authoritative doc (the live room's when open).
 func (s *Service) GetSnapshot(ctx context.Context, vaultID uuid.UUID, id string) (SnapshotResult, error) {
-	if s.crdt == nil {
+	if s.crdt == nil || s.docs == nil {
 		return SnapshotResult{}, errCRDTUnavailable
 	}
 	n, err := s.notes.Get(ctx, vaultID, id)
 	if err != nil {
 		return SnapshotResult{}, err
 	}
-	doc, err := s.crdt.LoadDoc(ctx, vaultID, id)
+	out := SnapshotResult{NoteID: n.ID, Path: n.Path}
+	err = s.docs.View(ctx, vaultID, id, func(doc *crdt.Doc) error {
+		var err error
+		if out.Text, err = doc.Text(); err != nil {
+			return err
+		}
+		if out.VectorClock, err = doc.StateVectorV1(); err != nil {
+			return err
+		}
+		out.State, err = doc.EncodeStateAsUpdate()
+		return err
+	})
 	if err != nil {
 		return SnapshotResult{}, err
 	}
-	defer doc.Close()
-
-	text, err := doc.Text()
-	if err != nil {
-		return SnapshotResult{}, err
-	}
-	sv, err := doc.StateVectorV1()
-	if err != nil {
-		return SnapshotResult{}, err
-	}
-	return SnapshotResult{
-		NoteID:      n.ID,
-		Path:        n.Path,
-		Text:        text,
-		VectorClock: sv,
-	}, nil
+	return out, nil
 }
 
-// ApplyDiff is the TUI-style "I rewrote the whole body, merge it in"
-// path. The supplied newText is diffed against the CRDT's current text
-// and applied as a single (remove, insert) operation, preserving any
-// concurrent edits the caller did not see. baseClock is currently
-// advisory (slice 2.2 always merges against current state — slice 2.3
-// will use it for 3-way conflict signalling).
+// DiffInput is the text-merge form of POST /diff.
+type DiffInput struct {
+	// Text is the full edited body.
+	Text string
+	// BaseState is the full encoded state (GET /snapshot `state`) the
+	// edit was made on. Preferred: enables a real 3-way merge.
+	BaseState []byte
+	// BaseClock is the state vector (GET /snapshot `vector_clock`) the
+	// edit was made on. Accepted only while it still equals the current
+	// state vector (nothing concurrent happened).
+	BaseClock []byte
+}
+
+// ApplyDiff is the opaque-editor "I rewrote the whole body" path.
 //
-// On success, the resulting text is also written back to the on-disk
-// markdown file with the existing frontmatter so the FS view stays
-// consistent. originKind is recorded on the update row for audit.
+//   - With BaseState: rebuild the base, diff base text → Text, and merge
+//     those ops into the current doc (3-way; concurrent edits survive).
+//   - With only BaseClock: plain diff against current text, but only if
+//     the clock still equals the current state vector — atomically
+//     checked; otherwise errBaseRequired.
+//   - With neither: errBaseRequired (HTTP 409). The old behaviour —
+//     diffing against current state — silently discarded every edit the
+//     caller had not seen (vector V9a).
+//
+// Caveat: deletions do not advance a state vector, so the BaseClock path
+// cannot see a concurrent pure deletion (it would be re-inserted).
+// Clients should send BaseState.
 func (s *Service) ApplyDiff(
 	ctx context.Context,
 	vaultID uuid.UUID, id string,
-	newText string,
+	in DiffInput,
 	originKind string,
 	actor uuid.UUID, ip, ua string,
 ) (SnapshotResult, error) {
-	if s.crdt == nil {
+	if s.crdt == nil || s.docs == nil {
 		return SnapshotResult{}, errCRDTUnavailable
 	}
 	n, err := s.notes.Get(ctx, vaultID, id)
 	if err != nil {
 		return SnapshotResult{}, err
 	}
-	v, err := s.vaults.GetByID(ctx, vaultID)
-	if err != nil {
-		return SnapshotResult{}, err
-	}
+	opts := wsync.ApplyOptions{Actor: actor, Origin: originKind, Mirror: wsync.MirrorNow}
 
-	doc, err := s.crdt.LoadDoc(ctx, vaultID, id)
-	if err != nil {
-		return SnapshotResult{}, err
+	var res wsync.ApplyResult
+	switch {
+	case len(in.BaseState) > 0:
+		tw, err := crdt.ThreeWayUpdate(in.BaseState, in.Text)
+		if err != nil {
+			return SnapshotResult{}, err
+		}
+		// The base must be a version this doc descends from, otherwise
+		// the derived ops reference items the server never saw and
+		// would sit as a pending update forever.
+		var covered bool
+		if err := s.docs.View(ctx, vaultID, id, func(doc *crdt.Doc) error {
+			raw, err := doc.StateVectorV1()
+			if err != nil {
+				return err
+			}
+			cur, err := crdt.DecodeStateVector(raw)
+			if err != nil {
+				return err
+			}
+			covered = cur.Covers(tw.BaseSV)
+			return nil
+		}); err != nil {
+			return SnapshotResult{}, err
+		}
+		if !covered {
+			return SnapshotResult{}, fmt.Errorf("%w: base_state contains changes this server does not have", crdt.ErrBaseMismatch)
+		}
+		res, err = s.docs.ApplyUpdate(ctx, vaultID, id, tw.Update, opts)
+		if err != nil {
+			return SnapshotResult{}, err
+		}
+	case len(in.BaseClock) > 0:
+		res, err = s.docs.ApplyText(ctx, vaultID, id, in.Text, in.BaseClock, opts)
+		if errors.Is(err, crdt.ErrBaseMismatch) {
+			return SnapshotResult{}, fmt.Errorf("%w: base_clock is stale; resend with base_state", errBaseRequired)
+		}
+		if err != nil {
+			return SnapshotResult{}, err
+		}
+	default:
+		return SnapshotResult{}, errBaseRequired
 	}
-	defer doc.Close()
-
-	update, err := doc.ApplyTextDiff(newText, originKind)
-	if err != nil {
-		return SnapshotResult{}, err
-	}
-	if len(update) == 0 {
-		// No-op edit. Return the current snapshot for parity.
-		text, _ := doc.Text()
-		sv, _ := doc.StateVectorV1()
-		return SnapshotResult{NoteID: n.ID, Path: n.Path, Text: text, VectorClock: sv}, nil
-	}
-
-	if err := s.crdt.PersistChange(ctx, vaultID, id, update, actor, originKind, doc); err != nil {
-		return SnapshotResult{}, err
-	}
-
-	// Mirror to the on-disk markdown, preserving frontmatter.
-	front, _, err := s.fs.ReadNote(v.Slug, n.Path)
-	if err != nil {
-		// FS read failed but CRDT is updated — surface the error so the
-		// client knows the state diverged. They can retry by reading
-		// /content and re-PATCHing.
-		return SnapshotResult{}, fmt.Errorf("crdt + fs mirror: read note: %w", err)
-	}
-	mergedText, _ := doc.Text()
-	now := s.now().UTC()
-	front["updated_at"] = now.Format(time.RFC3339)
-	if _, ok := front["id"]; !ok {
-		front["id"] = id
-	}
-	s.suppressFSEvent(v.Slug, n.Path)
-	if err := s.fs.WriteNote(v.Slug, n.Path, front, []byte(mergedText)); err != nil {
-		return SnapshotResult{}, fmt.Errorf("crdt + fs mirror: write note: %w", err)
-	}
-
-	updated := domain.Note{
-		ID:        id,
-		VaultID:   vaultID,
-		Path:      n.Path,
-		Title:     n.Title,
-		CreatedAt: n.CreatedAt,
-		UpdatedAt: now,
-	}
-	if err := s.notes.Upsert(ctx, updated); err != nil {
-		return SnapshotResult{}, err
-	}
-	s.recordAudit(ctx, actor, vaultID, domain.ActionNoteEdit, ip, ua, map[string]any{
-		"note_id": id,
-		"path":    n.Path,
-		"source":  originKind,
-		"bytes":   len(update),
-	})
-
-	sv, err := doc.StateVectorV1()
-	if err != nil {
-		return SnapshotResult{}, err
-	}
-	return SnapshotResult{
-		NoteID:      id,
-		Path:        n.Path,
-		Text:        mergedText,
-		VectorClock: sv,
-	}, nil
+	return s.finishCRDTWrite(ctx, vaultID, n, res, originKind, actor, ip, ua)
 }
 
 // ApplyUpdate is the CRDT-peer "here's a Yjs update I computed
-// locally" path (Phase H slice 3). The supplied `update` bytes are a
-// lib0-v1 encoded Y.Doc update — applied to the server's doc directly
-// without a text re-diff. The caller already speaks Yjs (e.g. the
-// apple client's LumiCRDT). Empty update is a no-op.
-//
-// Same persistence + FS-mirror + audit flow as ApplyDiff; differs only
-// in how the update bytes are produced.
+// locally" path. The update (lib0 v1) is merged into the note's
+// authoritative doc — the live room's when one is open — persisted once,
+// broadcast to live clients and mirrored to disk. Empty or already-known
+// updates are no-ops.
 func (s *Service) ApplyUpdate(
 	ctx context.Context,
 	vaultID uuid.UUID, id string,
@@ -661,87 +693,52 @@ func (s *Service) ApplyUpdate(
 	originKind string,
 	actor uuid.UUID, ip, ua string,
 ) (SnapshotResult, error) {
-	if s.crdt == nil {
+	if s.crdt == nil || s.docs == nil {
 		return SnapshotResult{}, errCRDTUnavailable
 	}
 	n, err := s.notes.Get(ctx, vaultID, id)
 	if err != nil {
 		return SnapshotResult{}, err
 	}
-	v, err := s.vaults.GetByID(ctx, vaultID)
-	if err != nil {
-		return SnapshotResult{}, err
-	}
-
-	doc, err := s.crdt.LoadDoc(ctx, vaultID, id)
-	if err != nil {
-		return SnapshotResult{}, err
-	}
-	defer doc.Close()
-
-	if len(update) == 0 {
-		// No-op edit. Return the current snapshot for parity.
-		text, _ := doc.Text()
-		sv, _ := doc.StateVectorV1()
-		return SnapshotResult{NoteID: n.ID, Path: n.Path, Text: text, VectorClock: sv}, nil
-	}
-	if err := doc.ApplyUpdate(update); err != nil {
-		return SnapshotResult{}, fmt.Errorf("apply update: %w", err)
-	}
-	if err := s.crdt.PersistChange(ctx, vaultID, id, update, actor, originKind, doc); err != nil {
-		return SnapshotResult{}, err
-	}
-
-	// Mirror merged text to disk, preserving frontmatter.
-	front, _, err := s.fs.ReadNote(v.Slug, n.Path)
-	if err != nil {
-		return SnapshotResult{}, fmt.Errorf("crdt + fs mirror: read note: %w", err)
-	}
-	mergedText, _ := doc.Text()
-	now := s.now().UTC()
-	front["updated_at"] = now.Format(time.RFC3339)
-	if _, ok := front["id"]; !ok {
-		front["id"] = id
-	}
-	s.suppressFSEvent(v.Slug, n.Path)
-	if err := s.fs.WriteNote(v.Slug, n.Path, front, []byte(mergedText)); err != nil {
-		return SnapshotResult{}, fmt.Errorf("crdt + fs mirror: write note: %w", err)
-	}
-
-	updated := domain.Note{
-		ID:        id,
-		VaultID:   vaultID,
-		Path:      n.Path,
-		Title:     n.Title,
-		CreatedAt: n.CreatedAt,
-		UpdatedAt: now,
-	}
-	if err := s.notes.Upsert(ctx, updated); err != nil {
-		return SnapshotResult{}, err
-	}
-	s.recordAudit(ctx, actor, vaultID, domain.ActionNoteEdit, ip, ua, map[string]any{
-		"note_id": id,
-		"path":    n.Path,
-		"source":  originKind,
-		"bytes":   len(update),
+	res, err := s.docs.ApplyUpdate(ctx, vaultID, id, update, wsync.ApplyOptions{
+		Actor: actor, Origin: originKind, Mirror: wsync.MirrorNow,
 	})
-
-	sv, err := doc.StateVectorV1()
 	if err != nil {
-		return SnapshotResult{}, err
+		return SnapshotResult{}, fmt.Errorf("%w: apply update: %v", domain.ErrValidation, err)
+	}
+	return s.finishCRDTWrite(ctx, vaultID, n, res, originKind, actor, ip, ua)
+}
+
+// finishCRDTWrite audits a REST CRDT write and shapes the response. The
+// disk write and updated_at bump already happened in the Hub's
+// synchronous mirror (WriteBodyFromCRDT).
+func (s *Service) finishCRDTWrite(ctx context.Context, vaultID uuid.UUID, n domain.Note, res wsync.ApplyResult, originKind string, actor uuid.UUID, ip, ua string) (SnapshotResult, error) {
+	if res.MirrorErr != nil {
+		// The CRDT change is persisted and broadcast; the file is behind.
+		// Surface it so the client knows; a retry is an idempotent no-op
+		// for the CRDT and re-runs the mirror on the next change.
+		return SnapshotResult{}, fmt.Errorf("crdt fs mirror: %w", res.MirrorErr)
+	}
+	if res.Changed {
+		s.recordAudit(ctx, actor, vaultID, domain.ActionNoteEdit, ip, ua, map[string]any{
+			"note_id": n.ID,
+			"path":    n.Path,
+			"source":  originKind,
+			"bytes":   len(res.Update),
+		})
 	}
 	return SnapshotResult{
-		NoteID:      id,
+		NoteID:      n.ID,
 		Path:        n.Path,
-		Text:        mergedText,
-		VectorClock: sv,
+		Text:        res.Text,
+		VectorClock: res.StateVector,
 	}, nil
 }
 
 // WriteBodyFromCRDT mirrors a CRDT-derived body back to the on-disk
-// markdown file. Called by the WebSocket hub's debounced mirror
-// (slice 4.5) so live-collab edits propagate to FS-reading clients
-// (TUI, apple) without needing an explicit /diff round-trip.
+// markdown file. Called by the WebSocket hub's mirror (debounced for
+// live edits, synchronous for REST writes) so CRDT changes propagate to
+// FS-reading clients (TUI, apple).
 //
 // Frontmatter is preserved; only the body region is replaced. The FS
 // watcher path is suppressed so we don't bounce our own write back
@@ -761,7 +758,11 @@ func (s *Service) WriteBodyFromCRDT(ctx context.Context, vaultID uuid.UUID, note
 	}
 	front, _, err := s.fs.ReadNote(v.Slug, n.Path)
 	if err != nil {
-		return err
+		if !errors.Is(err, domain.ErrNotFound) {
+			return err
+		}
+		// First mirror of a federation-announced note: create the file.
+		front = map[string]any{"id": noteID, "title": n.Title, "created_at": n.CreatedAt.UTC().Format(time.RFC3339)}
 	}
 	now := s.now().UTC()
 	front["updated_at"] = now.Format(time.RFC3339)
@@ -772,34 +773,12 @@ func (s *Service) WriteBodyFromCRDT(ctx context.Context, vaultID uuid.UUID, note
 	if err := s.fs.WriteNote(v.Slug, n.Path, front, []byte(text)); err != nil {
 		return err
 	}
-	// Bump updated_at in pg so listings reflect the live edit. We
-	// don't add an audit row — the underlying CRDT update already
-	// has one via Hub.ApplyAndBroadcast's PersistChange.
+	// Bump updated_at in pg so listings reflect the edit. No audit row
+	// here — the underlying CRDT write is audited by its entry point.
 	updated := n
 	updated.UpdatedAt = now
 	_ = s.notes.Upsert(ctx, updated)
 	return nil
-}
-
-// applyBodyToCRDT is the PATCH-body bridge: load doc, apply diff, persist.
-// Best-effort — caller treats CRDT errors as non-fatal.
-func (s *Service) applyBodyToCRDT(ctx context.Context, vaultID uuid.UUID, id string, newBody string, actor uuid.UUID, originKind string) error {
-	if s.crdt == nil {
-		return nil
-	}
-	doc, err := s.crdt.LoadDoc(ctx, vaultID, id)
-	if err != nil {
-		return err
-	}
-	defer doc.Close()
-	update, err := doc.ApplyTextDiff(newBody, originKind)
-	if err != nil {
-		return err
-	}
-	if len(update) == 0 {
-		return nil
-	}
-	return s.crdt.PersistChange(ctx, vaultID, id, update, actor, originKind, doc)
 }
 
 // ---- Audit -----------------------------------------------------------------
@@ -1110,10 +1089,11 @@ func (h *Handlers) delete(c *fiber.Ctx) error {
 
 // getSnapshot — GET /api/vaults/:vault/notes/:id/snapshot
 //
-// Returns { id, path, text, vector_clock } where vector_clock is the
-// base64-encoded lib0-v1 state vector. Clients use vector_clock as the
-// "base" when later POSTing /diff — though slice 2.2 treats it as
-// advisory only.
+// Returns { id, path, text, vector_clock, state }:
+//   - vector_clock: base64 lib0-v1 state vector (unchanged; REST-only CRDT
+//     clients use it as lastServerSV for encodeStateAsUpdate).
+//   - state: base64 full lib0-v1 update (EncodeStateAsUpdate). Opaque
+//     editors keep it as the base for a 3-way POST /diff (`base_state`).
 func (h *Handlers) getSnapshot(c *fiber.Ctx) error {
 	vaultID, err := capguard.WithVaultID(c)
 	if err != nil {
@@ -1125,35 +1105,34 @@ func (h *Handlers) getSnapshot(c *fiber.Ctx) error {
 	}
 	r, err := h.svc.GetSnapshot(c.UserContext(), vaultID, id)
 	if err != nil {
-		if errors.Is(err, errCRDTUnavailable) {
-			return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "crdt_unavailable"})
-		}
-		return mapErr(c, err)
+		return mapCRDTErr(c, err)
 	}
 	return c.JSON(fiber.Map{
 		"id":           r.NoteID,
 		"path":         r.Path,
 		"text":         r.Text,
 		"vector_clock": base64.StdEncoding.EncodeToString(r.VectorClock),
+		"state":        base64.StdEncoding.EncodeToString(r.State),
 	})
 }
 
 type diffReq struct {
-	// BaseClock is base64-encoded; advisory in slice 2.2.
-	BaseClock string `json:"base_clock,omitempty"`
-	// Text is the full new body the caller wants to commit. The server
-	// computes the minimal (remove, insert) operation against the
-	// CRDT's current state, preserving any concurrent edits. Mutually
-	// exclusive with `Update`; one of the two must be set.
+	// Text is the full edited body (text-merge form). Requires a base:
+	// `base_state` (preferred) or a still-current `base_clock`.
 	Text string `json:"text,omitempty"`
+	// BaseState is the base64 full state from GET /snapshot `state` that
+	// the edit was made on. Enables a 3-way merge.
+	BaseState string `json:"base_state,omitempty"`
+	// BaseClock is the base64 state vector from GET /snapshot
+	// `vector_clock`. Without base_state the write is accepted only if it
+	// still equals the current state vector.
+	BaseClock string `json:"base_clock,omitempty"`
 	// Update is a base64-encoded lib0-v1 Y.Doc update produced by a
-	// CRDT-peer client (e.g. apple-client's LumiCRDT, Phase H slice 3).
-	// When set, the server applies the update directly — no text
-	// re-diff. Mutually exclusive with `Text`.
+	// CRDT-peer client (e.g. apple-client's LumiCRDT). Applied as a CRDT
+	// merge. Mutually exclusive with `Text`.
 	Update string `json:"update,omitempty"`
-	// Origin labels the source; must be one of clientOriginAllowlist
-	// ("tui-diff", "apple-diff", "web", "web-diff"). Defaults to
-	// "tui-diff" when omitted.
+	// Origin labels the source; must be one of clientOriginAllowlist.
+	// Defaults to "tui-diff" when omitted.
 	Origin string `json:"origin,omitempty"`
 }
 
@@ -1166,6 +1145,8 @@ var clientOriginAllowlist = map[string]struct{}{
 	"apple-diff": {},
 	"web":        {},
 	"web-diff":   {},
+	"tui":        {},
+	"apple":      {},
 }
 
 // defaultClientOrigin is used when the client omits origin.
@@ -1184,14 +1165,34 @@ func clientOrigin(raw string) (string, error) {
 	return o, nil
 }
 
+func decodeB64Field(c *fiber.Ctx, name, raw string) ([]byte, bool) {
+	if raw == "" {
+		return nil, true
+	}
+	b, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		_ = c.Status(http.StatusBadRequest).JSON(fiber.Map{
+			"error":  "invalid_body",
+			"detail": name + " is not valid base64",
+		})
+		return nil, false
+	}
+	return b, true
+}
+
 // applyDiff — POST /api/vaults/:vault/notes/:id/diff
 //
 // Accepts two body shapes (mutually exclusive):
-//   - `{text, base_clock?, origin?}` — the original text-merge path.
-//     Server computes the minimal diff vs current CRDT state.
-//   - `{update, origin?}` — the Phase H slice 3 raw-update path.
-//     `update` is base64-encoded lib0-v1 Y.Doc update bytes; server
-//     applies them directly.
+//   - `{update, origin?}` — a lib0-v1 Y.Doc update computed by a CRDT
+//     client (e.g. on a doc restored from /snapshot `state`); merged.
+//   - `{text, base_state | base_clock, origin?}` — opaque-editor form.
+//     With base_state the server performs the 3-way merge itself. With
+//     only base_clock the write is accepted iff the clock is current.
+//     With neither: 409 {"error":"base_required"} (no more LWW).
+//
+// Errors: 409 base_required (no/stale base), 409 base_mismatch
+// (base_state is not an ancestor of the server's state).
+// Success: { id, path, text, vector_clock }.
 func (h *Handlers) applyDiff(c *fiber.Ctx) error {
 	vaultID, err := capguard.WithVaultID(c)
 	if err != nil {
@@ -1213,45 +1214,38 @@ func (h *Handlers) applyDiff(c *fiber.Ctx) error {
 		})
 	}
 	uid, _ := capguard.UserIDFrom(c)
+	ip, ua := c.IP(), string(c.Request().Header.UserAgent())
 
+	var r SnapshotResult
 	if req.Update != "" {
-		// Raw-update path. Reject ambiguous payloads that carry both
-		// shapes so a bug in the client can't silently land "the wrong"
-		// path on the server.
-		if req.Text != "" {
+		// Reject ambiguous payloads that carry both shapes so a bug in
+		// the client can't silently land "the wrong" path on the server.
+		if req.Text != "" || req.BaseState != "" {
 			return c.Status(http.StatusBadRequest).JSON(fiber.Map{
 				"error":  "invalid_body",
 				"detail": "set exactly one of `text` or `update`",
 			})
 		}
-		updateBytes, err := base64.StdEncoding.DecodeString(req.Update)
-		if err != nil {
-			return c.Status(http.StatusBadRequest).JSON(fiber.Map{
-				"error":  "invalid_body",
-				"detail": "update is not valid base64",
-			})
+		updateBytes, ok := decodeB64Field(c, "update", req.Update)
+		if !ok {
+			return nil
 		}
-		r, err := h.svc.ApplyUpdate(c.UserContext(), vaultID, id, updateBytes, origin, uid, c.IP(), string(c.Request().Header.UserAgent()))
-		if err != nil {
-			if errors.Is(err, errCRDTUnavailable) {
-				return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "crdt_unavailable"})
-			}
-			return mapErr(c, err)
+		r, err = h.svc.ApplyUpdate(c.UserContext(), vaultID, id, updateBytes, origin, uid, ip, ua)
+	} else {
+		baseState, ok := decodeB64Field(c, "base_state", req.BaseState)
+		if !ok {
+			return nil
 		}
-		return c.JSON(fiber.Map{
-			"id":           r.NoteID,
-			"path":         r.Path,
-			"text":         r.Text,
-			"vector_clock": base64.StdEncoding.EncodeToString(r.VectorClock),
-		})
+		baseClock, ok := decodeB64Field(c, "base_clock", req.BaseClock)
+		if !ok {
+			return nil
+		}
+		r, err = h.svc.ApplyDiff(c.UserContext(), vaultID, id, DiffInput{
+			Text: req.Text, BaseState: baseState, BaseClock: baseClock,
+		}, origin, uid, ip, ua)
 	}
-
-	r, err := h.svc.ApplyDiff(c.UserContext(), vaultID, id, req.Text, origin, uid, c.IP(), string(c.Request().Header.UserAgent()))
 	if err != nil {
-		if errors.Is(err, errCRDTUnavailable) {
-			return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "crdt_unavailable"})
-		}
-		return mapErr(c, err)
+		return mapCRDTErr(c, err)
 	}
 	return c.JSON(fiber.Map{
 		"id":           r.NoteID,
@@ -1259,6 +1253,23 @@ func (h *Handlers) applyDiff(c *fiber.Ctx) error {
 		"text":         r.Text,
 		"vector_clock": base64.StdEncoding.EncodeToString(r.VectorClock),
 	})
+}
+
+// mapCRDTErr maps the CRDT endpoints' specific errors, then falls back to
+// mapErr.
+func mapCRDTErr(c *fiber.Ctx, err error) error {
+	switch {
+	case errors.Is(err, errCRDTUnavailable):
+		return c.Status(http.StatusServiceUnavailable).JSON(fiber.Map{"error": "crdt_unavailable"})
+	case errors.Is(err, errBaseRequired):
+		return c.Status(http.StatusConflict).JSON(fiber.Map{
+			"error":  "base_required",
+			"detail": "send base_state (from GET /snapshot `state`) so the server can merge instead of overwrite",
+		})
+	case errors.Is(err, crdt.ErrBaseMismatch):
+		return c.Status(http.StatusConflict).JSON(fiber.Map{"error": "base_mismatch", "detail": err.Error()})
+	}
+	return mapErr(c, err)
 }
 
 // yamlToJSON walks a value tree produced by gopkg.in/yaml.v3's Unmarshal

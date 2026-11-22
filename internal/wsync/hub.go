@@ -2,7 +2,7 @@ package wsync
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -35,9 +35,25 @@ const DefaultMaxUserConnections = 10
 // enough for TUI / apple clients tailing the dir to feel responsive.
 const DefaultMirrorDebounce = 500 * time.Millisecond
 
+// loadTimeout bounds a room's initial LoadDoc. The load runs on the
+// hub's root context, not the first caller's, so one cancelled HTTP
+// request cannot fail the load for every concurrent waiter.
+const loadTimeout = 30 * time.Second
+
+// mirrorFlushTimeout bounds the synchronous mirror run during eviction
+// and hub shutdown (the root context may already be cancelled there).
+const mirrorFlushTimeout = 5 * time.Second
+
 // Origin labels recorded in note_yjs_updates.origin_kind when an
 // update arrives over this transport.
 const OriginLive = "web"
+
+// OriginFSWatcher is the origin_kind tag for updates originating from
+// the external filesystem watcher. Distinct from OriginLive so the
+// audit log shows "user edited via Finder/$EDITOR" separately from
+// "user edited via web client". FS-origin updates never schedule the
+// disk mirror (the file already holds the change).
+const OriginFSWatcher = "fs-watcher"
 
 // FSMirrorFunc writes the current CRDT text back to the on-disk
 // markdown file. Wired in main.go to notes.Service.WriteBodyFromCRDT.
@@ -45,25 +61,84 @@ const OriginLive = "web"
 // do not yet have notes.Service in the dep graph.
 type FSMirrorFunc func(ctx context.Context, vaultID uuid.UUID, noteID, text string) error
 
-// Room is the per-note collaboration channel: it owns a single
-// *crdt.Doc, fans inbound updates out to subscribers, and persists
-// each update through the CRDT registry.
+// MirrorMode selects what happens to the on-disk file after a change.
+type MirrorMode int
+
+const (
+	// MirrorDebounced schedules the room's debounced mirror (live edits,
+	// federation updates).
+	MirrorDebounced MirrorMode = iota
+	// MirrorNow writes the file synchronously before returning (REST
+	// writes, so the response reflects what is on disk).
+	MirrorNow
+	// MirrorNone skips the mirror (fs-watcher input: the file is the
+	// source of the change).
+	MirrorNone
+)
+
+// ApplyOptions describes the provenance of a mutation routed through the
+// Hub's authoritative document.
+type ApplyOptions struct {
+	// Actor is recorded as note_yjs_updates.origin_user_id (uuid.Nil for
+	// system writes).
+	Actor uuid.UUID
+	// Origin is note_yjs_updates.origin_kind ("web", "tui", "fs-watcher",
+	// "federation:<peer>", …). It also drives federation echo suppression.
+	Origin string
+	// Mirror selects the disk-mirror behaviour.
+	Mirror MirrorMode
+}
+
+// ApplyResult reports the outcome of a mutation on the authoritative doc.
+type ApplyResult struct {
+	// Changed is false when the update/text was a no-op (nothing
+	// persisted, broadcast or mirrored).
+	Changed bool
+	// Update is the lib0-v1 update that was applied (nil when !Changed).
+	Update []byte
+	// Text and StateVector describe the document right after the change.
+	Text        string
+	StateVector []byte
+	// MirrorErr is set when Mirror==MirrorNow and the disk write failed;
+	// the CRDT change itself is persisted and broadcast regardless.
+	MirrorErr error
+}
+
+// ErrHubClosed is returned once the Hub has been shut down.
+var ErrHubClosed = errors.New("wsync: hub is closed")
+
+// Room is the per-note collaboration channel: it owns the single
+// authoritative in-memory *crdt.Doc for the note while anyone (a WS
+// subscriber or a transient REST/fs-watcher/federation writer) holds it,
+// fans updates out to subscribers, and persists each change exactly once
+// through the CRDT registry.
 type Room struct {
 	vaultID uuid.UUID
 	noteID  string
 
-	doc *crdt.Doc
+	// ready is closed once doc/loadErr are set.
+	ready   chan struct{}
+	doc     *crdt.Doc
+	loadErr error
+
+	// refs counts subscribers plus transient holders. Guarded by hub.mu.
+	refs int
+	// idleTimer is guarded by hub.mu.
+	idleTimer *time.Timer
 
 	subs       map[*Subscriber]struct{}
 	subsMu     sync.RWMutex
 	hub        *Hub
 	persistCtx context.Context
 
-	idleTimer *time.Timer
-	idleMu    sync.Mutex
-	evicted   atomic.Bool
+	// opMu serialises mutations: apply → persist → broadcast → mirror,
+	// so the update log order matches the apply order and the no-op
+	// check cannot interleave with another writer.
+	opMu    sync.Mutex
+	evicted atomic.Bool
 
 	mirrorTimer *time.Timer
+	mirrorGen   uint64
 	mirrorMu    sync.Mutex
 }
 
@@ -73,18 +148,16 @@ type Room struct {
 // stop.
 //
 // ClientID is the per-session presence identity declared by the client
-// at connect time via the `?client_id=<uuid>` query param. Optional —
-// uuid.Nil for clients that don't participate in awareness (legacy TUI,
-// internal callers). When non-nil, Leave broadcasts a synthetic
-// awareness "left" frame to remaining subscribers so they can drop the
-// peer from their presence list immediately instead of waiting on the
-// client-side TTL.
+// at connect time via the `?client_id=<uuid>` query param (legacy JSON
+// presence, Apple client). Optional.
 type Subscriber struct {
 	UserID   uuid.UUID
 	ClientID uuid.UUID
 	Out      chan []byte
 	Done     chan struct{}
 	doneCh   sync.Once
+
+	aw awarenessTracker
 }
 
 // CloseSubscriber closes Done idempotently so the pump goroutine can exit.
@@ -92,20 +165,26 @@ func (s *Subscriber) CloseSubscriber() {
 	s.doneCh.Do(func() { close(s.Done) })
 }
 
-// Hub indexes rooms by (vault_id, note_id) so multiple clients viewing
-// the same note share a single in-memory doc. Also tracks per-user
-// concurrent connection counts so a single user cannot exhaust server
-// goroutines or memory by opening thousands of WS sessions.
+// Hub indexes rooms by (vault_id, note_id) so every reader and writer of
+// a note shares a single in-memory doc. Also tracks per-user concurrent
+// connection counts so a single user cannot exhaust server goroutines or
+// memory by opening thousands of WS sessions.
+//
+// Invariant (CRDT client protocol §10 S2): every mutation of a note's
+// CRDT — live WS, REST /diff and PATCH body, fs-watcher, federation —
+// goes through Hub.ApplyUpdate / Hub.ApplyText (or a Room method), never
+// through a doc loaded separately from storage. That keeps live clients
+// informed and stops the debounced mirror from writing stale text.
 type Hub struct {
 	registry *crdt.Registry
 
-	mu       sync.Mutex
-	rooms    map[string]*Room
-	idleTTL  time.Duration
-	sendBuf  int
-	rootCtx  context.Context
-	rootCxl  context.CancelFunc
-	closed   atomic.Bool
+	mu      sync.Mutex
+	rooms   map[string]*Room
+	idleTTL time.Duration
+	sendBuf int
+	rootCtx context.Context
+	rootCxl context.CancelFunc
+	closed  atomic.Bool
 
 	slotsMu      sync.Mutex
 	userSlots    map[uuid.UUID]int
@@ -155,6 +234,12 @@ func (h *Hub) SetFSMirror(fn FSMirrorFunc) {
 	h.mirrorMu.Unlock()
 }
 
+func (h *Hub) mirror() FSMirrorFunc {
+	h.mirrorMu.RLock()
+	defer h.mirrorMu.RUnlock()
+	return h.mirrorFn
+}
+
 // NewHub constructs a Hub backed by the supplied CRDT registry.
 func NewHub(registry *crdt.Registry, opts ...HubOption) *Hub {
 	if registry == nil {
@@ -178,9 +263,9 @@ func NewHub(registry *crdt.Registry, opts ...HubOption) *Hub {
 	return h
 }
 
-// Close evicts every room and stops accepting new joins. Active
-// subscribers are signalled via their Done channels; their pump
-// goroutines should exit promptly.
+// Close evicts every room and stops accepting new joins. Pending debounced
+// mirrors are flushed. Active subscribers are signalled via their Done
+// channels; their pump goroutines should exit promptly.
 func (h *Hub) Close() {
 	if !h.closed.CompareAndSwap(false, true) {
 		return
@@ -189,17 +274,128 @@ func (h *Hub) Close() {
 	h.mu.Lock()
 	rooms := make([]*Room, 0, len(h.rooms))
 	for _, r := range h.rooms {
+		if r.idleTimer != nil {
+			r.idleTimer.Stop()
+			r.idleTimer = nil
+		}
+		r.evicted.Store(true)
 		rooms = append(rooms, r)
 	}
 	h.rooms = map[string]*Room{}
 	h.mu.Unlock()
 	for _, r := range rooms {
-		r.evict()
+		r.shutdown()
 	}
 }
 
 func roomKey(vaultID uuid.UUID, noteID string) string {
 	return vaultID.String() + "/" + noteID
+}
+
+// acquire returns the note's room, loading the doc on first use, and
+// takes a reference on it. Exactly one LoadDoc runs per room; concurrent
+// acquirers wait for it. Pair with release.
+func (h *Hub) acquire(ctx context.Context, vaultID uuid.UUID, noteID string) (*Room, error) {
+	if h.closed.Load() {
+		return nil, ErrHubClosed
+	}
+	key := roomKey(vaultID, noteID)
+
+	h.mu.Lock()
+	if h.closed.Load() {
+		h.mu.Unlock()
+		return nil, ErrHubClosed
+	}
+	room, ok := h.rooms[key]
+	if ok {
+		room.refs++
+		if room.idleTimer != nil {
+			room.idleTimer.Stop()
+			room.idleTimer = nil
+		}
+		h.mu.Unlock()
+		select {
+		case <-room.ready:
+		case <-ctx.Done():
+			h.release(room, false)
+			return nil, ctx.Err()
+		}
+		if room.loadErr != nil {
+			h.release(room, false)
+			return nil, room.loadErr
+		}
+		return room, nil
+	}
+	room = &Room{
+		vaultID:    vaultID,
+		noteID:     noteID,
+		ready:      make(chan struct{}),
+		refs:       1,
+		subs:       make(map[*Subscriber]struct{}),
+		hub:        h,
+		persistCtx: h.rootCtx,
+	}
+	h.rooms[key] = room
+	h.mu.Unlock()
+
+	loadCtx, cancel := context.WithTimeout(h.rootCtx, loadTimeout)
+	doc, err := h.registry.LoadDoc(loadCtx, vaultID, noteID)
+	cancel()
+	if err != nil {
+		room.loadErr = err
+		h.mu.Lock()
+		if h.rooms[key] == room {
+			delete(h.rooms, key)
+		}
+		room.evicted.Store(true)
+		h.mu.Unlock()
+		close(room.ready)
+		return nil, err
+	}
+	room.doc = doc
+	close(room.ready)
+	return room, nil
+}
+
+// release drops a reference. When the last one goes, a room that served
+// WS subscribers lingers for idleTTL (cheap reconnects); a room held only
+// by a transient writer is evicted right away (flushing any pending
+// mirror), so bulk REST/fs-watcher traffic does not pin docs in memory.
+func (h *Hub) release(room *Room, linger bool) {
+	key := roomKey(room.vaultID, room.noteID)
+	h.mu.Lock()
+	room.refs--
+	if room.refs > 0 || h.rooms[key] != room || room.loadErr != nil {
+		h.mu.Unlock()
+		return
+	}
+	if linger && h.idleTTL > 0 {
+		if room.idleTimer != nil {
+			room.idleTimer.Stop()
+		}
+		room.idleTimer = time.AfterFunc(h.idleTTL, func() { h.tryEvict(room) })
+		h.mu.Unlock()
+		return
+	}
+	delete(h.rooms, key)
+	room.evicted.Store(true)
+	h.mu.Unlock()
+	room.shutdown()
+}
+
+// tryEvict evicts room if it is still idle and still registered.
+func (h *Hub) tryEvict(room *Room) {
+	key := roomKey(room.vaultID, room.noteID)
+	h.mu.Lock()
+	if room.refs > 0 || h.rooms[key] != room {
+		h.mu.Unlock()
+		return
+	}
+	delete(h.rooms, key)
+	room.idleTimer = nil
+	room.evicted.Store(true)
+	h.mu.Unlock()
+	room.shutdown()
 }
 
 // Join attaches sub to the (vault_id, note_id) room, loading the doc
@@ -208,46 +404,10 @@ func roomKey(vaultID uuid.UUID, noteID string) string {
 // the client's incoming messages). The caller is responsible for
 // calling Leave when the subscriber disconnects.
 func (h *Hub) Join(ctx context.Context, vaultID uuid.UUID, noteID string, sub *Subscriber) (*Room, error) {
-	if h.closed.Load() {
-		return nil, fmt.Errorf("wsync: hub is closed")
+	room, err := h.acquire(ctx, vaultID, noteID)
+	if err != nil {
+		return nil, err
 	}
-	key := roomKey(vaultID, noteID)
-
-	h.mu.Lock()
-	room, ok := h.rooms[key]
-	if ok {
-		h.mu.Unlock()
-		room.cancelIdle()
-	} else {
-		// Load the doc fresh — we don't hold h.mu across LoadDoc to
-		// avoid serialising opens of distinct notes.
-		h.mu.Unlock()
-		doc, err := h.registry.LoadDoc(ctx, vaultID, noteID)
-		if err != nil {
-			return nil, err
-		}
-		room = &Room{
-			vaultID:    vaultID,
-			noteID:     noteID,
-			doc:        doc,
-			subs:       make(map[*Subscriber]struct{}),
-			hub:        h,
-			persistCtx: h.rootCtx,
-		}
-		// Race window: two concurrent first-joiners could each LoadDoc.
-		// The loser closes its doc and adopts the winner's.
-		h.mu.Lock()
-		if existing, ok2 := h.rooms[key]; ok2 {
-			h.mu.Unlock()
-			_ = doc.Close()
-			existing.cancelIdle()
-			room = existing
-		} else {
-			h.rooms[key] = room
-			h.mu.Unlock()
-		}
-	}
-
 	room.subsMu.Lock()
 	room.subs[sub] = struct{}{}
 	room.subsMu.Unlock()
@@ -255,89 +415,200 @@ func (h *Hub) Join(ctx context.Context, vaultID uuid.UUID, noteID string, sub *S
 }
 
 // Leave detaches the subscriber and starts the idle timer if it was the
-// last one in the room. If the departing sub had a non-nil ClientID and
-// other subscribers remain, a synthetic "left" awareness frame is
-// broadcast so peers can drop the entry from their presence list right
-// away (without waiting on a TTL).
+// last holder. Remaining subscribers receive an awareness update that
+// removes the departed client's awareness entries (see presence.go).
 func (h *Hub) Leave(room *Room, sub *Subscriber) {
 	if room == nil || sub == nil {
 		return
 	}
 	room.subsMu.Lock()
+	_, present := room.subs[sub]
 	delete(room.subs, sub)
-	empty := len(room.subs) == 0
 	room.subsMu.Unlock()
 	sub.CloseSubscriber()
-
-	if !empty && sub.ClientID != uuid.Nil {
-		room.broadcastPresenceLeave(sub.ClientID)
+	if !present {
+		return
 	}
-	if empty {
-		room.scheduleIdleEviction()
+	room.broadcastPresenceLeave(sub)
+	h.release(room, true)
+}
+
+// RoomIfActive returns the live Room for (vaultID, noteID) without
+// creating one, or nil. Read-only callers may use it; mutations must use
+// ApplyUpdate / ApplyText so they are serialised with live traffic.
+func (h *Hub) RoomIfActive(vaultID uuid.UUID, noteID string) *Room {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	r := h.rooms[roomKey(vaultID, noteID)]
+	if r == nil {
+		return nil
+	}
+	select {
+	case <-r.ready:
+		if r.loadErr != nil {
+			return nil
+		}
+		return r
+	default:
+		return nil
 	}
 }
 
+// ApplyUpdate merges a lib0-v1 update into the note's authoritative doc
+// (the live room's doc when one is active, else a transiently loaded one
+// registered as the room for the duration), persists it once, broadcasts
+// it to every live subscriber and mirrors per opts. No-op updates change
+// nothing and report Changed=false.
+func (h *Hub) ApplyUpdate(ctx context.Context, vaultID uuid.UUID, noteID string, update []byte, opts ApplyOptions) (ApplyResult, error) {
+	room, err := h.acquire(ctx, vaultID, noteID)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	defer h.release(room, false)
+	return room.applyUpdate(update, nil, opts)
+}
+
+// ApplyText replaces the note's text with newText, expressed as minimal
+// ranged ops against the authoritative doc's current text (LWW for any
+// part the caller did not see — callers must only use it where that is
+// the intended semantics: fs-watcher input, PATCH body, or a /diff whose
+// base matches the current state).
+//
+// When expectSV is non-nil the write happens only if the doc's current
+// state vector equals it; otherwise crdt.ErrBaseMismatch is returned and
+// nothing changes. The check and the write are atomic.
+func (h *Hub) ApplyText(ctx context.Context, vaultID uuid.UUID, noteID, newText string, expectSV []byte, opts ApplyOptions) (ApplyResult, error) {
+	room, err := h.acquire(ctx, vaultID, noteID)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	defer h.release(room, false)
+	return room.applyText(newText, expectSV, opts)
+}
+
+// View runs fn against the note's authoritative doc for reading (state
+// vector, diff, text, full state). fn must not mutate the doc.
+func (h *Hub) View(ctx context.Context, vaultID uuid.UUID, noteID string, fn func(*crdt.Doc) error) error {
+	room, err := h.acquire(ctx, vaultID, noteID)
+	if err != nil {
+		return err
+	}
+	defer h.release(room, false)
+	return fn(room.doc)
+}
+
 // Doc exposes the underlying CRDT document for handshake reads (state
-// vector / diff). Callers must not retain the pointer past the
-// subscriber's lifetime.
+// vector / diff). Callers must not mutate it directly (use the Apply
+// methods) nor retain the pointer past the subscriber's lifetime.
 func (r *Room) Doc() *crdt.Doc {
 	return r.doc
 }
 
-// OriginFSWatcher is the origin_kind tag for updates originating from
-// the external filesystem watcher. Distinct from OriginLive so the
-// audit log shows "user edited via Finder/$EDITOR" separately from
-// "user edited via web client".
-const OriginFSWatcher = "fs-watcher"
-
-// ApplyAndBroadcast applies update to the room's doc, persists it via
-// the CRDT registry, and fans it out to every subscriber except origin.
-// originUser is the user id recorded in note_yjs_updates.origin_user_id.
+// ApplyAndBroadcast applies a live (WS) update to the room's doc,
+// persists it via the CRDT registry, and fans it out to every subscriber
+// except origin. originUser is the user id recorded in
+// note_yjs_updates.origin_user_id. No-op updates (e.g. the [0,0]
+// SyncStep2 sent by every up-to-date client on connect) are dropped.
 func (r *Room) ApplyAndBroadcast(update []byte, origin *Subscriber, originUser uuid.UUID) error {
-	return r.applyAndBroadcastWithOrigin(update, origin, originUser, OriginLive)
+	_, err := r.applyUpdate(update, origin, ApplyOptions{Actor: originUser, Origin: OriginLive, Mirror: MirrorDebounced})
+	return err
 }
 
 // ApplyAndBroadcastFromFS applies an externally-sourced update (the FS
 // watcher having read a file edited outside the app), persists it
-// tagged "fs-watcher", and broadcasts to ALL subscribers — there is no
-// connection to suppress because the change did not originate from
-// the WS transport.
+// tagged "fs-watcher", and broadcasts to ALL subscribers. No mirror.
 func (r *Room) ApplyAndBroadcastFromFS(update []byte) error {
-	return r.applyAndBroadcastWithOrigin(update, nil, uuid.Nil, OriginFSWatcher)
+	_, err := r.applyUpdate(update, nil, ApplyOptions{Origin: OriginFSWatcher, Mirror: MirrorNone})
+	return err
 }
 
 // ApplyAndBroadcastFederation applies an update relayed from a federated
-// peer server (v3 F2). Broadcasts to ALL local subscribers (the change has
-// no local WS origin to suppress) and schedules the FS mirror — unlike an
-// FS-origin update, the local file does not yet reflect this change.
-// originKind is "federation:<peer-url>" so the registry persist hook can
-// suppress echoing the update back to its source link.
+// peer server (v3 F2). Broadcasts to ALL local subscribers and schedules
+// the FS mirror. originKind is "federation:<peer-url>" so the registry
+// persist hook can suppress echoing the update back to its source link.
 func (r *Room) ApplyAndBroadcastFederation(update []byte, originKind string) error {
-	return r.applyAndBroadcastWithOrigin(update, nil, uuid.Nil, originKind)
+	_, err := r.applyUpdate(update, nil, ApplyOptions{Origin: originKind, Mirror: MirrorDebounced})
+	return err
 }
 
-func (r *Room) applyAndBroadcastWithOrigin(update []byte, origin *Subscriber, originUser uuid.UUID, originKind string) error {
+func (r *Room) applyUpdate(update []byte, origin *Subscriber, opts ApplyOptions) (ApplyResult, error) {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	if r.evicted.Load() {
-		return fmt.Errorf("wsync: room evicted")
+		return ApplyResult{}, fmt.Errorf("wsync: room evicted")
 	}
-	if err := r.doc.ApplyUpdate(update); err != nil {
-		return err
+	changed, err := r.doc.ApplyUpdateChanged(update)
+	if err != nil {
+		return ApplyResult{}, err
 	}
+	if !changed {
+		return r.resultLocked(false, nil, nil), nil
+	}
+	return r.commitLocked(update, origin, opts)
+}
+
+func (r *Room) applyText(newText string, expectSV []byte, opts ApplyOptions) (ApplyResult, error) {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	if r.evicted.Load() {
+		return ApplyResult{}, fmt.Errorf("wsync: room evicted")
+	}
+	if expectSV != nil {
+		want, err := crdt.DecodeStateVector(expectSV)
+		if err != nil {
+			return ApplyResult{}, fmt.Errorf("%w: %v", crdt.ErrBaseMismatch, err)
+		}
+		rawCur, err := r.doc.StateVectorV1()
+		if err != nil {
+			return ApplyResult{}, err
+		}
+		cur, err := crdt.DecodeStateVector(rawCur)
+		if err != nil {
+			return ApplyResult{}, err
+		}
+		if !cur.Equal(want) {
+			return ApplyResult{}, crdt.ErrBaseMismatch
+		}
+	}
+	update, err := r.doc.ApplyTextDiff(newText, opts.Origin)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if len(update) == 0 {
+		return r.resultLocked(false, nil, nil), nil
+	}
+	return r.commitLocked(update, nil, opts)
+}
+
+// commitLocked persists an update already applied to r.doc, broadcasts
+// it and handles the mirror. Caller holds opMu.
+func (r *Room) commitLocked(update []byte, origin *Subscriber, opts ApplyOptions) (ApplyResult, error) {
 	// Persist before broadcasting so a crash between the two doesn't
 	// leave subscribers with state the server then loses.
 	if err := r.hub.registry.PersistChange(
-		r.persistCtx, r.vaultID, r.noteID, update, originUser, originKind, r.doc,
+		r.persistCtx, r.vaultID, r.noteID, update, opts.Actor, opts.Origin, r.doc,
 	); err != nil {
-		return err
+		return ApplyResult{}, err
 	}
 	r.broadcast(EncodeSyncUpdate(update), origin)
-	// Schedule the FS mirror. We do NOT mirror FS-originated updates
-	// — the file is already the source for that change; mirroring
-	// would race the fswatch suppression window.
-	if originKind != OriginFSWatcher {
+	var mirrorErr error
+	switch {
+	case opts.Origin == OriginFSWatcher || opts.Mirror == MirrorNone:
+		// The file is the source of this change; mirroring would race
+		// the fswatch suppression window.
+	case opts.Mirror == MirrorNow:
+		mirrorErr = r.flushMirror(r.hub.rootCtx)
+	default:
 		r.scheduleMirror()
 	}
-	return nil
+	return r.resultLocked(true, update, mirrorErr), nil
+}
+
+func (r *Room) resultLocked(changed bool, update []byte, mirrorErr error) ApplyResult {
+	res := ApplyResult{Changed: changed, Update: update, MirrorErr: mirrorErr}
+	res.Text, _ = r.doc.Text()
+	res.StateVector, _ = r.doc.StateVectorV1()
+	return res
 }
 
 // scheduleMirror starts (or resets) a per-room debounce timer. On
@@ -353,28 +624,47 @@ func (r *Room) scheduleMirror() {
 	if r.mirrorTimer != nil {
 		r.mirrorTimer.Stop()
 	}
-	r.mirrorTimer = time.AfterFunc(r.hub.mirrorDebounce, r.fireMirror)
+	r.mirrorGen++
+	gen := r.mirrorGen
+	r.mirrorTimer = time.AfterFunc(r.hub.mirrorDebounce, func() { r.fireMirror(gen) })
 }
 
-func (r *Room) fireMirror() {
+func (r *Room) fireMirror(gen uint64) {
 	if r.evicted.Load() {
 		return
 	}
-	r.hub.mirrorMu.RLock()
-	fn := r.hub.mirrorFn
-	r.hub.mirrorMu.RUnlock()
-	if fn == nil {
+	r.mirrorMu.Lock()
+	if gen != r.mirrorGen || r.mirrorTimer == nil {
+		// Superseded by a newer schedule, or flushed already.
+		r.mirrorMu.Unlock()
 		return
+	}
+	r.mirrorTimer = nil
+	r.mirrorMu.Unlock()
+	_ = r.writeMirror(r.hub.rootCtx)
+}
+
+// flushMirror cancels any pending debounced mirror and writes now.
+func (r *Room) flushMirror(ctx context.Context) error {
+	r.mirrorMu.Lock()
+	if r.mirrorTimer != nil {
+		r.mirrorTimer.Stop()
+		r.mirrorTimer = nil
+	}
+	r.mirrorMu.Unlock()
+	return r.writeMirror(ctx)
+}
+
+func (r *Room) writeMirror(ctx context.Context) error {
+	fn := r.hub.mirror()
+	if fn == nil {
+		return nil
 	}
 	text, err := r.doc.Text()
 	if err != nil {
-		return
+		return err
 	}
-	// Use the hub's root context so the mirror call survives short-
-	// lived per-handler contexts. notes.Service's WriteBodyFromCRDT
-	// is quick (frontmatter parse + atomic write) so a stale ctx is
-	// fine.
-	_ = fn(r.hub.rootCtx, r.vaultID, r.noteID, text)
+	return fn(ctx, r.vaultID, r.noteID, text)
 }
 
 // BroadcastAwareness fans out an awareness blob to all subscribers
@@ -383,37 +673,18 @@ func (r *Room) BroadcastAwareness(awareness []byte, origin *Subscriber) {
 	r.broadcast(EncodeAwareness(awareness), origin)
 }
 
-// broadcastPresenceLeave emits a synthetic awareness frame signalling
-// that clientID has departed. The payload mirrors the lumi PresenceState
-// JSON shape with empty user fields and `left: true`. Clients drop the
-// entry from their presence map without waiting on the per-peer TTL.
-//
-// Best-effort: a single Marshal failure (impossible for this fixed
-// shape) silently no-ops. The room mutex isn't held here because
-// broadcast() takes its own RLock and the caller has already removed
-// sub from the map.
-func (r *Room) broadcastPresenceLeave(clientID uuid.UUID) {
-	payload, err := json.Marshal(struct {
-		ClientID    string `json:"client_id"`
-		Username    string `json:"username"`
-		DisplayName string `json:"display_name"`
-		Color       string `json:"color"`
-		Left        bool   `json:"left"`
-	}{ClientID: clientID.String(), Left: true})
-	if err != nil {
-		return
-	}
-	r.broadcast(EncodeAwareness(payload), nil)
-}
-
 // broadcast pushes msg into every subscriber's Out channel except
 // origin. Subscribers whose outbound queue is full are dropped (their
 // Done is closed); the pump will catch up next.
 func (r *Room) broadcast(msg []byte, origin *Subscriber) {
+	r.broadcastFiltered(msg, origin, nil)
+}
+
+func (r *Room) broadcastFiltered(msg []byte, origin *Subscriber, keep func(*Subscriber) bool) {
 	r.subsMu.RLock()
 	subs := make([]*Subscriber, 0, len(r.subs))
 	for s := range r.subs {
-		if s == origin {
+		if s == origin || (keep != nil && !keep(s)) {
 			continue
 		}
 		subs = append(subs, s)
@@ -431,43 +702,30 @@ func (r *Room) broadcast(msg []byte, origin *Subscriber) {
 	}
 }
 
-func (r *Room) cancelIdle() {
-	r.idleMu.Lock()
-	if r.idleTimer != nil {
-		r.idleTimer.Stop()
-		r.idleTimer = nil
-	}
-	r.idleMu.Unlock()
-}
-
-func (r *Room) scheduleIdleEviction() {
-	r.idleMu.Lock()
-	defer r.idleMu.Unlock()
-	if r.idleTimer != nil {
-		r.idleTimer.Stop()
-	}
-	r.idleTimer = time.AfterFunc(r.hub.idleTTL, r.evict)
-}
-
-func (r *Room) evict() {
-	if !r.evicted.CompareAndSwap(false, true) {
+// shutdown runs once the room is unregistered: flush a pending mirror
+// (so the last debounced edit reaches disk), signal subscribers, close
+// the doc.
+func (r *Room) shutdown() {
+	<-r.ready
+	if r.loadErr != nil {
 		return
 	}
-	r.hub.mu.Lock()
-	delete(r.hub.rooms, roomKey(r.vaultID, r.noteID))
-	r.hub.mu.Unlock()
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 
-	// Stop the FS mirror timer so we don't fire a stale mirror after
-	// the doc has been closed.
 	r.mirrorMu.Lock()
-	if r.mirrorTimer != nil {
+	pending := r.mirrorTimer != nil
+	if pending {
 		r.mirrorTimer.Stop()
 		r.mirrorTimer = nil
 	}
 	r.mirrorMu.Unlock()
+	if pending {
+		ctx, cancel := context.WithTimeout(context.Background(), mirrorFlushTimeout)
+		_ = r.writeMirror(ctx)
+		cancel()
+	}
 
-	// Signal any remaining subscribers (Close should have drained, but
-	// defensive) and close the doc.
 	r.subsMu.Lock()
 	subs := make([]*Subscriber, 0, len(r.subs))
 	for s := range r.subs {
@@ -499,17 +757,6 @@ func (h *Hub) NewSubscriberWithClient(userID, clientID uuid.UUID) *Subscriber {
 	s := h.NewSubscriber(userID)
 	s.ClientID = clientID
 	return s
-}
-
-// RoomIfActive returns the live Room for (vaultID, noteID) without
-// creating one. Used by the FS watcher to broadcast external edits to
-// any currently-connected subscribers; if there are none, the watcher
-// applies and persists through the registry directly without touching
-// the WS layer.
-func (h *Hub) RoomIfActive(vaultID uuid.UUID, noteID string) *Room {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.rooms[roomKey(vaultID, noteID)]
 }
 
 // TryAcquireUserSlot atomically checks the per-user WS cap and

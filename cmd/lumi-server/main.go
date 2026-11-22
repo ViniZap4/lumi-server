@@ -493,8 +493,13 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 
 	notesSvc := notes.NewService(noteStore, vaultStore, fsMgr, auditStore, fedResolver, crdtRegistry, fsWatcher)
 	wsHub := wsync.NewHub(crdtRegistry, wsync.WithFSMirror(notesSvc.WriteBodyFromCRDT))
+	// Every CRDT mutation (REST, fs-watcher, federation, live WS) goes
+	// through the hub's single in-memory doc per note.
+	notesSvc.SetLiveDocs(wsHub)
+	// Lazily seed never-initialised notes (legacy / failed create) from disk.
+	crdtRegistry.SetInitSource(notesSvc.CRDTInitBody)
 
-	fsWatcher.SetHandler(buildFSHandler(zlog, vaultStore, noteStore, fsMgr, crdtRegistry, wsHub))
+	fsWatcher.SetHandler(buildFSHandler(zlog, vaultStore, noteStore, fsMgr, wsHub))
 	vaultsSvc.SetWatcher(fsWatcher)
 	vaultsSvc.SetOwnershipDeps(memberStore, userStore, notesSvc)
 	if err := fsWatcher.WatchExistingVaults(); err != nil {
@@ -643,9 +648,9 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 //  2. Look up the note row by path (skip if no row — Phase 2.4 does NOT
 //     auto-create on drop-in files; that's a 2.4.b call).
 //  3. Read frontmatter + body from disk.
-//  4. If a live WS Room exists, drive the change through it so
-//     subscribers see the broadcast; otherwise apply + persist via the
-//     CRDT registry directly.
+//  4. Apply it as a text diff through the hub's authoritative doc (the
+//     live room's when open), so subscribers see the broadcast and the
+//     write is serialised with live/REST/federation traffic.
 //  5. The note's pg row gets updated_at bumped so list/search reflects
 //     the external edit.
 //
@@ -656,10 +661,8 @@ func buildFSHandler(
 	vaultStore *pg.VaultStore,
 	noteStore *pg.NoteStore,
 	fsMgr *fs.Manager,
-	crdtReg *crdt.Registry,
 	hub *wsync.Hub,
 ) fswatch.Handler {
-	const originKind = "fs-watcher"
 	log := zlog.With().Str("component", "fswatch.handler").Logger()
 	return fswatch.HandlerFunc(func(ctx context.Context, ev fswatch.Event) {
 		v, err := vaultStore.GetBySlug(ctx, ev.VaultSlug)
@@ -678,48 +681,21 @@ func buildFSHandler(
 			return
 		}
 
-		// If subscribers are connected, drive the diff through the
-		// live Room so they see the update. Otherwise apply + persist
-		// without touching the WS layer.
-		newText := string(body)
-		if room := hub.RoomIfActive(v.ID, n.ID); room != nil {
-			doc := room.Doc()
-			update, err := doc.ApplyTextDiff(newText, originKind)
-			if err != nil {
-				log.Warn().Err(err).Msg("live ApplyTextDiff failed")
-				return
-			}
-			if len(update) == 0 {
-				return
-			}
-			if err := room.ApplyAndBroadcastFromFS(update); err != nil {
-				log.Warn().Err(err).Msg("ApplyAndBroadcastFromFS failed")
-			}
-			return
-		}
-
-		// Cold path: no live room. Load doc, apply, persist, close.
-		doc, err := crdtReg.LoadDoc(ctx, v.ID, n.ID)
+		// Route through the hub's authoritative doc (the live room's
+		// when one is open) so connected clients receive the change and
+		// it is serialised with every other writer. No disk mirror: the
+		// file is the source of this change.
+		res, err := hub.ApplyText(ctx, v.ID, n.ID, string(body), nil, wsync.ApplyOptions{
+			Origin: wsync.OriginFSWatcher, Mirror: wsync.MirrorNone,
+		})
 		if err != nil {
-			log.Warn().Err(err).Msg("LoadDoc failed")
+			log.Warn().Err(err).Str("path", n.Path).Msg("apply external edit failed")
 			return
 		}
-		defer doc.Close()
-		update, err := doc.ApplyTextDiff(newText, originKind)
-		if err != nil {
-			log.Warn().Err(err).Msg("cold ApplyTextDiff failed")
+		if !res.Changed {
 			return
-		}
-		if len(update) == 0 {
-			return
-		}
-		if err := crdtReg.PersistChange(ctx, v.ID, n.ID, update, uuid.Nil, originKind, doc); err != nil {
-			log.Warn().Err(err).Msg("PersistChange failed")
 		}
 		// Bump updated_at so list/search reflects the external edit.
-		// We don't audit fs-watcher writes for now — the action is
-		// attributed to the underlying user via their OS audit; future
-		// slice could surface them via a "system" actor.
 		updated := n
 		updated.UpdatedAt = time.Now().UTC()
 		_ = noteStore.Upsert(ctx, updated)

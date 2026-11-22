@@ -55,11 +55,14 @@ type NoteMetaRepo interface {
 	ListForVault(ctx context.Context, vaultID uuid.UUID, limit, offset int) ([]domain.Note, error)
 }
 
-// RoomLookup finds a live wsync room so relayed updates reach connected
-// clients immediately. nil-safe: without it the relay still persists and
-// mirrors, clients catch up on next open.
-type RoomLookup interface {
-	RoomIfActive(vaultID uuid.UUID, noteID string) *wsync.Room
+// DocAuthority is the single owner of each note's in-memory CRDT doc
+// (implemented by *wsync.Hub). Relayed updates go through it so they reach
+// connected clients immediately and are serialised with every other
+// writer. nil-safe for tests: without it the relay loads, persists and
+// mirrors through the registry directly — only correct when no Hub exists.
+type DocAuthority interface {
+	ApplyUpdate(ctx context.Context, vaultID uuid.UUID, noteID string, update []byte, opts wsync.ApplyOptions) (wsync.ApplyResult, error)
+	View(ctx context.Context, vaultID uuid.UUID, noteID string, fn func(*crdt.Doc) error) error
 }
 
 // DeleteFunc removes a note (row + file + CRDT cascade) without notifying
@@ -86,7 +89,7 @@ type (
 // RelayDeps is everything a Session needs to apply and read note state.
 type RelayDeps struct {
 	Registry *crdt.Registry
-	Rooms    RoomLookup
+	Rooms    DocAuthority
 	Notes    NoteMetaRepo
 	Mirror   MirrorFunc
 	Delete   DeleteFunc
@@ -170,14 +173,23 @@ func (l *Links) NoteCreated(vaultID uuid.UUID, noteID, path, title string) {
 	if len(sessions) == 0 {
 		return
 	}
-	doc, err := l.deps.Registry.LoadDoc(l.rootCtx, vaultID, noteID)
+	var state []byte
+	var err error
+	if l.deps.Rooms != nil {
+		err = l.deps.Rooms.View(l.rootCtx, vaultID, noteID, func(doc *crdt.Doc) error {
+			var err error
+			state, err = doc.EncodeStateAsUpdate()
+			return err
+		})
+	} else {
+		var doc *crdt.Doc
+		if doc, err = l.deps.Registry.LoadDoc(l.rootCtx, vaultID, noteID); err == nil {
+			state, err = doc.EncodeStateAsUpdate()
+			doc.Close()
+		}
+	}
 	if err != nil {
 		l.deps.Log.Warn().Err(err).Str("note", noteID).Msg("federation: note-created load")
-		return
-	}
-	state, err := doc.EncodeStateAsUpdate()
-	doc.Close()
-	if err != nil {
 		return
 	}
 	announce := EncodeNoteAnnounce(NoteMeta{ID: noteID, Path: path, Title: title})
@@ -562,9 +574,10 @@ func (s *Session) applyRemote(noteID string, update []byte) error {
 	}
 	origin := s.originKind()
 	if s.deps.Rooms != nil {
-		if room := s.deps.Rooms.RoomIfActive(s.vaultID, noteID); room != nil {
-			return room.ApplyAndBroadcastFederation(update, origin)
-		}
+		_, err := s.deps.Rooms.ApplyUpdate(s.ctx, s.vaultID, noteID, update, wsync.ApplyOptions{
+			Origin: origin, Mirror: wsync.MirrorDebounced,
+		})
+		return err
 	}
 	doc, err := s.deps.Registry.LoadDoc(s.ctx, s.vaultID, noteID)
 	if err != nil {
@@ -588,9 +601,13 @@ func (s *Session) applyRemote(noteID string, update []byte) error {
 // one exists, else a freshly-loaded (and closed) one.
 func (s *Session) withDoc(noteID string, fn func(*crdt.Doc) ([]byte, error)) ([]byte, error) {
 	if s.deps.Rooms != nil {
-		if room := s.deps.Rooms.RoomIfActive(s.vaultID, noteID); room != nil {
-			return fn(room.Doc())
-		}
+		var out []byte
+		err := s.deps.Rooms.View(s.ctx, s.vaultID, noteID, func(doc *crdt.Doc) error {
+			var err error
+			out, err = fn(doc)
+			return err
+		})
+		return out, err
 	}
 	doc, err := s.deps.Registry.LoadDoc(s.ctx, s.vaultID, noteID)
 	if err != nil {
