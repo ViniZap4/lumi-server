@@ -632,16 +632,11 @@ func validateNoteID(id string) error {
 	return nil
 }
 
-// validateRelPath is a first-line guard on peer-supplied paths; the fs
-// layer's SafeJoin remains the authoritative check on every disk access.
+// validateRelPath gates peer-supplied note paths with the shared canonical
+// note-path policy (.md only, no dot/hidden segments — a peer must not be
+// able to target .lumi/vault.yaml or similar). Peers send canonical paths,
+// so no normalisation is attempted. fs.SafeJoin remains the authoritative
+// containment check on every disk access.
 func validateRelPath(p string) error {
-	if p == "" || len(p) > 1024 || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\") {
-		return fmt.Errorf("%w: invalid note path %q", domain.ErrValidation, p)
-	}
-	for _, seg := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {
-		if seg == ".." {
-			return fmt.Errorf("%w: invalid note path %q", domain.ErrValidation, p)
-		}
-	}
-	return nil
+	return domain.ValidateNotePath(p)
 }

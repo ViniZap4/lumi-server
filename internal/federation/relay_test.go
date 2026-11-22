@@ -510,6 +510,14 @@ func TestRelay_RejectsHostileMetadata(t *testing.T) {
 		{ID: "ok", Path: "/abs.md", Title: "t"},
 		{ID: "", Path: "x.md", Title: "t"},
 		{ID: ".hidden", Path: "x.md", Title: "t"},
+		// Regression: dot-segments and non-.md targets used to pass, letting
+		// a peer overwrite vault control files.
+		{ID: "ok", Path: ".lumi/vault.yaml", Title: "t"},
+		{ID: "ok", Path: ".lumi/vault.md", Title: "t"},
+		{ID: "ok", Path: "a/./b.md", Title: "t"},
+		{ID: "ok", Path: "sub/.hidden.md", Title: "t"},
+		{ID: "ok", Path: "notes.txt", Title: "t"},
+		{ID: "ok", Path: "a\\b.md", Title: "t"},
 	} {
 		if err := sess.ensureNote(m); err == nil {
 			t.Fatalf("hostile meta accepted: %+v", m)

@@ -427,8 +427,9 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 	return updated, nil
 }
 
-// validateNoteRelPath rejects absolute paths, parent traversals, and any
-// path that does not end in `.md`. fs.SafeJoin enforces the same plus
+// validateNoteRelPath normalises (trim + path.Clean) and then applies
+// domain.ValidateNotePath: rejects absolute paths, parent traversals,
+// hidden/dot segments, and any path that does not end in `.md`. fs.SafeJoin enforces the same plus
 // symlink-escape — this check exists to fail early with a friendlier error.
 func validateNoteRelPath(raw string) (string, error) {
 	s := strings.TrimSpace(raw)
@@ -441,6 +442,11 @@ func validateNoteRelPath(raw string) (string, error) {
 	}
 	if !strings.HasSuffix(cleaned, ".md") {
 		return "", fmt.Errorf("%w: path must end with .md", domain.ErrValidation)
+	}
+	// Canonical-form policy shared with the federation relay: no hidden or
+	// dot segments (keeps writes out of .lumi/), no backslashes, bounded.
+	if err := domain.ValidateNotePath(cleaned); err != nil {
+		return "", err
 	}
 	return cleaned, nil
 }

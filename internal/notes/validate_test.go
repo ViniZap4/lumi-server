@@ -86,6 +86,11 @@ func TestValidateNoteRelPath_RejectsAdversarial(t *testing.T) {
 		{"parent alone", ".."},
 		{"non-md extension", "secrets.txt"},
 		{"no extension", "notes"},
+		{"hidden control dir", ".lumi/vault.md"},
+		{"hidden dir after clean", "ok/../.lumi/x.md"},
+		{"hidden file", "sub/.hidden.md"},
+		{"backslash", "a\\..\\b.md"},
+		{"bare extension", ".md"},
 	}
 	for _, tc := range bad {
 		t.Run(tc.name, func(t *testing.T) {
