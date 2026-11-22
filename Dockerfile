@@ -1,42 +1,42 @@
-# syntax=docker/dockerfile:1.6
+# syntax=docker/dockerfile:1.29.0
 #
 # Multi-stage build for lumi-server v2.
 #
-# Phase 2+ requires cgo (yrs/yffi for the CRDT engine). The builder
-# stage compiles libyrs.a from the y-crdt submodule via cargo, then
-# Go links it statically. The runtime image uses distroless/base
-# because it includes glibc — distroless/static cannot load even a
-# minimally-cgo binary.
+# Phase 2+ requires cgo (yrs/yffi for the CRDT engine):
+#   1. `yrs` stage: libyrs.a built by a pinned official Rust image. It only
+#      depends on third_party/y-crdt, so Docker reuses it when only Go code
+#      changes. (Replaces `curl sh.rustup.rs | sh` with a floating "stable".)
+#   2. `builder` stage: Go links the static lib (same steps as `make libyrs`).
+#   3. Runtime: distroless/base (glibc; distroless/static cannot load a cgo
+#      binary), pinned by digest. Ships migrations/ (LUMI_MIGRATIONS_DIR) so
+#      LUMI_AUTO_MIGRATE=true and `lumi-server migrate up` work in the
+#      container, and /vaults owned by nonroot (65532) so a fresh named
+#      volume inherits a writable owner.
+# Both build images are bookworm (same glibc), so the .a links cleanly.
+# Note: Go >= 1.27 rejects archives carrying LLVM bitcode sections in
+# #cgo LDFLAGS; keep the Go image on 1.25.x (or strip bitcode) when bumping.
 
-# ---- Build stage -----------------------------------------------------------
-FROM golang:1.25-bookworm AS builder
+# ---- yrs (y-crdt) ----------------------------------------------------------
+FROM rust:1.100.0-bookworm AS yrs
 WORKDIR /src
+COPY third_party/y-crdt ./third_party/y-crdt
+RUN cargo build --release --locked -p yffi --manifest-path third_party/y-crdt/Cargo.toml
 
-# Install Rust toolchain for yffi. Pin to a known-good MSRV that
-# matches third_party/y-crdt v0.26.0 (Rust 1.79+; we use stable).
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        build-essential \
-        curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-       sh -s -- --default-toolchain stable -y --profile minimal
-ENV PATH="/root/.cargo/bin:${PATH}"
+# ---- Go build --------------------------------------------------------------
+FROM golang:1.25.14-bookworm AS builder
+WORKDIR /src
 
 # Pre-fetch Go deps for a stable cache layer.
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Bring in the source. third_party/y-crdt is a submodule on the host;
-# `git submodule update --init --recursive` must have run before
-# `docker build`, or the Dockerfile will fail at the cargo step.
+# third_party/y-crdt is a submodule on the host; run
+# `git submodule update --init --recursive` before `docker build`.
 COPY . .
 
-# Build yffi static lib + copy header into the project tree. This
-# mirrors what `make libyrs` does on the host.
-RUN cargo build --release -p yffi --manifest-path third_party/y-crdt/Cargo.toml \
-    && mkdir -p internal/crdt/lib internal/crdt/include \
-    && cp third_party/y-crdt/target/release/libyrs.a internal/crdt/lib/libyrs.a \
+# Same result as `make libyrs`, with the archive from the yrs stage.
+COPY --from=yrs /src/third_party/y-crdt/target/release/libyrs.a internal/crdt/lib/libyrs.a
+RUN mkdir -p internal/crdt/include \
     && cp third_party/y-crdt/tests-ffi/include/libyrs.h internal/crdt/include/libyrs.h \
     && sed -i -E \
         -e 's|^typedef YDoc YDoc;|/* typedef YDoc YDoc; — removed for cgo */|' \
@@ -49,14 +49,19 @@ RUN CGO_ENABLED=1 go build \
         -trimpath \
         -ldflags="-s -w" \
         -o /out/lumi-server \
-        ./cmd/lumi-server
+        ./cmd/lumi-server \
+    && mkdir -p /out/vaults
 
-# ---- Runtime stage ---------------------------------------------------------
-FROM gcr.io/distroless/base-debian12:nonroot
+# ---- Runtime ---------------------------------------------------------------
+# distroless/base-debian12:nonroot as of 2026-11-22.
+FROM gcr.io/distroless/base-debian12:nonroot@sha256:7f0c72cd138b442ae0deeb69c08b1acf5525439ba251a49ad93c320a061567e5
 COPY --from=builder /out/lumi-server /lumi-server
+COPY --from=builder /src/migrations /migrations
+COPY --from=builder --chown=65532:65532 /out/vaults /vaults
 
 ENV LUMI_ROOT=/vaults \
-    LUMI_PORT=8080
+    LUMI_PORT=8080 \
+    LUMI_MIGRATIONS_DIR=/migrations
 
 EXPOSE 8080
 USER nonroot:nonroot

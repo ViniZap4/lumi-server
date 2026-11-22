@@ -20,3 +20,9 @@
 .DS_Store
 .idea/
 .vscode/
+
+# Host build artefacts: the image builds libyrs itself (and a host .a may
+# be the wrong architecture); the cargo target dir is huge.
+/third_party/y-crdt/target/
+/internal/crdt/lib/
+/internal/crdt/include/
