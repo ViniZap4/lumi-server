@@ -178,16 +178,27 @@ func (f *fakeCreator) Create(_ context.Context, in vaults.CreateInput) (domain.V
 }
 
 type fakeHome struct {
-	identity Identity
-	accept   func(AcceptRequest) (AcceptResponse, error)
+	identity  Identity
+	accept    func(AcceptRequest) (AcceptResponse, error)
+	challenge func(ChallengeRequest) (string, error)
+	notified  chan RevokeNotice // nil: notices dropped
 }
 
 func (f *fakeHome) Identity(context.Context, string) (Identity, error) { return f.identity, nil }
 func (f *fakeHome) Accept(_ context.Context, _ string, req AcceptRequest) (AcceptResponse, error) {
 	return f.accept(req)
 }
-func (f *fakeHome) SyncChallenge(context.Context, string, uuid.UUID, string) (string, error) {
+func (f *fakeHome) SyncChallenge(_ context.Context, _ string, req ChallengeRequest) (string, error) {
+	if f.challenge != nil {
+		return f.challenge(req)
+	}
 	return "", errors.New("not implemented in fake")
+}
+func (f *fakeHome) NotifyRevoked(_ context.Context, _ string, n RevokeNotice) error {
+	if f.notified != nil {
+		f.notified <- n
+	}
+	return nil
 }
 
 // ---- harness -----------------------------------------------------------------
@@ -264,6 +275,9 @@ func newFedFixture(t *testing.T, baseURL string) *fedFixture {
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
+	// Never touch the network from unit tests (revoke notices are pushed
+	// in the background); tests that need a peer install their own fake.
+	svc.client = &fakeHome{}
 	fx.svc = svc
 	return fx
 }

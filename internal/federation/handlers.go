@@ -28,6 +28,7 @@ func NewHandlers(svc *Service, resolver capguard.Resolver) *Handlers {
 func (h *Handlers) RegisterPublic(r fiber.Router) {
 	r.Get("/api/federation/identity", h.identity)
 	r.Post("/api/federation/accept", h.accept)
+	r.Post("/api/federation/revoked", h.revoked)
 }
 
 // RegisterAuthed wires the operator/admin routes on the authed group.
@@ -74,6 +75,19 @@ func (h *Handlers) accept(c *fiber.Ctx) error {
 		return mapErr(c, err)
 	}
 	return c.Status(http.StatusCreated).JSON(resp)
+}
+
+// revoked receives home's signed RevokeNotice (follower side). Public: the
+// Ed25519 signature by the pinned home key is the authorisation.
+func (h *Handlers) revoked(c *fiber.Ctx) error {
+	var n RevokeNotice
+	if err := c.BodyParser(&n); err != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid_body"})
+	}
+	if err := h.svc.ApplyRevokeNotice(c.UserContext(), n); err != nil {
+		return mapErr(c, err)
+	}
+	return c.SendStatus(http.StatusNoContent)
 }
 
 // ---- authed --------------------------------------------------------------------

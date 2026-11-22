@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/url"
@@ -111,6 +112,11 @@ func (m *Manager) runLoop(ctx context.Context, vaultID uuid.UUID, homeURL string
 		if ctx.Err() != nil {
 			return
 		}
+		if errors.Is(err, errLinkInactive) {
+			m.log.Info().Err(err).Str("home", homeURL).Str("vault", vaultID.String()).
+				Msg("federation: relay link stopped")
+			return
+		}
 		// A connection that survived a while earns a fresh backoff.
 		if time.Since(start) > 30*time.Second {
 			attempt = 0
@@ -141,10 +147,23 @@ func (m *Manager) connectOnce(ctx context.Context, vaultID uuid.UUID, homeURL st
 		}
 	}
 	if !active {
-		return fmt.Errorf("federation: link no longer active")
+		return errLinkInactive
 	}
 
-	nonce, err := m.svc.client.SyncChallenge(ctx, homeURL, vaultID, m.svc.baseURL)
+	ts := m.svc.now().Unix()
+	proof := ed25519.Sign(m.svc.priv, StatusProofMessage(vaultID, m.svc.baseURL, ts))
+	nonce, err := m.svc.client.SyncChallenge(ctx, homeURL, ChallengeRequest{
+		VaultID: vaultID, PeerURL: m.svc.baseURL, TS: ts, Sig: hex.EncodeToString(proof),
+	})
+	var revoked *RevokedError
+	if errors.As(err, &revoked) {
+		// Home revoked the link while we were away (or the push notice
+		// was lost): verify and sever locally.
+		if aerr := m.svc.ApplyRevokeNotice(ctx, revoked.Notice); aerr != nil {
+			return fmt.Errorf("sync challenge: revoke notice rejected: %w", aerr)
+		}
+		return fmt.Errorf("%w: revoked by home", errLinkInactive)
+	}
 	if err != nil {
 		return fmt.Errorf("sync challenge: %w", err)
 	}

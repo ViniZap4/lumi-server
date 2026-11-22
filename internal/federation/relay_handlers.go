@@ -47,6 +47,8 @@ func (h *RelayHandlers) Register(app fiber.Router) {
 type challengeReq struct {
 	VaultID string `json:"vault_id"`
 	PeerURL string `json:"peer_url"`
+	TS      int64  `json:"ts,omitempty"`
+	Sig     string `json:"sig,omitempty"`
 }
 
 // challenge mints a single-use nonce bound to (vault, peer). Only issued
@@ -64,6 +66,11 @@ func (h *RelayHandlers) challenge(c *fiber.Ctx) error {
 	peerURL := normalizeServerURL(req.PeerURL)
 	fed, err := h.svc.federations.GetActiveByVaultAndPeer(c.UserContext(), vaultID, peerURL)
 	if err != nil || fed.Role != "home" {
+		// A follower proving it holds the enrolled key learns that the
+		// link was revoked (signed notice) so it can sever its side.
+		if n, ok := h.svc.revokedNoticeFor(c.UserContext(), vaultID, peerURL, req.TS, req.Sig); ok {
+			return c.Status(http.StatusGone).JSON(n)
+		}
 		// Uniform 403: no oracle distinguishing "unknown vault" from
 		// "not federated with you".
 		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})

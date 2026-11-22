@@ -58,6 +58,7 @@ func TestRegisterRoutes_PublicRoutesBypassAuth(t *testing.T) {
 		{"invite accept", http.MethodPost, "/api/invites/abc/accept", false},
 		{"federation identity", http.MethodGet, "/api/federation/identity", false},
 		{"federation accept", http.MethodPost, "/api/federation/accept", false},
+		{"federation revoke notice", http.MethodPost, "/api/federation/revoked", false},
 		{"federation sync challenge", http.MethodPost, "/api/federation/sync-challenge", false},
 		{"federation relay ws", http.MethodGet, "/api/federation/vaults/00000000-0000-0000-0000-000000000001/sync", false},
 

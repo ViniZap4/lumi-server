@@ -71,12 +71,27 @@ type VaultCreator interface {
 	Create(ctx context.Context, in vaults.CreateInput) (domain.Vault, error)
 }
 
-// HomeClient talks to the home server during join and relay setup.
+// HomeClient talks to peer servers: to home during join and relay setup,
+// and (as home) to a follower to deliver a revocation notice.
 // Implemented by httpClient; faked in tests.
 type HomeClient interface {
 	Identity(ctx context.Context, homeURL string) (Identity, error)
 	Accept(ctx context.Context, homeURL string, req AcceptRequest) (AcceptResponse, error)
-	SyncChallenge(ctx context.Context, homeURL string, vaultID uuid.UUID, peerURL string) (nonce string, err error)
+	// SyncChallenge returns a relay nonce, or *RevokedError when home
+	// reports the link revoked.
+	SyncChallenge(ctx context.Context, homeURL string, req ChallengeRequest) (nonce string, err error)
+	// NotifyRevoked delivers a revocation notice to a follower.
+	NotifyRevoked(ctx context.Context, followerURL string, n RevokeNotice) error
+}
+
+// ChallengeRequest is the sync-challenge payload. TS/Sig are the optional
+// status proof (StatusProofMessage signed by the follower key) that lets
+// home answer 410 + RevokeNotice instead of a uniform 403.
+type ChallengeRequest struct {
+	VaultID uuid.UUID `json:"vault_id"`
+	PeerURL string    `json:"peer_url"`
+	TS      int64     `json:"ts,omitempty"`
+	Sig     string    `json:"sig,omitempty"`
 }
 
 // ---- wire shapes (shared by handlers and client) ------------------------------
@@ -523,8 +538,9 @@ type LinkController interface {
 func (s *Service) SetLinkController(lc LinkController) { s.relay = lc }
 
 // RevokeFederation severs a link from this side: the row flips to revoked,
-// the live relay session (if any) is closed, and reconnect loops stop.
-// Signed revocation events to the peer are F3.
+// the live relay session (if any) is closed, and reconnect loops stop. When
+// this server is home, the follower is sent a signed RevokeNotice (see
+// revoke.go) so it marks its side severed.
 func (s *Service) RevokeFederation(ctx context.Context, vaultID, fedID, actor uuid.UUID, ip, ua string) error {
 	f, err := s.federations.Get(ctx, fedID)
 	if err != nil {
@@ -536,11 +552,18 @@ func (s *Service) RevokeFederation(ctx context.Context, vaultID, fedID, actor uu
 	if f.Status != "active" {
 		return fmt.Errorf("%w: federation already %s", domain.ErrConflict, f.Status)
 	}
-	if err := s.federations.UpdateStatus(ctx, fedID, "revoked", s.now().UTC()); err != nil {
+	// Microsecond precision = what Postgres stores, so the pushed notice
+	// and a later pulled one (built from the row) carry the same instant.
+	revokedAt := s.now().UTC().Truncate(time.Microsecond)
+	if err := s.federations.UpdateStatus(ctx, fedID, "revoked", revokedAt); err != nil {
 		return err
 	}
 	if s.relay != nil {
 		s.relay.StopLink(vaultID, f.PeerURL)
+	}
+	if f.Role == "home" && s.baseURL != "" {
+		// Tell the follower so it severs instead of redialling forever.
+		s.notifyRevokedAsync(s.signRevokeNotice(vaultID, f.PeerURL, revokedAt))
 	}
 	s.feedFederationChanged(vaultID)
 	if f.Role == "follower" {
