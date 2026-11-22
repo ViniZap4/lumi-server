@@ -1,6 +1,7 @@
 package notes
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http/httptest"
@@ -333,5 +334,36 @@ func TestMapCRDTErr_Conflicts(t *testing.T) {
 		if resp.StatusCode != want {
 			t.Errorf("%s: status %d, want %d", path, resp.StatusCode, want)
 		}
+	}
+}
+
+// /diff returns the post-merge state, usable directly as the next base.
+func TestApplyDiff_ReturnsStateAsNextBase(t *testing.T) {
+	f := newCRDTFixture(t)
+	ctx := context.Background()
+	n, err := f.svc.Create(ctx, f.vault.ID, CreateInput{Title: "Note", Body: "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, _ := f.svc.GetSnapshot(ctx, f.vault.ID, n.ID)
+	res, err := f.svc.ApplyDiff(ctx, f.vault.ID, n.ID, DiffInput{Text: "one two", BaseState: snap.State}, "tui", uuid.Nil, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.State) == 0 {
+		t.Fatal("ApplyDiff result carries no state")
+	}
+	cur, _ := f.svc.GetSnapshot(ctx, f.vault.ID, n.ID)
+	if !bytes.Equal(res.State, cur.State) {
+		t.Fatal("returned state differs from the snapshot state after the merge")
+	}
+	res2, err := f.svc.ApplyDiff(ctx, f.vault.ID, n.ID, DiffInput{Text: "one two three", BaseState: res.State}, "tui", uuid.Nil, "", "")
+	if err != nil || res2.Text != "one two three" {
+		t.Fatalf("chained diff: res=%q err=%v", res2.Text, err)
+	}
+	// The raw-update path returns state too.
+	up, err := f.svc.ApplyUpdate(ctx, f.vault.ID, n.ID, nil, "tui", uuid.Nil, "", "")
+	if err != nil || len(up.State) == 0 {
+		t.Fatalf("ApplyUpdate state: len=%d err=%v", len(up.State), err)
 	}
 }

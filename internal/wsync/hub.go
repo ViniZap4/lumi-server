@@ -87,6 +87,10 @@ type ApplyOptions struct {
 	Origin string
 	// Mirror selects the disk-mirror behaviour.
 	Mirror MirrorMode
+	// WantState fills ApplyResult.State (full encoded doc right after the
+	// change, read under the room lock). Off by default: encoding the
+	// whole doc is wasted work on hot paths (relay, live edits).
+	WantState bool
 }
 
 // ApplyResult reports the outcome of a mutation on the authoritative doc.
@@ -99,6 +103,9 @@ type ApplyResult struct {
 	// Text and StateVector describe the document right after the change.
 	Text        string
 	StateVector []byte
+	// State is the full lib0-v1 encoded doc after the change; only set
+	// when ApplyOptions.WantState.
+	State []byte
 	// MirrorErr is set when Mirror==MirrorNow and the disk write failed;
 	// the CRDT change itself is persisted and broadcast regardless.
 	MirrorErr error
@@ -550,7 +557,7 @@ func (r *Room) applyUpdate(update []byte, origin *Subscriber, opts ApplyOptions)
 		return ApplyResult{}, err
 	}
 	if !changed {
-		return r.resultLocked(false, nil, nil), nil
+		return r.resultLocked(false, nil, nil, opts), nil
 	}
 	return r.commitLocked(update, origin, opts)
 }
@@ -583,7 +590,7 @@ func (r *Room) applyText(newText string, expectSV []byte, opts ApplyOptions) (Ap
 		return ApplyResult{}, err
 	}
 	if len(update) == 0 {
-		return r.resultLocked(false, nil, nil), nil
+		return r.resultLocked(false, nil, nil, opts), nil
 	}
 	return r.commitLocked(update, nil, opts)
 }
@@ -611,13 +618,16 @@ func (r *Room) commitLocked(update []byte, origin *Subscriber, opts ApplyOptions
 	default:
 		r.scheduleMirror()
 	}
-	return r.resultLocked(true, update, mirrorErr), nil
+	return r.resultLocked(true, update, mirrorErr, opts), nil
 }
 
-func (r *Room) resultLocked(changed bool, update []byte, mirrorErr error) ApplyResult {
+func (r *Room) resultLocked(changed bool, update []byte, mirrorErr error, opts ApplyOptions) ApplyResult {
 	res := ApplyResult{Changed: changed, Update: update, MirrorErr: mirrorErr}
 	res.Text, _ = r.doc.Text()
 	res.StateVector, _ = r.doc.StateVectorV1()
+	if opts.WantState {
+		res.State, _ = r.doc.EncodeStateAsUpdate()
+	}
 	return res
 }
 

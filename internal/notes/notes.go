@@ -703,7 +703,9 @@ func (s *Service) ApplyDiff(
 	if err != nil {
 		return SnapshotResult{}, err
 	}
-	opts := wsync.ApplyOptions{Actor: actor, Origin: originKind, Mirror: wsync.MirrorNow}
+	// WantState: the response carries the post-merge state so the
+	// client has its next base without a /snapshot round-trip.
+	opts := wsync.ApplyOptions{Actor: actor, Origin: originKind, Mirror: wsync.MirrorNow, WantState: true}
 
 	var res wsync.ApplyResult
 	switch {
@@ -771,7 +773,7 @@ func (s *Service) ApplyUpdate(
 		return SnapshotResult{}, err
 	}
 	res, err := s.docs.ApplyUpdate(ctx, vaultID, id, update, wsync.ApplyOptions{
-		Actor: actor, Origin: originKind, Mirror: wsync.MirrorNow,
+		Actor: actor, Origin: originKind, Mirror: wsync.MirrorNow, WantState: true,
 	})
 	if err != nil {
 		return SnapshotResult{}, fmt.Errorf("%w: apply update: %v", domain.ErrValidation, err)
@@ -802,6 +804,7 @@ func (s *Service) finishCRDTWrite(ctx context.Context, vaultID uuid.UUID, n doma
 		Path:        n.Path,
 		Text:        res.Text,
 		VectorClock: res.StateVector,
+		State:       res.State,
 	}, nil
 }
 
@@ -1336,7 +1339,8 @@ func decodeB64Field(c *fiber.Ctx, name, raw string) ([]byte, bool) {
 //
 // Errors: 409 base_required (no/stale base), 409 base_mismatch
 // (base_state is not an ancestor of the server's state).
-// Success: { id, path, text, vector_clock }.
+// Success: { id, path, text, vector_clock, state } — state (base64 full
+// lib0-v1 doc, as GET /snapshot) is the client's next base_state.
 func (h *Handlers) applyDiff(c *fiber.Ctx) error {
 	vaultID, err := capguard.WithVaultID(c)
 	if err != nil {
@@ -1391,12 +1395,16 @@ func (h *Handlers) applyDiff(c *fiber.Ctx) error {
 	if err != nil {
 		return mapCRDTErr(c, err)
 	}
-	return c.JSON(fiber.Map{
+	out := fiber.Map{
 		"id":           r.NoteID,
 		"path":         r.Path,
 		"text":         r.Text,
 		"vector_clock": base64.StdEncoding.EncodeToString(r.VectorClock),
-	})
+	}
+	if len(r.State) > 0 {
+		out["state"] = base64.StdEncoding.EncodeToString(r.State)
+	}
+	return c.JSON(out)
 }
 
 // mapCRDTErr maps the CRDT endpoints' specific errors, then falls back to
