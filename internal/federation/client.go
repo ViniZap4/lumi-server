@@ -7,22 +7,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 
-	fws "github.com/fasthttp/websocket"
 	"github.com/google/uuid"
 )
 
-// httpClient is the default HomeClient: plain JSON over HTTP(S) with tight
-// timeouts. TLS enforcement mirrors the rest of lumi — production deploys
-// terminate TLS upstream and set https base URLs; http is tolerated for
-// loopback/dev.
+// httpClient is the default HomeClient: plain JSON over HTTP(S) through the
+// SSRF-guarded client from NetPolicy (public addresses only, no redirects,
+// no proxy, tight timeouts).
 type httpClient struct {
 	c *http.Client
 }
 
-func newHTTPClient() *httpClient {
-	return &httpClient{c: &http.Client{Timeout: 15 * time.Second}}
+func newHTTPClient(p NetPolicy) *httpClient {
+	return &httpClient{c: p.HTTPClient()}
 }
 
 // maxPeerResponse caps how much of a peer's response we read: identity and
@@ -57,20 +54,6 @@ func (h *httpClient) SyncChallenge(ctx context.Context, homeURL string, vaultID 
 		return "", fmt.Errorf("federation: home returned empty nonce")
 	}
 	return out.Nonce, nil
-}
-
-// defaultDialer opens the relay WebSocket via fasthttp/websocket (the same
-// stack the server side uses).
-func defaultDialer(ctx context.Context, wsURL string) (wsConn, error) {
-	d := &fws.Dialer{HandshakeTimeout: 15 * time.Second}
-	conn, resp, err := d.DialContext(ctx, wsURL, nil)
-	if resp != nil && resp.Body != nil {
-		_ = resp.Body.Close()
-	}
-	if err != nil {
-		return nil, err
-	}
-	return conn, nil
 }
 
 func (h *httpClient) getJSON(ctx context.Context, url string, out any) error {

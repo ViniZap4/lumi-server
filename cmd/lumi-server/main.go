@@ -191,6 +191,10 @@ type config struct {
 	logFormat          string
 	logLevel           string
 	autoMigrate        bool
+
+	// Federation outbound policy + who may join remote vaults.
+	federationNet       federation.NetPolicy
+	federationOperators []string
 }
 
 func loadConfig() (config, error) {
@@ -226,6 +230,25 @@ func loadConfig() (config, error) {
 			}
 		}
 	}
+	// LUMI_FEDERATION_OPERATORS: comma-separated local usernames allowed to
+	// join remote vaults. Defaults to the bootstrap admin.
+	ops := os.Getenv("LUMI_FEDERATION_OPERATORS")
+	if ops == "" {
+		ops = c.adminUsername
+	}
+	for _, o := range strings.Split(ops, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			c.federationOperators = append(c.federationOperators, o)
+		}
+	}
+	// Dev/test escape hatches for the federation SSRF guard. Production
+	// leaves both unset: https only, public addresses only.
+	c.federationNet.AllowInsecureHTTP = envBool("LUMI_FEDERATION_ALLOW_HTTP", false)
+	cidrs, err := federation.ParseCIDRList(os.Getenv("LUMI_FEDERATION_ALLOWED_CIDRS"))
+	if err != nil {
+		return config{}, fmt.Errorf("LUMI_FEDERATION_ALLOWED_CIDRS: %w", err)
+	}
+	c.federationNet.AllowedCIDRs = cidrs
 	if err := c.validate(); err != nil {
 		return config{}, err
 	}
@@ -486,6 +509,8 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		Creator:     vaultsSvc,
 		Audit:       auditStore,
 		BaseURL:     cfg.publicBaseURL,
+		Net:         cfg.federationNet,
+		Operators:   federation.NewUsernameOperators(userStore, cfg.federationOperators),
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("federation service: %w", err)

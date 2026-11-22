@@ -11,7 +11,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net/url"
 	"strings"
 	"time"
 
@@ -123,6 +122,8 @@ type Service struct {
 	baseURL     string
 	relay       LinkController
 	now         func() time.Time
+	net         NetPolicy
+	operators   OperatorChecker
 
 	// F3 control plane (nil = disabled).
 	control       *ControlPlaneDeps
@@ -139,6 +140,18 @@ type Deps struct {
 	Client      HomeClient // nil → default HTTP client
 	Audit       audit.Recorder
 	BaseURL     string // LUMI_PUBLIC_BASE_URL; empty disables federation endpoints
+	// Net is the outbound peer-connection policy (zero value = strict:
+	// https only, public addresses only).
+	Net NetPolicy
+	// Operators decides who may make this server join a remote vault
+	// (an operator-to-operator trust decision, SPEC-V3). nil = nobody.
+	Operators OperatorChecker
+}
+
+// OperatorChecker reports whether a local user is a server operator,
+// i.e. allowed to federate this server with a remote home (Join).
+type OperatorChecker interface {
+	IsOperator(ctx context.Context, userID uuid.UUID) (bool, error)
 }
 
 // NewService loads (or mints, on first boot) the server keypair and wires the
@@ -165,9 +178,11 @@ func NewService(ctx context.Context, d Deps) (*Service, error) {
 		audit:       d.Audit,
 		baseURL:     strings.TrimRight(d.BaseURL, "/"),
 		now:         time.Now,
+		net:         d.Net,
+		operators:   d.Operators,
 	}
 	if svc.client == nil {
-		svc.client = newHTTPClient()
+		svc.client = newHTTPClient(d.Net)
 	}
 	return svc, nil
 }
@@ -222,7 +237,7 @@ func (s *Service) CreateInvite(ctx context.Context, in CreateInviteInput) (domai
 		return domain.FederationInvite{}, fmt.Errorf("%w: LUMI_PUBLIC_BASE_URL must be set for federation", domain.ErrValidation)
 	}
 	if in.ServerURLHint != "" {
-		if err := validateServerURL(in.ServerURLHint); err != nil {
+		if err := s.net.CheckPeerURL(normalizeServerURL(in.ServerURLHint)); err != nil {
 			return domain.FederationInvite{}, err
 		}
 	}
@@ -288,7 +303,7 @@ func (s *Service) Accept(ctx context.Context, req AcceptRequest) (AcceptResponse
 		return AcceptResponse{}, err
 	}
 	followerURL := normalizeServerURL(req.FollowerURL)
-	if err := validateServerURL(followerURL); err != nil {
+	if err := s.net.CheckPeerURL(followerURL); err != nil {
 		return AcceptResponse{}, err
 	}
 	if followerURL == s.baseURL {
@@ -373,11 +388,24 @@ func (s *Service) Join(ctx context.Context, in JoinInput) (domain.Vault, domain.
 	if s.creator == nil {
 		return domain.Vault{}, domain.Federation{}, errors.New("federation: join deps not wired")
 	}
+	// Joining makes this server dial an arbitrary URL and store a full
+	// replica of someone else's vault: operator-only (SPEC-V3 "operator-
+	// to-operator trust decision"), never any logged-in user.
+	if s.operators == nil {
+		return domain.Vault{}, domain.Federation{}, fmt.Errorf("%w: federation join is restricted to server operators", domain.ErrForbidden)
+	}
+	isOp, err := s.operators.IsOperator(ctx, in.Actor)
+	if err != nil {
+		return domain.Vault{}, domain.Federation{}, err
+	}
+	if !isOp {
+		return domain.Vault{}, domain.Federation{}, fmt.Errorf("%w: federation join is restricted to server operators", domain.ErrForbidden)
+	}
 	if _, err := s.Identity(); err != nil {
 		return domain.Vault{}, domain.Federation{}, err
 	}
 	homeURL := normalizeServerURL(in.HomeURL)
-	if err := validateServerURL(homeURL); err != nil {
+	if err := s.net.CheckPeerURL(homeURL); err != nil {
 		return domain.Vault{}, domain.Federation{}, err
 	}
 	if homeURL == s.baseURL {
@@ -506,14 +534,6 @@ func newToken() string {
 
 func normalizeServerURL(raw string) string {
 	return strings.TrimRight(strings.TrimSpace(raw), "/")
-}
-
-func validateServerURL(raw string) error {
-	u, err := url.ParseRequestURI(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("%w: server url must be an absolute http(s) URL", domain.ErrValidation)
-	}
-	return nil
 }
 
 func (s *Service) recordAudit(ctx context.Context, userID *uuid.UUID, vaultID uuid.UUID, action, ip, ua string, payload map[string]any) {

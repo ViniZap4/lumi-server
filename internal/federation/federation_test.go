@@ -234,6 +234,11 @@ type fedFixture struct {
 	vault   domain.Vault
 }
 
+// allOperators treats every user as a server operator (join tests).
+type allOperators struct{}
+
+func (allOperators) IsOperator(context.Context, uuid.UUID) (bool, error) { return true, nil }
+
 func newFedFixture(t *testing.T, baseURL string) *fedFixture {
 	t.Helper()
 	fx := &fedFixture{
@@ -254,6 +259,7 @@ func newFedFixture(t *testing.T, baseURL string) *fedFixture {
 		Creator:     fx.creator,
 		Audit:       fx.audit,
 		BaseURL:     baseURL,
+		Operators:   allOperators{},
 	})
 	if err != nil {
 		t.Fatalf("NewService: %v", err)

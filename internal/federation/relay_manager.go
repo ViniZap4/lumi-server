@@ -45,7 +45,7 @@ type Manager struct {
 
 func NewManager(svc *Service, links *Links, dialer Dialer, log zerolog.Logger) *Manager {
 	if dialer == nil {
-		dialer = defaultDialer
+		dialer = svc.net.WSDialer()
 	}
 	return &Manager{svc: svc, links: links, dialer: dialer, log: log, loops: map[string]context.CancelFunc{}}
 }
