@@ -40,17 +40,17 @@ func (m *memControlStates) Get(_ context.Context, vaultID uuid.UUID) (int64, []b
 	return r.seq, r.state, r.sig, nil
 }
 
-func (m *memControlStates) Upsert(_ context.Context, vaultID uuid.UUID, seq int64, state, sig []byte) error {
+func (m *memControlStates) Upsert(_ context.Context, vaultID uuid.UUID, seq int64, state, sig []byte) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if cur, ok := m.rows[vaultID]; ok && cur.seq >= seq {
-		return nil
+		return false, nil
 	}
 	m.rows[vaultID] = struct {
 		seq        int64
 		state, sig []byte
 	}{seq, state, sig}
-	return nil
+	return true, nil
 }
 
 type memReplicated struct {

@@ -62,7 +62,8 @@ type ControlState struct {
 
 type ControlStateRepo interface {
 	Get(ctx context.Context, vaultID uuid.UUID) (seq int64, state, sig []byte, err error)
-	Upsert(ctx context.Context, vaultID uuid.UUID, seq int64, state, sig []byte) error
+	// Upsert persists iff seq advances and reports whether it did.
+	Upsert(ctx context.Context, vaultID uuid.UUID, seq int64, state, sig []byte) (bool, error)
 }
 
 type ReplicatedControlRepo interface {
@@ -153,6 +154,13 @@ func (s *Service) RebuildControlState(ctx context.Context, vaultID uuid.UUID) (s
 	if !s.hasActiveHomeFederation(ctx, vaultID) {
 		return nil, nil, 0, nil
 	}
+	// Serialise rebuilds per vault: seq = prev+1 is read-then-write, and
+	// two concurrent rebuilds would both sign seq N+1 from different
+	// membership snapshots — the stale one could win persistence while
+	// the fresh one was still pushed to followers. Under the lock each
+	// rebuild reads the snapshot after the previous one committed.
+	unlock := s.lockControl(vaultID)
+	defer unlock()
 	v, err := s.vaults.GetByID(ctx, vaultID)
 	if err != nil {
 		return nil, nil, 0, err
@@ -194,10 +202,29 @@ func (s *Service) RebuildControlState(ctx context.Context, vaultID uuid.UUID) (s
 		return nil, nil, 0, err
 	}
 	signature := ed25519.Sign(s.priv, controlSigMessage(vaultID, stateJSON))
-	if err := s.control.States.Upsert(ctx, vaultID, doc.Seq, stateJSON, signature); err != nil {
+	persisted, err := s.control.States.Upsert(ctx, vaultID, doc.Seq, stateJSON, signature)
+	if err != nil {
 		return nil, nil, 0, err
 	}
+	if !persisted {
+		// Another writer (e.g. a second process on the same DB) advanced
+		// seq first. Never hand out an unpersisted document: return the
+		// authoritative stored one so only persisted state is pushed.
+		curSeq, curState, curSig, err := s.control.States.Get(ctx, vaultID)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+		return curState, curSig, curSeq, nil
+	}
 	return stateJSON, signature, doc.Seq, nil
+}
+
+// lockControl takes the per-vault control-state rebuild lock.
+func (s *Service) lockControl(vaultID uuid.UUID) (unlock func()) {
+	mu, _ := s.controlLocks.LoadOrStore(vaultID, &sync.Mutex{})
+	m := mu.(*sync.Mutex)
+	m.Lock()
+	return m.Unlock
 }
 
 // ControlChanged is the notifier target for members/roles/vaults/users

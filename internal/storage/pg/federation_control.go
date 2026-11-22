@@ -106,8 +106,9 @@ func (s *ControlStateStore) Get(ctx context.Context, vaultID uuid.UUID) (seq int
 }
 
 // Upsert writes the new document iff seq advances — a concurrent rebuild
-// with a higher seq wins, matching follower apply semantics.
-func (s *ControlStateStore) Upsert(ctx context.Context, vaultID uuid.UUID, seq int64, state, sig []byte) error {
+// with a higher seq wins, matching follower apply semantics. Reports
+// whether this call's document was persisted.
+func (s *ControlStateStore) Upsert(ctx context.Context, vaultID uuid.UUID, seq int64, state, sig []byte) (bool, error) {
 	const q = `
 INSERT INTO federation_control_state (vault_id, seq, state, signature, updated_at)
 VALUES ($1, $2, $3, $4, NOW())
@@ -115,10 +116,11 @@ ON CONFLICT (vault_id) DO UPDATE
    SET seq = EXCLUDED.seq, state = EXCLUDED.state,
        signature = EXCLUDED.signature, updated_at = NOW()
  WHERE federation_control_state.seq < EXCLUDED.seq`
-	if _, err := s.pool.Exec(ctx, q, vaultID, seq, state, sig); err != nil {
-		return fmt.Errorf("control state store: upsert: %w", errMap(err))
+	tag, err := s.pool.Exec(ctx, q, vaultID, seq, state, sig)
+	if err != nil {
+		return false, fmt.Errorf("control state store: upsert: %w", errMap(err))
 	}
-	return nil
+	return tag.RowsAffected() == 1, nil
 }
 
 // ReplicatedControlStore persists the follower-side verified control state.

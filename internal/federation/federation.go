@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -129,6 +130,7 @@ type Service struct {
 	control       *ControlPlaneDeps
 	renamer       VaultRenamer
 	resolverCache *resolverCache
+	controlLocks  sync.Map // vaultID -> *sync.Mutex (RebuildControlState)
 }
 
 type Deps struct {
