@@ -576,24 +576,27 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 
-	// Auth handlers register their own routes (public + Required-protected).
-	auth.NewHandlers(authSvc).Register(app)
-
-	// Authenticated group for everything else.
-	authed := app.Group("/api", auth.Required(authSvc))
-
-	users.NewHandlers(usersSvc, authSvc).Register(authed)
-	vaults.NewHandlers(vaultsSvc).Register(authed)
-	roles.NewHandlers(rolesSvc, fedResolver).Register(authed)
-	members.NewHandlers(membersSvc, fedResolver).Register(authed)
-	audit.NewHandlers(auditStore, fedResolver).Register(authed)
-	notes.NewHandlers(notesSvc).Register(authed)
-	wsync.NewHandler(wsHub, fedResolver, cfg.allowedOrigins).Register(authed)
-
-	// Invites: split between vault-scoped (authed) and public.
-	invites.NewHandlers(invitesSvc).Register(app, authed, fedResolver)
-	federation.NewHandlers(federationSvc, fedResolver).Register(app, authed)
-	federation.NewRelayHandlers(federationSvc, relayLinks, zlog).Register(app)
+	registerRoutes(app, auth.Required(authSvc),
+		// Public (or self-guarding) /api routes. Auth handlers mix public
+		// login/register with per-route Required guards.
+		[]func(fiber.Router){
+			auth.NewHandlers(authSvc).Register,
+			invites.NewHandlers(invitesSvc).RegisterPublic,
+			federation.NewHandlers(federationSvc, fedResolver).RegisterPublic,
+			federation.NewRelayHandlers(federationSvc, relayLinks, zlog).Register,
+		},
+		[]func(fiber.Router){
+			users.NewHandlers(usersSvc, authSvc).Register,
+			vaults.NewHandlers(vaultsSvc).Register,
+			roles.NewHandlers(rolesSvc, fedResolver).Register,
+			members.NewHandlers(membersSvc, fedResolver).Register,
+			audit.NewHandlers(auditStore, fedResolver).Register,
+			notes.NewHandlers(notesSvc).Register,
+			wsync.NewHandler(wsHub, fedResolver, cfg.allowedOrigins).Register,
+			func(r fiber.Router) { invites.NewHandlers(invitesSvc).RegisterAuthed(r, fedResolver) },
+			federation.NewHandlers(federationSvc, fedResolver).RegisterAuthed,
+		},
+	)
 
 	shutdown := func(ctx context.Context) error {
 		_ = ctx
@@ -693,6 +696,23 @@ func buildFSHandler(
 		updated.UpdatedAt = time.Now().UTC()
 		_ = noteStore.Upsert(ctx, updated)
 	})
+}
+
+// registerRoutes mounts the public /api routes and then the authenticated
+// /api group. Order is load-bearing: Fiber implements Group(prefix,
+// handlers...) as a prefix-scoped app.Use, so every route registered on the
+// app AFTER the group is created — including ones registered directly on
+// app — still runs the auth middleware first. Public routes therefore go
+// in strictly before the group; their handlers terminate the chain, so the
+// group middleware never runs for them.
+func registerRoutes(app *fiber.App, requireAuth fiber.Handler, public, protected []func(fiber.Router)) {
+	for _, register := range public {
+		register(app)
+	}
+	authed := app.Group("/api", requireAuth)
+	for _, register := range protected {
+		register(authed)
+	}
 }
 
 // ---------------------------------------------------------- middleware ------

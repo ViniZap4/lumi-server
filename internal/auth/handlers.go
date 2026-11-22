@@ -20,7 +20,7 @@ func NewHandlers(svc *Service) *Handlers {
 }
 
 // Register attaches the routes documented in SPEC.md "API surface".
-func (h *Handlers) Register(app *fiber.App) {
+func (h *Handlers) Register(app fiber.Router) {
 	app.Post("/api/auth/register", h.RegisterHandler)
 	app.Post("/api/auth/login", h.Login)
 	app.Post("/api/auth/logout", Required(h.svc), h.Logout)

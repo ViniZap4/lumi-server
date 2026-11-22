@@ -494,8 +494,17 @@ type Handlers struct {
 
 func NewHandlers(svc *Service) *Handlers { return &Handlers{svc: svc} }
 
-func (h *Handlers) Register(app *fiber.App, authedGroup fiber.Router, resolver capguard.Resolver) {
-	// Authed (vault-scoped) endpoints.
+// RegisterPublic wires the unauthenticated invite routes. It MUST be called
+// before the authenticated /api group is created: Fiber implements group
+// middleware as a prefix-scoped app.Use, so a route registered after
+// app.Group("/api", auth.Required(...)) would still demand a session.
+func (h *Handlers) RegisterPublic(r fiber.Router) {
+	r.Get("/api/invites/:token", h.info)
+	r.Post("/api/invites/:token/accept", h.accept)
+}
+
+// RegisterAuthed wires the vault-scoped invite routes on the authed group.
+func (h *Handlers) RegisterAuthed(authedGroup fiber.Router, resolver capguard.Resolver) {
 	authedGroup.Post("/vaults/:vault/invites",
 		capguard.RequireCapability(resolver, domain.CapMembersInvite),
 		h.create,
@@ -508,9 +517,6 @@ func (h *Handlers) Register(app *fiber.App, authedGroup fiber.Router, resolver c
 		capguard.RequireCapability(resolver, domain.CapMembersInvite),
 		h.revoke,
 	)
-	// Public endpoints.
-	app.Get("/api/invites/:token", h.info)
-	app.Post("/api/invites/:token/accept", h.accept)
 }
 
 type createReq struct {

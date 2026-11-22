@@ -21,12 +21,17 @@ func NewHandlers(svc *Service, resolver capguard.Resolver) *Handlers {
 	return &Handlers{svc: svc, resolver: resolver}
 }
 
-// Register wires public server-to-server routes on the app and operator/admin
-// routes on the authed group (mirrors the invites package split).
-func (h *Handlers) Register(app *fiber.App, authed fiber.Router) {
-	app.Get("/api/federation/identity", h.identity)
-	app.Post("/api/federation/accept", h.accept)
+// RegisterPublic wires the unauthenticated server-to-server routes. It MUST
+// be called before the authenticated /api group exists (Fiber group
+// middleware is a prefix-scoped app.Use and would otherwise demand a user
+// session from peer servers, which never have one).
+func (h *Handlers) RegisterPublic(r fiber.Router) {
+	r.Get("/api/federation/identity", h.identity)
+	r.Post("/api/federation/accept", h.accept)
+}
 
+// RegisterAuthed wires the operator/admin routes on the authed group.
+func (h *Handlers) RegisterAuthed(authed fiber.Router) {
 	authed.Post("/federation/join", h.join)
 	authed.Post("/vaults/:vault/federation-invites",
 		capguard.RequireCapability(h.resolver, domain.CapVaultFederate), h.createInvite)

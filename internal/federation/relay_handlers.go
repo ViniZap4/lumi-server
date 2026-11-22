@@ -28,8 +28,9 @@ func NewRelayHandlers(svc *Service, links *Links, log zerolog.Logger) *RelayHand
 
 // Register attaches the public relay routes. Both are unauthenticated in
 // the session sense: authorisation is the active federation row plus the
-// Ed25519 signature over the single-use nonce.
-func (h *RelayHandlers) Register(app *fiber.App) {
+// Ed25519 signature over the single-use nonce. Like the other public
+// routes it must be registered before the authenticated /api group.
+func (h *RelayHandlers) Register(app fiber.Router) {
 	app.Post("/api/federation/sync-challenge", h.challenge)
 
 	const path = "/api/federation/vaults/:vault/sync"
