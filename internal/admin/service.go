@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +37,8 @@ const (
 	ActionSessionRevoke    = "admin.session.revoke"
 	ActionVaultDelete      = "admin.vault.delete"
 	ActionFederationRevoke = "admin.federation.revoke"
+	ActionUserLogout       = "admin.user.logout"
+	ActionInviteRevoke     = "admin.invite.revoke"
 )
 
 // Actor is who performs an admin action: an admin token over the API, or
@@ -81,7 +84,9 @@ type User struct {
 	LockedUntil  *time.Time
 	Sessions     int // live (unexpired) sessions
 	OwnedVaults  int
-	Vaults       int // memberships, owned included
+	Vaults       int        // memberships, owned included
+	LastLoginAt  *time.Time // newest auth.login audit row
+	LastSeenAt   *time.Time // newest session use
 }
 
 // State is "disabled", "locked" or "active" (disabled wins).
@@ -119,7 +124,81 @@ type Vault struct {
 	CRDTBytes         int64 // stored Yjs snapshots + pending updates
 	FederationRole    *string
 	ActiveFederations int
+	HeadSeq           int64      // vault_heads.seq, 0 without a head
+	LastChangeAt      *time.Time // vault_heads.updated_at
+	InvitesActive     int
 	CreatedAt         time.Time
+}
+
+// Member is a local vault membership as the operator sees it.
+type Member struct {
+	UserID      uuid.UUID
+	Username    string
+	DisplayName string
+	RoleID      uuid.UUID
+	RoleName    string
+	Owner       bool
+	JoinedAt    time.Time
+}
+
+// Role is a vault role with its member count.
+type Role struct {
+	ID      uuid.UUID
+	Name    string
+	Seed    bool
+	Members int
+}
+
+// Invite is a vault join link. ID is the hex SHA-256 of the token: it
+// names the row but cannot be used to join.
+type Invite struct {
+	ID              string
+	VaultID         uuid.UUID
+	VaultSlug       string
+	VaultName       string
+	InviterID       uuid.UUID
+	InviterUsername string
+	RoleID          uuid.UUID
+	RoleName        string
+	EmailHint       *string
+	MaxUses         int
+	UseCount        int
+	ExpiresAt       time.Time
+	CreatedAt       time.Time
+	RevokedAt       *time.Time
+}
+
+// State is "revoked", "expired", "exhausted" or "active", in that order.
+func (i Invite) State(now time.Time) string {
+	switch {
+	case i.RevokedAt != nil:
+		return "revoked"
+	case !i.ExpiresAt.After(now):
+		return "expired"
+	case i.UseCount >= i.MaxUses:
+		return "exhausted"
+	}
+	return "active"
+}
+
+// UserFilter narrows the user list: Query is a case-insensitive substring
+// of username or display name; State is "", "active", "disabled" or "locked".
+type UserFilter struct {
+	Query string
+	State string
+}
+
+// VaultFilter narrows the vault list: UserID keeps the vaults the user owns
+// or belongs to; Query is a case-insensitive substring of slug or name.
+type VaultFilter struct {
+	UserID *uuid.UUID
+	Query  string
+}
+
+// InviteFilter narrows the invite list.
+type InviteFilter struct {
+	VaultID    *uuid.UUID
+	ActiveOnly bool
 }
 
 type Federation struct {
@@ -145,6 +224,13 @@ type Counts struct {
 	Federations   int64 // active links
 	SchemaVersion int64
 	SchemaDirty   bool
+
+	UsersDisabled    int64
+	UsersLocked      int64 // locked and not disabled
+	CRDTBytes        int64
+	Logins24h        int64
+	LoginFailures24h int64
+	InvitesActive    int64
 }
 
 // AuditQuery pages audit_log newest first. Before is an exclusive id bound
@@ -155,6 +241,12 @@ type AuditQuery struct {
 	AdminOn bool
 	UserID  *uuid.UUID
 	VaultID *uuid.UUID
+	// Action matches exactly, or as a prefix when ActionPrefix is set
+	// ("auth." for the "auth.*" form).
+	Action       string
+	ActionPrefix bool
+	Since        *time.Time // created_at >= Since
+	Until        *time.Time // created_at < Until
 }
 
 // Cursor pages list routes ordered by (Time, Key).
@@ -177,8 +269,9 @@ type Store interface {
 	RevokeToken(ctx context.Context, id uuid.UUID, at time.Time, e domain.AuditEntry) error
 
 	Counts(ctx context.Context) (Counts, error)
+	Ping(ctx context.Context) error
 
-	ListUsers(ctx context.Context, afterUsername string, limit int) ([]User, bool, error)
+	ListUsers(ctx context.Context, f UserFilter, afterUsername string, limit int) ([]User, bool, error)
 	GetUser(ctx context.Context, id uuid.UUID) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
 	OwnedVaultIDs(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error)
@@ -190,10 +283,18 @@ type Store interface {
 	ListSessions(ctx context.Context, userID *uuid.UUID, after *Cursor, limit int) ([]Session, bool, error)
 	GetSession(ctx context.Context, id string) (Session, error)
 	DeleteSession(ctx context.Context, id string, e domain.AuditEntry) error
+	// EndUserSessions deletes every session of the user and writes the
+	// audit row built from the count, in one transaction.
+	EndUserSessions(ctx context.Context, userID uuid.UUID, e func(n int) domain.AuditEntry) (int, error)
 
-	ListVaults(ctx context.Context, userID *uuid.UUID, afterSlug string, limit int) ([]Vault, bool, error)
+	ListVaults(ctx context.Context, f VaultFilter, afterSlug string, limit int) ([]Vault, bool, error)
 	GetVault(ctx context.Context, id uuid.UUID) (Vault, error)
 	GetVaultBySlug(ctx context.Context, slug string) (Vault, error)
+	VaultMembers(ctx context.Context, vaultID uuid.UUID) ([]Member, []Role, error)
+
+	ListInvites(ctx context.Context, f InviteFilter, after *Cursor, limit int) ([]Invite, bool, error)
+	GetInvite(ctx context.Context, id string) (Invite, error)
+	RevokeInvite(ctx context.Context, id string, at time.Time, e domain.AuditEntry) error
 
 	ListFederations(ctx context.Context, vaultID *uuid.UUID, after *Cursor, limit int) ([]Federation, bool, error)
 	GetFederation(ctx context.Context, id uuid.UUID) (Federation, error)
@@ -376,10 +477,17 @@ type Status struct {
 	SchemaVersion     int64
 	SchemaDirty       bool
 	PendingMigrations int
+	DBLatency         time.Duration
+	GoVersion         string
 	Counts
 }
 
 func (s *Service) Status(ctx context.Context) (Status, error) {
+	start := time.Now()
+	if err := s.Store.Ping(ctx); err != nil {
+		return Status{}, err
+	}
+	latency := time.Since(start)
 	c, err := s.Store.Counts(ctx)
 	if err != nil {
 		return Status{}, err
@@ -394,6 +502,8 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 		SchemaVersion:     c.SchemaVersion,
 		SchemaDirty:       c.SchemaDirty,
 		PendingMigrations: pending,
+		DBLatency:         latency,
+		GoVersion:         runtime.Version(),
 		Counts:            c,
 	}, nil
 }
@@ -426,7 +536,12 @@ func PendingMigrations(dir string, current int64) (int, error) {
 // ---- users --------------------------------------------------------------------------
 
 func (s *Service) ListUsers(ctx context.Context, after string, limit int) ([]User, bool, error) {
-	return s.Store.ListUsers(ctx, after, limit)
+	return s.Store.ListUsers(ctx, UserFilter{}, after, limit)
+}
+
+// SearchUsers is ListUsers with a filter (validated by the caller).
+func (s *Service) SearchUsers(ctx context.Context, f UserFilter, after string, limit int) ([]User, bool, error) {
+	return s.Store.ListUsers(ctx, f, after, limit)
 }
 
 func (s *Service) GetUser(ctx context.Context, id uuid.UUID) (User, error) {
@@ -629,10 +744,69 @@ func (s *Service) RevokeSession(ctx context.Context, a Actor, id string) error {
 	return nil
 }
 
+// EndUserSessions signs the user out everywhere: every session is
+// deleted and the live streams are told. Audited even when there were none.
+func (s *Service) EndUserSessions(ctx context.Context, a Actor, id uuid.UUID) (int, error) {
+	u, err := s.Store.GetUser(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	n, err := s.Store.EndUserSessions(ctx, id, func(n int) domain.AuditEntry {
+		return s.entry(a, ActionUserLogout, &u.ID, nil, map[string]any{"username": u.Username, "sessions": n})
+	})
+	if err != nil {
+		return 0, err
+	}
+	s.endUserSessions(id)
+	s.logAction(a, ActionUserLogout).Str("user_id", id.String()).Int("sessions", n).Msg("admin action")
+	return n, nil
+}
+
 // ---- vaults ---------------------------------------------------------------------------
 
 func (s *Service) ListVaults(ctx context.Context, userID *uuid.UUID, after string, limit int) ([]Vault, bool, error) {
-	return s.Store.ListVaults(ctx, userID, after, limit)
+	return s.Store.ListVaults(ctx, VaultFilter{UserID: userID}, after, limit)
+}
+
+// SearchVaults is ListVaults with a filter (validated by the caller).
+func (s *Service) SearchVaults(ctx context.Context, f VaultFilter, after string, limit int) ([]Vault, bool, error) {
+	return s.Store.ListVaults(ctx, f, after, limit)
+}
+
+// VaultMembers lists the local members (owner first) and the roles.
+func (s *Service) VaultMembers(ctx context.Context, id uuid.UUID) ([]Member, []Role, error) {
+	if _, err := s.Store.GetVault(ctx, id); err != nil {
+		return nil, nil, err
+	}
+	return s.Store.VaultMembers(ctx, id)
+}
+
+// ---- invites -----------------------------------------------------------------------------
+
+func (s *Service) ListInvites(ctx context.Context, f InviteFilter, after *Cursor, limit int) ([]Invite, bool, error) {
+	return s.Store.ListInvites(ctx, f, after, limit)
+}
+
+// RevokeInvite revokes a vault join link by its id (the token hash).
+// Revoking an already revoked link is a no-op success that is still
+// audited, like tokens.
+func (s *Service) RevokeInvite(ctx context.Context, a Actor, id string) error {
+	if !sessionIDPattern.MatchString(id) {
+		return fmt.Errorf("invite: %w", domain.ErrNotFound)
+	}
+	inv, err := s.Store.GetInvite(ctx, id)
+	if err != nil {
+		return err
+	}
+	e := s.entry(a, ActionInviteRevoke, nil, &inv.VaultID, map[string]any{
+		"invite_id":  id[:12],
+		"vault_slug": inv.VaultSlug,
+	})
+	if err := s.Store.RevokeInvite(ctx, id, s.clock().UTC(), e); err != nil {
+		return err
+	}
+	s.logAction(a, ActionInviteRevoke).Str("vault_id", inv.VaultID.String()).Str("invite_id", id[:12]).Msg("admin action")
+	return nil
 }
 
 func (s *Service) GetVault(ctx context.Context, id uuid.UUID) (Vault, error) {

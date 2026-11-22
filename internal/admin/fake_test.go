@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +25,9 @@ type fakeStore struct {
 	sessions  map[string]*Session
 	vaults    map[uuid.UUID]*Vault
 	feds      map[uuid.UUID]*Federation
+	members   map[uuid.UUID][]Member
+	roles     map[uuid.UUID][]Role
+	invites   map[string]*Invite
 	audit     []domain.AuditEntry
 	failAudit bool
 }
@@ -33,6 +37,7 @@ func newFakeStore() *fakeStore {
 		tokens: map[uuid.UUID]*Token{}, digests: map[uuid.UUID][]byte{},
 		users: map[uuid.UUID]*User{}, owned: map[uuid.UUID][]uuid.UUID{},
 		sessions: map[string]*Session{}, vaults: map[uuid.UUID]*Vault{}, feds: map[uuid.UUID]*Federation{},
+		members: map[uuid.UUID][]Member{}, roles: map[uuid.UUID][]Role{}, invites: map[string]*Invite{},
 	}
 }
 
@@ -124,11 +129,20 @@ func (f *fakeStore) Counts(context.Context) (Counts, error) {
 	return Counts{Users: int64(len(f.users)), Sessions: int64(len(f.sessions)), Vaults: int64(len(f.vaults)), SchemaVersion: 7}, nil
 }
 
-func (f *fakeStore) ListUsers(_ context.Context, after string, limit int) ([]User, bool, error) {
+func (f *fakeStore) Ping(context.Context) error { return nil }
+
+func (f *fakeStore) ListUsers(_ context.Context, flt UserFilter, after string, limit int) ([]User, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []User
+	q := strings.ToLower(flt.Query)
 	for _, u := range f.users {
+		if q != "" && !strings.Contains(u.Username, q) && !strings.Contains(strings.ToLower(u.DisplayName), q) {
+			continue
+		}
+		if flt.State != "" && u.State(time.Now()) != flt.State {
+			continue
+		}
 		if u.Username > after {
 			out = append(out, *u)
 		}
@@ -275,14 +289,87 @@ func (f *fakeStore) DeleteSession(_ context.Context, id string, e domain.AuditEn
 	return nil
 }
 
-func (f *fakeStore) ListVaults(context.Context, *uuid.UUID, string, int) ([]Vault, bool, error) {
+func (f *fakeStore) ListVaults(_ context.Context, flt VaultFilter, _ string, _ int) ([]Vault, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []Vault
+	q := strings.ToLower(flt.Query)
 	for _, v := range f.vaults {
+		if q != "" && !strings.Contains(v.Slug, q) && !strings.Contains(strings.ToLower(v.Name), q) {
+			continue
+		}
 		out = append(out, *v)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Slug < out[j].Slug })
 	return out, false, nil
+}
+
+func (f *fakeStore) VaultMembers(_ context.Context, id uuid.UUID) ([]Member, []Role, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.members[id], f.roles[id], nil
+}
+
+func (f *fakeStore) EndUserSessions(_ context.Context, id uuid.UUID, e func(int) domain.AuditEntry) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.users[id]; !ok {
+		return 0, domain.ErrNotFound
+	}
+	n := 0
+	for _, s := range f.sessions {
+		if s.UserID == id {
+			n++
+		}
+	}
+	if err := f.addAudit(e(n)); err != nil {
+		return 0, err
+	}
+	f.endSessions(id)
+	return n, nil
+}
+
+func (f *fakeStore) ListInvites(_ context.Context, flt InviteFilter, _ *Cursor, _ int) ([]Invite, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []Invite
+	for _, i := range f.invites {
+		if flt.VaultID != nil && i.VaultID != *flt.VaultID {
+			continue
+		}
+		if flt.ActiveOnly && i.State(time.Now()) != "active" {
+			continue
+		}
+		out = append(out, *i)
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].CreatedAt.After(out[b].CreatedAt) })
+	return out, false, nil
+}
+
+func (f *fakeStore) GetInvite(_ context.Context, id string) (Invite, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	i, ok := f.invites[id]
+	if !ok {
+		return Invite{}, domain.ErrNotFound
+	}
+	return *i, nil
+}
+
+func (f *fakeStore) RevokeInvite(_ context.Context, id string, at time.Time, e domain.AuditEntry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	i, ok := f.invites[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if err := f.addAudit(e); err != nil {
+		return err
+	}
+	if i.RevokedAt == nil {
+		i.RevokedAt = &at
+	}
+	return nil
 }
 
 func (f *fakeStore) GetVault(_ context.Context, id uuid.UUID) (Vault, error) {
@@ -339,6 +426,12 @@ func (f *fakeStore) ListAudit(_ context.Context, q AuditQuery) ([]domain.AuditEn
 	for i := len(f.audit) - 1; i >= 0; i-- {
 		e := f.audit[i]
 		if q.Before > 0 && e.ID >= q.Before {
+			continue
+		}
+		if q.Action != "" && ((q.ActionPrefix && !strings.HasPrefix(e.Action, q.Action)) || (!q.ActionPrefix && e.Action != q.Action)) {
+			continue
+		}
+		if (q.Since != nil && e.CreatedAt.Before(*q.Since)) || (q.Until != nil && !e.CreatedAt.Before(*q.Until)) {
 			continue
 		}
 		out = append(out, e)

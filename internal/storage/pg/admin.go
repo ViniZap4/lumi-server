@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -144,8 +145,16 @@ SELECT (SELECT count(*) FROM users),
        (SELECT count(*) FROM sessions WHERE expires_at > NOW()),
        (SELECT count(*) FROM vaults),
        (SELECT count(*) FROM notes),
-       (SELECT count(*) FROM vault_federations WHERE status = 'active')`).
-		Scan(&c.Users, &c.Sessions, &c.Vaults, &c.Notes, &c.Federations)
+       (SELECT count(*) FROM vault_federations WHERE status = 'active'),
+       (SELECT count(*) FROM users WHERE disabled_at IS NOT NULL),
+       (SELECT count(*) FROM users WHERE disabled_at IS NULL AND locked_until > NOW()),
+       (COALESCE((SELECT sum(octet_length(state)) FROM note_yjs_snapshots), 0)
+      + COALESCE((SELECT sum(octet_length(update_blob)) FROM note_yjs_updates), 0))::bigint,
+       (SELECT count(*) FROM audit_log WHERE action = 'auth.login' AND created_at > NOW() - interval '24 hours'),
+       (SELECT count(*) FROM audit_log WHERE action = 'auth.login_failed' AND created_at > NOW() - interval '24 hours'),
+       (SELECT count(*) FROM invites WHERE revoked_at IS NULL AND expires_at > NOW() AND use_count < max_uses)`).
+		Scan(&c.Users, &c.Sessions, &c.Vaults, &c.Notes, &c.Federations,
+			&c.UsersDisabled, &c.UsersLocked, &c.CRDTBytes, &c.Logins24h, &c.LoginFailures24h, &c.InvitesActive)
 	if err != nil {
 		return admin.Counts{}, fmt.Errorf("admin store: counts: %w", errMap(err))
 	}
@@ -157,30 +166,60 @@ SELECT (SELECT count(*) FROM users),
 	return c, nil
 }
 
+// Ping is a trivial round trip, timed by the service as the DB latency.
+func (s *AdminStore) Ping(ctx context.Context) error {
+	var one int
+	if err := s.pool.QueryRow(ctx, `SELECT 1`).Scan(&one); err != nil {
+		return fmt.Errorf("admin store: ping: %w", errMap(err))
+	}
+	return nil
+}
+
+// likePattern turns a search into a case-insensitive substring pattern
+// (used with ILIKE ... ESCAPE '\'); "" stays "" (no filter).
+func likePattern(q string) string {
+	if q == "" {
+		return ""
+	}
+	return "%" + escapeLike(q) + "%"
+}
+
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// escapeLike neutralises LIKE wildcards (ESCAPE '\').
+func escapeLike(s string) string { return likeEscaper.Replace(s) }
+
 // ---- users ----------------------------------------------------------------------------
 
 const adminUserSelect = `
 SELECT u.id, u.username, u.display_name, u.created_at, u.disabled_at, u.failed_logins, u.locked_until,
        (SELECT count(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > NOW()),
        (SELECT count(*) FROM vaults v WHERE v.owner_user_id = u.id),
-       (SELECT count(*) FROM vault_members m WHERE m.user_id = u.id)
+       (SELECT count(*) FROM vault_members m WHERE m.user_id = u.id),
+       (SELECT max(a.created_at) FROM audit_log a WHERE a.user_id = u.id AND a.action = 'auth.login'),
+       (SELECT max(s.last_used_at) FROM sessions s WHERE s.user_id = u.id)
   FROM users u`
 
 func scanAdminUser(row pgx.Row) (admin.User, error) {
 	var u admin.User
 	err := row.Scan(&u.ID, &u.Username, &u.DisplayName, &u.CreatedAt, &u.DisabledAt, &u.FailedLogins,
-		&u.LockedUntil, &u.Sessions, &u.OwnedVaults, &u.Vaults)
+		&u.LockedUntil, &u.Sessions, &u.OwnedVaults, &u.Vaults, &u.LastLoginAt, &u.LastSeenAt)
 	if err != nil {
 		return admin.User{}, fmt.Errorf("admin store: user: %w", errMap(err))
 	}
 	return u, nil
 }
 
-func (s *AdminStore) ListUsers(ctx context.Context, after string, limit int) ([]admin.User, bool, error) {
+func (s *AdminStore) ListUsers(ctx context.Context, f admin.UserFilter, after string, limit int) ([]admin.User, bool, error) {
 	rows, err := s.pool.Query(ctx, adminUserSelect+`
  WHERE u.username > $1
+   AND ($3 = '' OR u.username ILIKE $3 ESCAPE '\' OR u.display_name ILIKE $3 ESCAPE '\')
+   AND ($4 = ''
+        OR ($4 = 'disabled' AND u.disabled_at IS NOT NULL)
+        OR ($4 = 'locked' AND u.disabled_at IS NULL AND u.locked_until > NOW())
+        OR ($4 = 'active' AND u.disabled_at IS NULL AND (u.locked_until IS NULL OR u.locked_until <= NOW())))
  ORDER BY u.username
- LIMIT $2`, after, limitArg(limit))
+ LIMIT $2`, after, limitArg(limit), likePattern(f.Query), f.State)
 	if err != nil {
 		return nil, false, fmt.Errorf("admin store: list users: %w", errMap(err))
 	}
@@ -315,6 +354,31 @@ func (s *AdminStore) DeleteSession(ctx context.Context, id string, e domain.Audi
 	})
 }
 
+// EndUserSessions deletes all sessions of the user and writes the audit
+// row (built from the count) in the same transaction.
+func (s *AdminStore) EndUserSessions(ctx context.Context, userID uuid.UUID, e func(n int) domain.AuditEntry) (int, error) {
+	var n int
+	err := runTx(ctx, s.pool, func(tx pgx.Tx) error {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)`, userID).Scan(&exists); err != nil {
+			return fmt.Errorf("admin store: end sessions: %w", errMap(err))
+		}
+		if !exists {
+			return fmt.Errorf("admin store: end sessions: %w", domain.ErrNotFound)
+		}
+		tag, err := tx.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, userID)
+		if err != nil {
+			return fmt.Errorf("admin store: end sessions: %w", errMap(err))
+		}
+		n = int(tag.RowsAffected())
+		return insertAudit(ctx, tx, e(n))
+	})
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // ---- vaults --------------------------------------------------------------------------------
 
 const adminVaultSelect = `
@@ -326,14 +390,19 @@ SELECT v.id, v.slug, v.name, v.owner_user_id, COALESCE(o.username, ''),
       + COALESCE((SELECT sum(octet_length(up.update_blob)) FROM note_yjs_updates up WHERE up.vault_id = v.id), 0))::bigint,
        (SELECT f.role FROM vault_federations f WHERE f.vault_id = v.id AND f.status = 'active' LIMIT 1),
        (SELECT count(*) FROM vault_federations f WHERE f.vault_id = v.id AND f.status = 'active'),
+       COALESCE(h.seq, 0), h.updated_at,
+       (SELECT count(*) FROM invites i WHERE i.vault_id = v.id AND i.revoked_at IS NULL
+           AND i.expires_at > NOW() AND i.use_count < i.max_uses),
        v.created_at
   FROM vaults v
-  LEFT JOIN users o ON o.id = v.owner_user_id`
+  LEFT JOIN users o ON o.id = v.owner_user_id
+  LEFT JOIN vault_heads h ON h.vault_id = v.id`
 
 func scanAdminVault(row pgx.Row) (admin.Vault, error) {
 	var v admin.Vault
 	err := row.Scan(&v.ID, &v.Slug, &v.Name, &v.OwnerID, &v.OwnerUsername, &v.Members, &v.FederatedMembers,
-		&v.Notes, &v.CRDTBytes, &v.FederationRole, &v.ActiveFederations, &v.CreatedAt)
+		&v.Notes, &v.CRDTBytes, &v.FederationRole, &v.ActiveFederations, &v.HeadSeq, &v.LastChangeAt,
+		&v.InvitesActive, &v.CreatedAt)
 	if err != nil {
 		return admin.Vault{}, fmt.Errorf("admin store: vault: %w", errMap(err))
 	}
@@ -342,13 +411,14 @@ func scanAdminVault(row pgx.Row) (admin.Vault, error) {
 
 // ListVaults pages vaults by slug; userID keeps those the user owns or
 // belongs to.
-func (s *AdminStore) ListVaults(ctx context.Context, userID *uuid.UUID, after string, limit int) ([]admin.Vault, bool, error) {
+func (s *AdminStore) ListVaults(ctx context.Context, f admin.VaultFilter, after string, limit int) ([]admin.Vault, bool, error) {
 	rows, err := s.pool.Query(ctx, adminVaultSelect+`
  WHERE v.slug > $1
    AND ($2::uuid IS NULL OR v.owner_user_id = $2
         OR EXISTS (SELECT 1 FROM vault_members m WHERE m.vault_id = v.id AND m.user_id = $2))
+   AND ($4 = '' OR v.slug ILIKE $4 ESCAPE '\' OR v.name ILIKE $4 ESCAPE '\')
  ORDER BY v.slug
- LIMIT $3`, after, userID, limitArg(limit))
+ LIMIT $3`, after, f.UserID, limitArg(limit), likePattern(f.Query))
 	if err != nil {
 		return nil, false, fmt.Errorf("admin store: list vaults: %w", errMap(err))
 	}
@@ -361,6 +431,106 @@ func (s *AdminStore) GetVault(ctx context.Context, id uuid.UUID) (admin.Vault, e
 
 func (s *AdminStore) GetVaultBySlug(ctx context.Context, slug string) (admin.Vault, error) {
 	return scanAdminVault(s.pool.QueryRow(ctx, adminVaultSelect+` WHERE v.slug = $1`, slug))
+}
+
+// VaultMembers lists the local members (owner first, then by username)
+// and the vault's roles by name with their member counts.
+func (s *AdminStore) VaultMembers(ctx context.Context, vaultID uuid.UUID) ([]admin.Member, []admin.Role, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT m.user_id, u.username, u.display_name, r.id, r.name, (v.owner_user_id = m.user_id), m.joined_at
+  FROM vault_members m
+  JOIN users u ON u.id = m.user_id
+  JOIN vault_roles r ON r.id = m.role_id
+  JOIN vaults v ON v.id = m.vault_id
+ WHERE m.vault_id = $1
+ ORDER BY (v.owner_user_id = m.user_id) DESC, u.username`, vaultID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("admin store: vault members: %w", errMap(err))
+	}
+	members, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (admin.Member, error) {
+		var m admin.Member
+		err := r.Scan(&m.UserID, &m.Username, &m.DisplayName, &m.RoleID, &m.RoleName, &m.Owner, &m.JoinedAt)
+		return m, err
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("admin store: vault members: %w", errMap(err))
+	}
+	rows, err = s.pool.Query(ctx, `
+SELECT r.id, r.name, r.is_seed, (SELECT count(*) FROM vault_members m WHERE m.role_id = r.id)
+  FROM vault_roles r
+ WHERE r.vault_id = $1
+ ORDER BY r.name`, vaultID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("admin store: vault roles: %w", errMap(err))
+	}
+	roles, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (admin.Role, error) {
+		var x admin.Role
+		err := r.Scan(&x.ID, &x.Name, &x.Seed, &x.Members)
+		return x, err
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("admin store: vault roles: %w", errMap(err))
+	}
+	return members, roles, nil
+}
+
+// ---- invites ---------------------------------------------------------------------------------
+
+// The id of an invite is the hex SHA-256 of its token; the token itself
+// never leaves the database through the admin surface.
+const adminInviteSelect = `
+SELECT encode(sha256(convert_to(i.token, 'UTF8')), 'hex'), i.vault_id, v.slug, v.name,
+       i.inviter_user_id, COALESCE(u.username, ''), i.role_id, COALESCE(r.name, ''), i.email_hint,
+       i.max_uses, i.use_count, i.expires_at, i.created_at, i.revoked_at
+  FROM invites i
+  JOIN vaults v ON v.id = i.vault_id
+  LEFT JOIN users u ON u.id = i.inviter_user_id
+  LEFT JOIN vault_roles r ON r.id = i.role_id`
+
+const inviteIDExpr = `encode(sha256(convert_to(i.token, 'UTF8')), 'hex')`
+
+func scanAdminInvite(row pgx.Row) (admin.Invite, error) {
+	var x admin.Invite
+	err := row.Scan(&x.ID, &x.VaultID, &x.VaultSlug, &x.VaultName, &x.InviterID, &x.InviterUsername,
+		&x.RoleID, &x.RoleName, &x.EmailHint, &x.MaxUses, &x.UseCount, &x.ExpiresAt, &x.CreatedAt, &x.RevokedAt)
+	if err != nil {
+		return admin.Invite{}, fmt.Errorf("admin store: invite: %w", errMap(err))
+	}
+	return x, nil
+}
+
+// ListInvites pages invites newest first by (created_at, id).
+func (s *AdminStore) ListInvites(ctx context.Context, f admin.InviteFilter, after *admin.Cursor, limit int) ([]admin.Invite, bool, error) {
+	var at any
+	key := ""
+	if after != nil {
+		at, key = after.Time, after.Key
+	}
+	rows, err := s.pool.Query(ctx, adminInviteSelect+`
+ WHERE ($1::uuid IS NULL OR i.vault_id = $1)
+   AND (NOT $2::bool OR (i.revoked_at IS NULL AND i.expires_at > NOW() AND i.use_count < i.max_uses))
+   AND ($3::timestamptz IS NULL OR (i.created_at, `+inviteIDExpr+`) < ($3, $4::text))
+ ORDER BY i.created_at DESC, `+inviteIDExpr+` DESC
+ LIMIT $5`, f.VaultID, f.ActiveOnly, at, key, limitArg(limit))
+	if err != nil {
+		return nil, false, fmt.Errorf("admin store: list invites: %w", errMap(err))
+	}
+	return collectPage(rows, limit, func(r pgx.Rows) (admin.Invite, error) { return scanAdminInvite(r) })
+}
+
+func (s *AdminStore) GetInvite(ctx context.Context, id string) (admin.Invite, error) {
+	return scanAdminInvite(s.pool.QueryRow(ctx, adminInviteSelect+` WHERE `+inviteIDExpr+` = $1`, id))
+}
+
+func (s *AdminStore) RevokeInvite(ctx context.Context, id string, at time.Time, e domain.AuditEntry) error {
+	return s.withAudit(ctx, e, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+UPDATE invites i SET revoked_at = COALESCE(i.revoked_at, $2) WHERE `+inviteIDExpr+` = $1`, id, at)
+		if err != nil {
+			return fmt.Errorf("admin store: revoke invite: %w", errMap(err))
+		}
+		return affected(tag, "revoke invite")
+	})
 }
 
 // ---- federations ----------------------------------------------------------------------------
@@ -417,9 +587,17 @@ SELECT id, user_id, vault_id, action, payload, host(ip), user_agent, created_at
    AND (NOT $2::bool OR action LIKE 'admin.%')
    AND ($3::uuid IS NULL OR user_id = $3)
    AND ($4::uuid IS NULL OR vault_id = $4)
+   AND ($6 = '' OR (NOT $7::bool AND action = $6) OR ($7::bool AND action LIKE $8 ESCAPE '\'))
+   AND ($9::timestamptz IS NULL OR created_at >= $9)
+   AND ($10::timestamptz IS NULL OR created_at < $10)
  ORDER BY id DESC
  LIMIT $5`
-	list, err := (&AuditStore{pool: s.pool}).queryEntries(ctx, sql, q.Before, q.AdminOn, q.UserID, q.VaultID, limitArg(q.Limit))
+	prefix := ""
+	if q.ActionPrefix {
+		prefix = escapeLike(q.Action) + "%"
+	}
+	list, err := (&AuditStore{pool: s.pool}).queryEntries(ctx, sql, q.Before, q.AdminOn, q.UserID, q.VaultID,
+		limitArg(q.Limit), q.Action, q.ActionPrefix, prefix, q.Since, q.Until)
 	if err != nil {
 		return nil, false, err
 	}

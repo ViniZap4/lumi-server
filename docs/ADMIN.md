@@ -25,8 +25,8 @@ Todas sob `/admin/v1`.
 
 | Método e rota | Corpo | Resposta |
 |---|---|---|
-| `GET /status` | — | `{"version", "schema_version", "schema_dirty", "pending_migrations", "users", "sessions", "vaults", "notes", "federations", "feed_connections", "ws_connections", "started_at", "token": {"id", "name", "expires_at"}}` |
-| `GET /users` | — | página de usuários por `username` |
+| `GET /status` | — | `{"version", "schema_version", "schema_dirty", "pending_migrations", "users", "sessions", "vaults", "notes", "federations", "feed_connections", "ws_connections", "started_at", "db_latency_ms", "users_disabled", "users_locked", "crdt_bytes", "logins_24h", "login_failures_24h", "invites_active", "go_version", "token": {"id", "name", "expires_at"}}` |
+| `GET /users?q={texto}&state=active\|disabled\|locked` | — | página de usuários por `username`; `q` filtra por trecho do nome de usuário ou de exibição, sem diferenciar maiúsculas |
 | `GET /users/{id}` | — | um usuário, com `"owned_vault_ids": [...]` |
 | `POST /users` | `{"username", "password", "display_name"?}` | `201` usuário |
 | `POST /users/{id}/password` | `{"password"}` | `204`; zera falhas e bloqueio e encerra todas as sessões do usuário |
@@ -34,24 +34,33 @@ Todas sob `/admin/v1`.
 | `POST /users/{id}/enable` | — | `204`; idempotente |
 | `POST /users/{id}/unlock` | — | `204`; zera `failed_logins` e `locked_until` |
 | `DELETE /users/{id}?delete_owned_vaults=true` | — | `204`; apagamento LGPD (abaixo) |
+| `DELETE /users/{id}/sessions` | — | `200 {"revoked": n}`; encerra todas as sessões do usuário (desconecta em todo lugar); auditado mesmo com `n` zero |
 | `GET /sessions?user={id}` | — | página de sessões, mais novas primeiro; sem `user`, todas |
 | `DELETE /sessions/{id}` | — | `204` |
-| `GET /vaults?user={id}` | — | página de cofres por `slug`; com `user`, os que ele possui ou dos quais é membro |
+| `GET /vaults?user={id}&q={texto}` | — | página de cofres por `slug`; com `user`, os que ele possui ou dos quais é membro; `q` filtra por trecho do slug ou do nome |
 | `GET /vaults/{id}` | — | um cofre |
+| `GET /vaults/{id}/members` | — | `{"members": [...], "roles": [...]}`: membros locais (o dono primeiro, depois por nome) e papéis por nome |
 | `DELETE /vaults/{id}` | — | `204`; apaga notas, papéis, membros, convites e vínculos de federação, e o diretório |
 | `GET /federations?vault={id}` | — | página de vínculos de federação por criação |
 | `DELETE /federations/{id}` | — | `204`; revoga (a linha fica com `status: "revoked"`; o cofre local fica); `409` se já não estava ativo |
+| `GET /invites?vault={id}&state=active\|all` | — | página de convites de cofre, mais novos primeiro; `state` padrão `all` |
+| `DELETE /invites/{id}` | — | `204`; revoga o convite; idempotente (já revogado também responde `204` e é auditado) |
 | `GET /tokens` | — | página de tokens por criação |
 | `DELETE /tokens/{id}` | — | `204`; revoga (o próprio também, com efeito na próxima chamada); idempotente |
-| `GET /audit?before={id}&limit={n}&scope=all\|admin&user={id}&vault={id}` | — | `{"entries": [...], "more", "next"}`, mais novas primeiro; `limit` padrão e máximo 100; `next` é o `before` da próxima página |
+| `GET /audit?before={id}&limit={n}&scope=all\|admin&user={id}&vault={id}&action={ação}&since={data}&until={data}` | — | `{"entries": [...], "more", "next"}`, mais novas primeiro; `limit` padrão e máximo 100; `next` é o `before` da próxima página |
 
 ### Formatos
-- Usuário: `{"id", "username", "display_name", "state", "disabled_at", "failed_logins", "locked_until", "sessions", "owned_vaults", "vaults", "created_at"}`. `state` é `"active"`, `"disabled"` ou `"locked"` (desativado vence). `sessions` conta as não expiradas; `vaults` conta participações (inclui as que possui).
+- Estado (`GET /status`): além das contagens, `db_latency_ms` (ida e volta de uma consulta trivial ao banco, em ms com fração), `users_disabled`, `users_locked` (bloqueados e não desativados), `crdt_bytes` (soma de todos os cofres), `logins_24h` e `login_failures_24h` (linhas `auth.login` e `auth.login_failed` da auditoria nas últimas 24 h), `invites_active` (convites não revogados, não expirados e com usos sobrando) e `go_version`.
+- Usuário: `{"id", "username", "display_name", "state", "disabled_at", "failed_logins", "locked_until", "sessions", "owned_vaults", "vaults", "created_at", "last_login_at", "last_seen_at"}`. `state` é `"active"`, `"disabled"` ou `"locked"` (desativado vence). `sessions` conta as não expiradas; `vaults` conta participações (inclui as que possui). `last_login_at` é a linha `auth.login` mais recente da auditoria; `last_seen_at`, o último uso de uma sessão ainda guardada; `null` quando não há.
 - Sessão: `{"id", "user_id", "username", "created_at", "last_used_at", "expires_at"}`. `id` é o SHA-256 (hex, 64 caracteres) do token guardado no banco: identifica a sessão, mas não serve para autenticar.
-- Cofre: `{"id", "slug", "name", "owner": {"id", "username"}, "members", "federated_members", "notes", "crdt_bytes", "federation": {"role": "home"|"follower", "active_links"} | null, "created_at"}`. `crdt_bytes` soma snapshots e atualizações Yjs guardados (não o tamanho em disco).
+- Cofre: `{"id", "slug", "name", "owner": {"id", "username"}, "members", "federated_members", "notes", "crdt_bytes", "federation": {"role": "home"|"follower", "active_links"} | null, "created_at"}`. `crdt_bytes` soma snapshots e atualizações Yjs guardados (não o tamanho em disco). Também `"head_seq"` (última sequência de mudança do cofre neste servidor, `0` sem nenhuma), `"last_change_at"` (`null` sem nenhuma) e `"invites_active"`.
+- Membro: `{"user": {"id", "username"}, "display_name", "role": {"id", "name"}, "owner", "joined_at"}`. Papel: `{"id", "name", "seed", "members"}`.
+- Convite: `{"id", "vault": {"id", "slug", "name"}, "inviter": {"id", "username"}, "role": {"id", "name"}, "email_hint", "max_uses", "use_count", "state", "expires_at", "created_at", "revoked_at"}`. `id` é o SHA-256 (hex, 64 caracteres) do token: identifica o convite, mas não serve para entrar; o token nunca sai pela API de admin. `state` é `revoked`, `expired`, `exhausted` ou `active`, nessa ordem de precedência. `inviter.username` vem vazio se a conta já foi apagada.
 - Federação: `{"id", "vault": {"id", "slug", "name"}, "role", "peer_url", "jurisdiction", "status", "last_acked_seq", "control_seq", "created_at", "revoked_at"}`. `role` é o papel **deste** servidor; `control_seq` só no lado `home`; `status` é `active`, `revoked` ou `severed`.
 - Token: `{"id", "name", "state", "created_at", "last_used_at", "expires_at", "revoked_at", "current"}`; `state` é `active`, `expired` ou `revoked`; `current` marca o token da chamada.
 - Auditoria: `{"id", "created_at", "action", "user_id", "vault_id", "ip", "user_agent", "payload"}`. É o `audit_log` inteiro (ações dos usuários também); `scope=admin` filtra as `admin.*`.
+- Filtros da auditoria: `action` é uma ação exata (`auth.login`) ou um prefixo terminado em `.*` (`auth.*`), até 64 caracteres de `[a-z_.]`; `since` e `until` em RFC 3339 (`created_at >= since` e `< until`; `until` precisa ser depois de `since`).
+- Busca (`q`): de 1 a 64 caracteres, sem caracteres de controle; vazio é o mesmo que ausente; `%` e `_` valem literalmente.
 - Páginas: `{"items": [...], "more", "next"}`. `?limit=` de 1 a 200 (padrão 200) e `?after={next}` para a seguinte; `next` é opaco e `null` na última.
 - Ids inválidos no caminho respondem `404`, como ids desconhecidos.
 
@@ -63,10 +72,10 @@ Todas sob `/admin/v1`.
 
 ## Auditoria
 - Toda ação que muda algo grava uma linha em `audit_log` e uma entrada no log do servidor (`component=admin`) com o token usado (id e nome, nunca o valor), o alvo e o IP.
-- `action`: `admin.token.create` (só no terminal), `admin.token.revoke`, `admin.user.create`, `admin.user.password`, `admin.user.disable`, `admin.user.enable`, `admin.user.unlock`, `admin.user.delete`, `admin.session.revoke`, `admin.vault.delete`, `admin.federation.revoke`.
-- `payload`: `{"actor": "admin", "token_id", "token_name", ...alvo}`; nunca senha nem token. Ações do terminal têm `token_id` nulo e `token_name` `"cli"`. `ip` é o do cliente do painel (nulo no terminal).
+- `action`: `admin.token.create` (só no terminal), `admin.token.revoke`, `admin.user.create`, `admin.user.password`, `admin.user.disable`, `admin.user.enable`, `admin.user.unlock`, `admin.user.delete`, `admin.user.logout`, `admin.session.revoke`, `admin.invite.revoke`, `admin.vault.delete`, `admin.federation.revoke`.
+- `payload`: `{"actor": "admin", "token_id", "token_name", ...alvo}`; nunca senha nem token (`admin.invite.revoke` guarda só os 12 primeiros caracteres do id do convite e o `vault_slug`; `admin.user.logout`, o `username` e o número de sessões encerradas). Ações do terminal têm `token_id` nulo e `token_name` `"cli"`. `ip` é o do cliente do painel (nulo no terminal).
 - Quando o alvo é um usuário, a linha leva o id dele em `user_id` e o nome em `payload.username`: o apagamento LGPD dele anonimiza também essas linhas (inclusive o IP do admin nelas).
-- Mudanças feitas só pelo serviço de administração (senha, desativar, ativar, desbloquear, encerrar sessão, tokens, criar usuário) gravam a auditoria na mesma transação: se a linha não puder ser escrita, nada muda. Apagar usuário, apagar cofre e revogar federação passam pelos serviços de domínio: a linha é gravada antes e, se falhar, a ação não acontece; se a ação falhar depois, o log do servidor registra a falha. Esses serviços gravam ainda os seus próprios eventos (`user.delete`, `vault.delete`, `federation.revoke`).
+- Mudanças feitas só pelo serviço de administração (senha, desativar, ativar, desbloquear, encerrar sessão, encerrar todas as sessões, revogar convite, tokens, criar usuário) gravam a auditoria na mesma transação: se a linha não puder ser escrita, nada muda. Apagar usuário, apagar cofre e revogar federação passam pelos serviços de domínio: a linha é gravada antes e, se falhar, a ação não acontece; se a ação falhar depois, o log do servidor registra a falha. Esses serviços gravam ainda os seus próprios eventos (`user.delete`, `vault.delete`, `federation.revoke`).
 
 ## Terminal
 `lumi-server help` lista os comandos. `<user>` aceita nome ou id; `<vault>`, slug ou id. As listas aceitam `--json` (mesmos formatos da API, sem paginação). Senhas: `--password-stdin` lê uma linha do stdin; sem ele, pede duas vezes no terminal, sem eco. `user delete` e `vault delete` pedem para digitar o nome do alvo, ou `--yes` quando o stdin não é um terminal. O terminal só precisa do banco e de `LUMI_ROOT` (as mesmas variáveis do servidor); com o servidor rodando, o efeito no banco é imediato, mas streams do feed abertas fecham na próxima checagem (até 1 min), WebSockets de notas ficam até reconectar e um vínculo de federação já aberto continua até reconectar ou reiniciar — por isso, com o servidor no ar, prefira a API.

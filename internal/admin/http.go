@@ -11,9 +11,12 @@ import (
 	"math"
 	"mime"
 	"net/netip"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/recover"
@@ -104,13 +107,17 @@ func (h *HTTP) App() *fiber.App {
 	v1.Post("/users/:id/disable", h.userOp((*Service).Disable))
 	v1.Post("/users/:id/enable", h.userOp((*Service).Enable))
 	v1.Post("/users/:id/unlock", h.userOp((*Service).Unlock))
+	v1.Delete("/users/:id/sessions", h.endUserSessions)
 	v1.Get("/sessions", h.listSessions)
 	v1.Delete("/sessions/:id", h.revokeSession)
 	v1.Get("/vaults", h.listVaults)
 	v1.Get("/vaults/:id", h.getVault)
+	v1.Get("/vaults/:id/members", h.vaultMembers)
 	v1.Delete("/vaults/:id", h.deleteVault)
 	v1.Get("/federations", h.listFederations)
 	v1.Delete("/federations/:id", h.revokeFederation)
+	v1.Get("/invites", h.listInvites)
+	v1.Delete("/invites/:id", h.revokeInvite)
 	v1.Get("/tokens", h.listTokens)
 	v1.Delete("/tokens/:id", h.revokeToken)
 	v1.Get("/audit", h.audit)
@@ -406,6 +413,40 @@ func queryUUID(c *fiber.Ctx, name string) (*uuid.UUID, error) {
 	return &id, nil
 }
 
+const maxSearchLen = 64
+
+// querySearch reads ?q=: empty means no filter; otherwise 1 to 64
+// characters without control characters.
+func querySearch(c *fiber.Ctx) (string, error) {
+	q := strings.TrimSpace(c.Query("q"))
+	if q == "" {
+		return "", nil
+	}
+	if utf8.RuneCountInString(q) > maxSearchLen {
+		return "", badRequest(c, "q", fmt.Sprintf("must have 1 to %d characters", maxSearchLen))
+	}
+	for _, r := range q {
+		if unicode.IsControl(r) {
+			return "", badRequest(c, "q", "must not contain control characters")
+		}
+	}
+	return strings.Clone(q), nil
+}
+
+func queryTime(c *fiber.Ctx, name string) (*time.Time, error) {
+	raw := c.Query(name)
+	if raw == "" {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil, badRequest(c, name, "must be an RFC 3339 timestamp")
+	}
+	return &t, nil
+}
+
+var auditActionPattern = regexp.MustCompile(`^[a-z_]+(\.[a-z_]+)*(\.\*)?$`)
+
 // pathUUID: a malformed id is a 404, like an unknown one.
 func pathUUID(c *fiber.Ctx) (uuid.UUID, bool) {
 	id, err := uuid.Parse(c.Params("id"))
@@ -436,6 +477,8 @@ type UserJSON struct {
 	OwnedVaults   int         `json:"owned_vaults"`
 	Vaults        int         `json:"vaults"`
 	CreatedAt     string      `json:"created_at"`
+	LastLoginAt   *string     `json:"last_login_at"`
+	LastSeenAt    *string     `json:"last_seen_at"`
 	OwnedVaultIDs []uuid.UUID `json:"owned_vault_ids,omitempty"`
 }
 
@@ -445,6 +488,7 @@ func ToUserJSON(now time.Time) func(User) UserJSON {
 			ID: u.ID, Username: u.Username, DisplayName: u.DisplayName, State: u.State(now),
 			DisabledAt: tsPtr(u.DisabledAt), FailedLogins: u.FailedLogins, LockedUntil: tsPtr(u.LockedUntil),
 			Sessions: u.Sessions, OwnedVaults: u.OwnedVaults, Vaults: u.Vaults, CreatedAt: ts(u.CreatedAt),
+			LastLoginAt: tsPtr(u.LastLoginAt), LastSeenAt: tsPtr(u.LastSeenAt),
 		}
 	}
 }
@@ -483,12 +527,16 @@ type VaultJSON struct {
 	Notes            int           `json:"notes"`
 	CRDTBytes        int64         `json:"crdt_bytes"`
 	Federation       *VaultFedJSON `json:"federation"`
+	HeadSeq          int64         `json:"head_seq"`
+	LastChangeAt     *string       `json:"last_change_at"`
+	InvitesActive    int           `json:"invites_active"`
 	CreatedAt        string        `json:"created_at"`
 }
 
 func ToVaultJSON(v Vault) VaultJSON {
 	out := VaultJSON{ID: v.ID, Slug: v.Slug, Name: v.Name, Owner: RefJSON{ID: v.OwnerID, Username: v.OwnerUsername},
-		Members: v.Members, FederatedMembers: v.FederatedMembers, Notes: v.Notes, CRDTBytes: v.CRDTBytes, CreatedAt: ts(v.CreatedAt)}
+		Members: v.Members, FederatedMembers: v.FederatedMembers, Notes: v.Notes, CRDTBytes: v.CRDTBytes, CreatedAt: ts(v.CreatedAt),
+		HeadSeq: v.HeadSeq, LastChangeAt: tsPtr(v.LastChangeAt), InvitesActive: v.InvitesActive}
 	if v.FederationRole != nil {
 		out.Federation = &VaultFedJSON{Role: *v.FederationRole, ActiveLinks: v.ActiveFederations}
 	}
@@ -499,6 +547,55 @@ type VaultRefJSON struct {
 	ID   uuid.UUID `json:"id"`
 	Slug string    `json:"slug"`
 	Name string    `json:"name"`
+}
+
+type RoleRefJSON struct {
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
+}
+
+type MemberJSON struct {
+	User        RefJSON     `json:"user"`
+	DisplayName string      `json:"display_name"`
+	Role        RoleRefJSON `json:"role"`
+	Owner       bool        `json:"owner"`
+	JoinedAt    string      `json:"joined_at"`
+}
+
+func ToMemberJSON(m Member) MemberJSON {
+	return MemberJSON{User: RefJSON{ID: m.UserID, Username: m.Username}, DisplayName: m.DisplayName,
+		Role: RoleRefJSON{ID: m.RoleID, Name: m.RoleName}, Owner: m.Owner, JoinedAt: ts(m.JoinedAt)}
+}
+
+type RoleJSON struct {
+	ID      uuid.UUID `json:"id"`
+	Name    string    `json:"name"`
+	Seed    bool      `json:"seed"`
+	Members int       `json:"members"`
+}
+
+// InviteJSON never carries the token: id is its SHA-256.
+type InviteJSON struct {
+	ID        string       `json:"id"`
+	Vault     VaultRefJSON `json:"vault"`
+	Inviter   RefJSON      `json:"inviter"`
+	Role      RoleRefJSON  `json:"role"`
+	EmailHint *string      `json:"email_hint"`
+	MaxUses   int          `json:"max_uses"`
+	UseCount  int          `json:"use_count"`
+	State     string       `json:"state"`
+	ExpiresAt string       `json:"expires_at"`
+	CreatedAt string       `json:"created_at"`
+	RevokedAt *string      `json:"revoked_at"`
+}
+
+func ToInviteJSON(now time.Time) func(Invite) InviteJSON {
+	return func(i Invite) InviteJSON {
+		return InviteJSON{ID: i.ID, Vault: VaultRefJSON{ID: i.VaultID, Slug: i.VaultSlug, Name: i.VaultName},
+			Inviter: RefJSON{ID: i.InviterID, Username: i.InviterUsername}, Role: RoleRefJSON{ID: i.RoleID, Name: i.RoleName},
+			EmailHint: i.EmailHint, MaxUses: i.MaxUses, UseCount: i.UseCount, State: i.State(now),
+			ExpiresAt: ts(i.ExpiresAt), CreatedAt: ts(i.CreatedAt), RevokedAt: tsPtr(i.RevokedAt)}
+	}
 }
 
 type FederationJSON struct {
@@ -584,6 +681,14 @@ func (h *HTTP) status(c *fiber.Ctx) error {
 		"feed_connections":   feedN,
 		"ws_connections":     wsN,
 		"started_at":         ts(h.StartedAt),
+		"db_latency_ms":      float64(st.DBLatency.Microseconds()) / 1000,
+		"users_disabled":     st.UsersDisabled,
+		"users_locked":       st.UsersLocked,
+		"crdt_bytes":         st.CRDTBytes,
+		"logins_24h":         st.Logins24h,
+		"login_failures_24h": st.LoginFailures24h,
+		"invites_active":     st.InvitesActive,
+		"go_version":         st.GoVersion,
 		"token":              fiber.Map{"id": t.ID, "name": t.Name, "expires_at": ts(t.ExpiresAt)},
 	})
 }
@@ -597,7 +702,18 @@ func (h *HTTP) listUsers(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	list, more, err := h.Service.ListUsers(c.UserContext(), after, limit)
+	var f UserFilter
+	if f.Query, err = querySearch(c); err != nil {
+		return err
+	}
+	switch st := c.Query("state"); st {
+	case "":
+	case "active", "disabled", "locked":
+		f.State = strings.Clone(st)
+	default:
+		return badRequest(c, "state", "must be active, disabled or locked")
+	}
+	list, more, err := h.Service.SearchUsers(c.UserContext(), f, after, limit)
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -736,7 +852,11 @@ func (h *HTTP) listVaults(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	list, more, err := h.Service.ListVaults(c.UserContext(), user, after, limit)
+	q, err := querySearch(c)
+	if err != nil {
+		return err
+	}
+	list, more, err := h.Service.SearchVaults(c.UserContext(), VaultFilter{UserID: user, Query: q}, after, limit)
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -851,6 +971,25 @@ func (h *HTTP) audit(c *fiber.Ctx) error {
 	if q.VaultID, err = queryUUID(c, "vault"); err != nil {
 		return err
 	}
+	if raw := c.Query("action"); raw != "" {
+		if len(raw) > 64 || !auditActionPattern.MatchString(raw) {
+			return badRequest(c, "action", `must be an action like auth.login, or a prefix like auth.*`)
+		}
+		if strings.HasSuffix(raw, ".*") {
+			q.Action, q.ActionPrefix = strings.Clone(strings.TrimSuffix(raw, "*")), true
+		} else {
+			q.Action = strings.Clone(raw)
+		}
+	}
+	if q.Since, err = queryTime(c, "since"); err != nil {
+		return err
+	}
+	if q.Until, err = queryTime(c, "until"); err != nil {
+		return err
+	}
+	if q.Since != nil && q.Until != nil && !q.Until.After(*q.Since) {
+		return badRequest(c, "until", "must be after since")
+	}
 	list, more, err := h.Service.ListAudit(c.UserContext(), q)
 	if err != nil {
 		return h.fail(c, err)
@@ -865,4 +1004,72 @@ func (h *HTTP) audit(c *fiber.Ctx) error {
 		next = &n
 	}
 	return c.JSON(fiber.Map{"entries": out, "more": more, "next": next})
+}
+
+func (h *HTTP) endUserSessions(c *fiber.Ctx) error {
+	id, ok := pathUUID(c)
+	if !ok {
+		return errorJSON(c, fiber.StatusNotFound, "not_found", "")
+	}
+	n, err := h.Service.EndUserSessions(c.UserContext(), actorOf(c), id)
+	if err != nil {
+		return h.fail(c, err)
+	}
+	return c.JSON(fiber.Map{"revoked": n})
+}
+
+func (h *HTTP) vaultMembers(c *fiber.Ctx) error {
+	id, ok := pathUUID(c)
+	if !ok {
+		return errorJSON(c, fiber.StatusNotFound, "not_found", "")
+	}
+	members, roles, err := h.Service.VaultMembers(c.UserContext(), id)
+	if err != nil {
+		return h.fail(c, err)
+	}
+	outM := make([]MemberJSON, 0, len(members))
+	for _, m := range members {
+		outM = append(outM, ToMemberJSON(m))
+	}
+	outR := make([]RoleJSON, 0, len(roles))
+	for _, r := range roles {
+		outR = append(outR, RoleJSON{ID: r.ID, Name: r.Name, Seed: r.Seed, Members: r.Members})
+	}
+	return c.JSON(fiber.Map{"members": outM, "roles": outR})
+}
+
+func (h *HTTP) listInvites(c *fiber.Ctx) error {
+	limit, err := queryLimit(c, maxListLimit, maxListLimit)
+	if err != nil {
+		return err
+	}
+	vault, err := queryUUID(c, "vault")
+	if err != nil {
+		return err
+	}
+	f := InviteFilter{VaultID: vault}
+	switch c.Query("state") {
+	case "", "all":
+	case "active":
+		f.ActiveOnly = true
+	default:
+		return badRequest(c, "state", "must be active or all")
+	}
+	after, err := decodeCursor(c)
+	if err != nil {
+		return err
+	}
+	list, more, err := h.Service.ListInvites(c.UserContext(), f, after, limit)
+	if err != nil {
+		return h.fail(c, err)
+	}
+	return c.JSON(newPage(list, more, ToInviteJSON(time.Now()), func(i Invite) string { return encodeCursor(i.CreatedAt, i.ID) }))
+}
+
+// revokeInvite clones the id for the same reason as revokeSession.
+func (h *HTTP) revokeInvite(c *fiber.Ctx) error {
+	if err := h.Service.RevokeInvite(c.UserContext(), actorOf(c), strings.Clone(c.Params("id"))); err != nil {
+		return h.fail(c, err)
+	}
+	return c.SendStatus(fiber.StatusNoContent)
 }
