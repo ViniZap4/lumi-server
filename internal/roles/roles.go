@@ -68,7 +68,19 @@ type Service struct {
 
 	grants capguard.Resolver
 	vaults VaultLookup
+
+	feed AccessFeed
 }
+
+// AccessFeed hears that a vault's role capabilities changed, so the
+// account feed re-resolves every connected user's access (implemented by
+// *feed.Broker). Must not block.
+type AccessFeed interface {
+	VaultAccessChanged(vaultID uuid.UUID)
+}
+
+// SetFeed wires the account feed; nil disables.
+func (s *Service) SetFeed(f AccessFeed) { s.feed = f }
 
 // VaultLookup resolves the vault (for its owner) during the
 // no-escalation check. Implemented by *pg.VaultStore.
@@ -118,6 +130,9 @@ func (s *Service) SetControlNotifier(n ControlPlaneNotifier) { s.controlNotify =
 func (s *Service) notifyControl(vaultID uuid.UUID) {
 	if s.controlNotify != nil {
 		s.controlNotify.ControlChanged(vaultID)
+	}
+	if s.feed != nil {
+		s.feed.VaultAccessChanged(vaultID)
 	}
 }
 

@@ -55,6 +55,23 @@ type Service struct {
 	roles         RoleLookup
 	grants        capguard.Resolver
 	controlNotify ControlPlaneNotifier
+	feed          AccessFeed
+}
+
+// AccessFeed hears membership changes so the account feed re-resolves the
+// affected user's access (vault.access / vault.revoked). Implemented by
+// *feed.Broker; must not block.
+type AccessFeed interface {
+	AccessChanged(vaultID uuid.UUID, userIDs ...uuid.UUID)
+}
+
+// SetFeed wires the account feed; nil disables.
+func (s *Service) SetFeed(f AccessFeed) { s.feed = f }
+
+func (s *Service) feedAccess(vaultID, userID uuid.UUID) {
+	if s.feed != nil {
+		s.feed.AccessChanged(vaultID, userID)
+	}
 }
 
 func NewService(r Repo, a audit.Recorder) *Service {
@@ -160,6 +177,7 @@ func (s *Service) Add(ctx context.Context, m domain.Member, ip, ua string) error
 		"role_id":        m.RoleID.String(),
 	})
 	s.notifyControl(m.VaultID)
+	s.feedAccess(m.VaultID, m.UserID)
 	return nil
 }
 
@@ -226,6 +244,7 @@ func (s *Service) ChangeRole(
 		"role_id_new":    newRoleID.String(),
 	})
 	s.notifyControl(vaultID)
+	s.feedAccess(vaultID, userID)
 	return nil
 }
 
@@ -277,6 +296,7 @@ func (s *Service) Remove(
 		"member_user_id": userID.String(),
 	})
 	s.notifyControl(vaultID)
+	s.feedAccess(vaultID, userID)
 	return nil
 }
 

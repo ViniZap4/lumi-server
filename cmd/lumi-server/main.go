@@ -36,6 +36,7 @@ import (
 	"github.com/ViniZap4/lumi-server/internal/crdt"
 	"github.com/ViniZap4/lumi-server/internal/domain"
 	"github.com/ViniZap4/lumi-server/internal/federation"
+	"github.com/ViniZap4/lumi-server/internal/feed"
 	"github.com/ViniZap4/lumi-server/internal/fswatch"
 	"github.com/ViniZap4/lumi-server/internal/invites"
 	"github.com/ViniZap4/lumi-server/internal/members"
@@ -200,6 +201,7 @@ type config struct {
 	tosVersion         string
 	privacyVersion     string
 	publicBaseURL      string
+	serverName         string
 	logFormat          string
 	logLevel           string
 	autoMigrate        bool
@@ -220,6 +222,7 @@ func loadConfig() (config, error) {
 		tosVersion:     os.Getenv("LUMI_TOS_VERSION"),
 		privacyVersion: os.Getenv("LUMI_PRIVACY_VERSION"),
 		publicBaseURL:  os.Getenv("LUMI_PUBLIC_BASE_URL"),
+		serverName:     os.Getenv("LUMI_SERVER_NAME"),
 		logFormat:      envDefault("LUMI_LOG_FORMAT", "json"),
 		logLevel:       envDefault("LUMI_LOG_LEVEL", "info"),
 	}
@@ -404,7 +407,7 @@ func runServer() int {
 		return exitConfig
 	}
 
-	app, shutdown, err := buildApp(rootCtx, cfg, zlog, pool, fsMgr)
+	app, drain, shutdown, err := buildApp(rootCtx, cfg, zlog, pool, fsMgr)
 	if err != nil {
 		zlog.Error().Err(err).Msg("build app")
 		return exitDB
@@ -423,6 +426,7 @@ func runServer() int {
 	case err := <-listenErrCh:
 		if err != nil {
 			zlog.Error().Err(err).Msg("listener exited unexpectedly")
+			drain()
 			_ = shutdown(context.Background())
 			return exitListenFail
 		}
@@ -430,6 +434,9 @@ func runServer() int {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// End long-lived streams first (feed sends `reconnect`), or they hold
+	// graceful shutdown for the whole timeout.
+	drain()
 	if err := app.ShutdownWithContext(shutdownCtx); err != nil {
 		zlog.Warn().Err(err).Msg("fiber shutdown error")
 	}
@@ -444,7 +451,7 @@ func runServer() int {
 // shutdownFn closes whatever buildApp constructed.
 type shutdownFn func(context.Context) error
 
-func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpool.Pool, fsMgr *fs.Manager) (*fiber.App, shutdownFn, error) {
+func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpool.Pool, fsMgr *fs.Manager) (*fiber.App, func(), shutdownFn, error) {
 	// Stores.
 	userStore := pg.NewUserStore(pool)
 	sessionStore := pg.NewSessionStore(pool)
@@ -470,7 +477,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	}
 	authSvc, err := auth.NewService(authUserRepoAdapter{userStore}, sessionStore, consentStore, auditStore, authCfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("auth service: %w", err)
+		return nil, nil, nil, fmt.Errorf("auth service: %w", err)
 	}
 
 	// Bootstrap admin if env supplies credentials and DB is empty.
@@ -478,7 +485,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		Username: cfg.adminUsername,
 		Password: cfg.adminPassword,
 	}); err != nil {
-		return nil, nil, fmt.Errorf("auth bootstrap: %w", err)
+		return nil, nil, nil, fmt.Errorf("auth bootstrap: %w", err)
 	}
 
 	// Domain services.
@@ -498,15 +505,25 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	vaultsSvc := vaults.NewService(vaultStore, roleStore, memberStore, fsMgr, auditStore, fedResolver)
 	usersSvc := users.NewService(userStore, consentStore, auditStore, auditStore, vaultStore)
 	usersSvc.SetVaultDirRemover(fsMgr)
+
+	// Account feed (SPEC-LIVROS §3): one SSE stream per account, fed by
+	// every service that changes vaults, notes, memberships or sessions.
+	broker := feed.NewBroker(feed.DefaultConfig(), feed.VaultsDirectory{Source: vaultsSvc}, authSvc.Check, zlog)
+	authSvc.SetSessionListener(broker)
+	vaultsSvc.SetFeedDeps(noteStore, pg.NewFederationStore(pool), cfg.publicBaseURL, broker)
+	membersSvc.SetFeed(broker)
+	rolesSvc.SetFeed(broker)
+	usersSvc.SetFeed(broker)
 	// FS watcher. Handler is set below once the WS hub exists; the
 	// silencer side (SkipNext) is what notes.Service needs at this
 	// point, and that surface is available immediately.
 	fsWatcher, err := fswatch.New(fsMgr.Root, fsMgr, nil, zlog)
 	if err != nil {
-		return nil, nil, fmt.Errorf("fswatch: %w", err)
+		return nil, nil, nil, fmt.Errorf("fswatch: %w", err)
 	}
 
 	notesSvc := notes.NewService(noteStore, vaultStore, fsMgr, auditStore, fedResolver, crdtRegistry, fsWatcher)
+	notesSvc.SetHeadPublisher(broker)
 	wsHub := wsync.NewHub(crdtRegistry,
 		wsync.WithFSMirror(notesSvc.WriteBodyFromCRDT),
 		// Feed seq: committed content changes bump the vault head at most
@@ -538,7 +555,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		Operators:   federation.NewUsernameOperators(userStore, cfg.federationOperators),
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("federation service: %w", err)
+		return nil, nil, nil, fmt.Errorf("federation service: %w", err)
 	}
 	// F2 content relay: live sessions registry + follower dial loops. The
 	// registry persist hook is the fan-out point for every write path;
@@ -573,6 +590,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		Pusher:     relayLinks,
 	})
 	federationSvc.SetVaultRenamer(vaultsSvc)
+	federationSvc.SetFeed(broker)
 	fedResolver.Bind(federationSvc)
 	membersSvc.SetControlNotifier(federationSvc)
 	rolesSvc.SetControlNotifier(federationSvc)
@@ -596,6 +614,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		Audit:         auditStore,
 		Resolver:      fedResolver,
 		PublicBaseURL: cfg.publicBaseURL,
+		Feed:          broker,
 	})
 
 	// Fiber app. BodyLimit is set to 4 MiB to accommodate note bodies;
@@ -634,6 +653,15 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		// login/register with per-route Required guards.
 		[]func(fiber.Router){
 			auth.NewHandlers(authSvc).Register,
+			func(r fiber.Router) {
+				r.Get("/api/info", infoHandler(serverInfo{
+					Name:         serverDisplayName(cfg),
+					Version:      Version,
+					Protocol:     feed.Protocol,
+					PublicKey:    federationSvc.PublicKeyHex(),
+					Registration: cfg.registration,
+				}))
+			},
 			invites.NewHandlers(invitesSvc).RegisterPublic,
 			federation.NewHandlers(federationSvc, fedResolver).RegisterPublic,
 			federation.NewRelayHandlers(federationSvc, relayLinks, zlog).Register,
@@ -660,6 +688,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 			members.NewHandlers(membersSvc, fedResolver).Register,
 			audit.NewHandlers(auditStore, fedResolver).Register,
 			notes.NewHandlers(notesSvc).Register,
+			feed.NewHandler(broker).Register,
 			func(r fiber.Router) { invites.NewHandlers(invitesSvc).RegisterAuthed(r, fedResolver) },
 			federation.NewHandlers(federationSvc, fedResolver).RegisterAuthed,
 		},
@@ -671,7 +700,37 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		wsHub.Close()
 		return nil
 	}
-	return app, shutdown, nil
+	return app, broker.Close, shutdown, nil
+}
+
+// serverInfo is the public GET /api/info payload (SPEC-LIVROS §3.5):
+// clients use it when adding a server and to detect two URLs that are the
+// same server (same public_key).
+type serverInfo struct {
+	Name         string `json:"name"`
+	Version      string `json:"version"`
+	Protocol     int    `json:"protocol"`
+	PublicKey    string `json:"public_key"` // hex Ed25519, as /api/federation/identity
+	Registration string `json:"registration"`
+}
+
+func infoHandler(info serverInfo) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		c.Set(fiber.HeaderCacheControl, "no-cache")
+		return c.JSON(info)
+	}
+}
+
+// serverDisplayName: LUMI_SERVER_NAME, else the public base URL's host,
+// else "lumi".
+func serverDisplayName(cfg config) string {
+	if cfg.serverName != "" {
+		return cfg.serverName
+	}
+	if u, err := url.Parse(cfg.publicBaseURL); err == nil && u.Host != "" {
+		return u.Hostname()
+	}
+	return "lumi"
 }
 
 // Tombstone retention (SPEC-LIVROS §3.4): pruned after 30 days; the prune
@@ -794,7 +853,7 @@ func corsMiddleware(allowed []string) fiber.Handler {
 				c.Set("Access-Control-Allow-Origin", origin)
 				c.Set("Vary", "Origin")
 				c.Set("Access-Control-Allow-Credentials", "true")
-				c.Set("Access-Control-Expose-Headers", "X-Request-ID")
+				c.Set("Access-Control-Expose-Headers", "X-Request-ID, Retry-After")
 			}
 		}
 		if c.Method() == fiber.MethodOptions {

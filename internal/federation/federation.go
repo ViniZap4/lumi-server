@@ -131,7 +131,30 @@ type Service struct {
 	renamer       VaultRenamer
 	resolverCache *resolverCache
 	controlLocks  sync.Map // vaultID -> *sync.Mutex (RebuildControlState)
+
+	feed Feed
 }
+
+// Feed is the account-feed surface the federation layer publishes to
+// (implemented by *feed.Broker). Must not block.
+type Feed interface {
+	VaultUpdated(vaultID uuid.UUID, fields ...string)
+	VaultAccessChanged(vaultID uuid.UUID)
+}
+
+// SetFeed wires the account feed; nil disables.
+func (s *Service) SetFeed(f Feed) { s.feed = f }
+
+func (s *Service) feedFederationChanged(vaultID uuid.UUID) {
+	if s.feed != nil {
+		s.feed.VaultUpdated(vaultID, "federation")
+	}
+}
+
+// PublicKeyHex is this server's Ed25519 public key, hex-encoded (the same
+// encoding as GET /api/federation/identity). Available without a public
+// base URL, for GET /api/info.
+func (s *Service) PublicKeyHex() string { return hex.EncodeToString(s.pub) }
 
 type Deps struct {
 	Keys        KeyStore
@@ -360,6 +383,7 @@ func (s *Service) Accept(ctx context.Context, req AcceptRequest) (AcceptResponse
 	}); err != nil {
 		return AcceptResponse{}, err
 	}
+	s.feedFederationChanged(v.ID)
 
 	s.recordAudit(ctx, nil, v.ID, domain.ActionFederationAccept, "", "", map[string]any{
 		"role":         "home",
@@ -466,6 +490,7 @@ func (s *Service) Join(ctx context.Context, in JoinInput) (domain.Vault, domain.
 	if err != nil {
 		return domain.Vault{}, domain.Federation{}, err
 	}
+	s.feedFederationChanged(replica.ID)
 
 	// Kick the F2 relay so content starts flowing without a restart.
 	if s.relay != nil {
@@ -516,6 +541,17 @@ func (s *Service) RevokeFederation(ctx context.Context, vaultID, fedID, actor uu
 	}
 	if s.relay != nil {
 		s.relay.StopLink(vaultID, f.PeerURL)
+	}
+	s.feedFederationChanged(vaultID)
+	if f.Role == "follower" {
+		// Authorization falls back from home's control state to local
+		// membership once the follower link is gone.
+		if s.resolverCache != nil {
+			s.resolverCache.invalidate(vaultID)
+		}
+		if s.feed != nil {
+			s.feed.VaultAccessChanged(vaultID)
+		}
 	}
 	s.recordAudit(ctx, &actor, vaultID, domain.ActionFederationRevoke, ip, ua, map[string]any{
 		"kind":     "federation",

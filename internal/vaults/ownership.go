@@ -91,6 +91,10 @@ func (s *Service) TransferOwnership(ctx context.Context, vaultID, newOwner, acto
 		"owner_new": newOwner,
 	})
 	v.OwnerUserID = newOwner
+	s.feedUpdated(vaultID, "owner")
+	if member.RoleID != adminRole.ID {
+		s.feedAccess(vaultID, newOwner) // promoted to Admin
+	}
 	return v, nil
 }
 
@@ -183,7 +187,9 @@ func (s *Service) createForCopy(ctx context.Context, src domain.Vault, recipient
 // rollbackCopy undoes a partially-forked vault. Best-effort: the DB row is
 // authoritative, the dir removal mirrors vaults.Service.Delete semantics.
 func (s *Service) rollbackCopy(ctx context.Context, dst domain.Vault) {
-	_ = s.repo.Delete(ctx, dst.ID)
+	if s.repo.Delete(ctx, dst.ID) == nil {
+		s.feedDeleted(dst.ID)
+	}
 	_ = s.fs.RemoveVaultDir(dst.Slug)
 }
 

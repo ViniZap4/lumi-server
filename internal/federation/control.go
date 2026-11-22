@@ -322,6 +322,11 @@ func (s *Service) ApplyControlState(ctx context.Context, vaultID uuid.UUID, peer
 	if s.resolverCache != nil {
 		s.resolverCache.invalidate(vaultID)
 	}
+	// Members/roles may have changed for local users: the feed diffs each
+	// connected user's access and emits vault.access / vault.revoked.
+	if s.feed != nil {
+		s.feed.VaultAccessChanged(vaultID)
+	}
 	return doc.Seq, nil
 }
 

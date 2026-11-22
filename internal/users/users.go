@@ -73,8 +73,20 @@ type Service struct {
 	vaultDirs     VaultDirRemover
 	controlNotify ControlPlaneNotifier
 	federations   FederationLister
+	feed          ErasureFeed
 	now           func() time.Time
 }
+
+// ErasureFeed hears LGPD erasure so the account feed ends the user's
+// streams and revokes force-deleted vaults for their other members
+// (implemented by *feed.Broker). Must not block.
+type ErasureFeed interface {
+	UserSessionsEnded(userID uuid.UUID, reason string)
+	VaultDeleted(vaultID uuid.UUID)
+}
+
+// SetFeed wires the account feed; nil disables.
+func (s *Service) SetFeed(f ErasureFeed) { s.feed = f }
 
 func NewService(repo Repo, consents ConsentReader, auditR AuditReader, recorder audit.Recorder, vaults VaultLister) *Service {
 	if repo == nil || consents == nil || auditR == nil || recorder == nil || vaults == nil {
@@ -186,6 +198,14 @@ func (s *Service) Delete(ctx context.Context, id uuid.UUID, forceVaults bool, ip
 
 	if err := s.repo.Delete(ctx, id, forceVaults); err != nil {
 		return err
+	}
+	if s.feed != nil {
+		s.feed.UserSessionsEnded(id, "deleted")
+		if forceVaults {
+			for _, v := range owned {
+				s.feed.VaultDeleted(v.ID)
+			}
+		}
 	}
 	// Rows are gone; remove the on-disk directories of the force-deleted
 	// owned vaults. Failures are non-fatal (the DB is authoritative and

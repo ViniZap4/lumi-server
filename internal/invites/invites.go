@@ -111,6 +111,7 @@ type Service struct {
 	grants        capguard.Resolver
 	publicBaseURL string
 	now           func() time.Time
+	feed          AccessFeed
 }
 
 type Deps struct {
@@ -129,6 +130,14 @@ type Deps struct {
 	Resolver      capguard.Resolver
 	PublicBaseURL string
 	Now           func() time.Time
+	// Feed hears joins for the account feed (vault.access on the
+	// joiner's other devices). nil disables.
+	Feed AccessFeed
+}
+
+// AccessFeed is implemented by *feed.Broker; must not block.
+type AccessFeed interface {
+	AccessChanged(vaultID uuid.UUID, userIDs ...uuid.UUID)
 }
 
 func NewService(d Deps) *Service {
@@ -159,6 +168,13 @@ func NewService(d Deps) *Service {
 		grants:        d.Resolver,
 		publicBaseURL: strings.TrimRight(d.PublicBaseURL, "/"),
 		now:           now,
+		feed:          d.Feed,
+	}
+}
+
+func (s *Service) feedJoined(vaultID, userID uuid.UUID) {
+	if s.feed != nil {
+		s.feed.AccessChanged(vaultID, userID)
 	}
 }
 
@@ -346,6 +362,7 @@ func (s *Service) AcceptWithSignup(ctx context.Context, in AcceptSignupInput) (d
 	s.recordAudit(ctx, domain.ActionConsentAccept, &user.ID, nil, in.IP, in.UA, map[string]any{"tos_version": consent.TosVersion, "privacy_version": consent.PrivacyVersion})
 	s.recordAudit(ctx, domain.ActionMemberAdd, &user.ID, &inv.VaultID, in.IP, in.UA, map[string]any{"role_id": inv.RoleID.String(), "via": "invite"})
 	s.recordAudit(ctx, domain.ActionInviteAccept, &user.ID, &inv.VaultID, in.IP, in.UA, map[string]any{"signup": true})
+	s.feedJoined(inv.VaultID, user.ID)
 	return session, nil
 }
 
@@ -385,6 +402,7 @@ func (s *Service) AcceptAsExistingUser(ctx context.Context, in AcceptExistingInp
 	}
 	s.recordAudit(ctx, domain.ActionMemberAdd, &in.UserID, &inv.VaultID, in.IP, in.UA, map[string]any{"role_id": inv.RoleID.String(), "via": "invite"})
 	s.recordAudit(ctx, domain.ActionInviteAccept, &in.UserID, &inv.VaultID, in.IP, in.UA, map[string]any{"signup": false})
+	s.feedJoined(inv.VaultID, in.UserID)
 	return nil
 }
 

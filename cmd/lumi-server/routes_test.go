@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bufio"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/recover"
@@ -110,5 +114,96 @@ func TestRegisterRoutes_SyncRouteBypassesAuthMiddleware(t *testing.T) {
 	}
 	if resp.StatusCode != fiber.StatusUpgradeRequired || authCalls != 0 {
 		t.Fatalf("status=%d authCalls=%d, want 426 without auth middleware", resp.StatusCode, authCalls)
+	}
+}
+
+// GET /api/info is public (used before any account exists); GET
+// /api/events sits behind the auth middleware.
+func TestRegisterRoutes_InfoPublicEventsAuthed(t *testing.T) {
+	app := fiber.New()
+	authCalls := 0
+	requireAuth := func(c *fiber.Ctx) error {
+		authCalls++
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	info := serverInfo{Name: "lumi.work.com", Version: "1.2.3", Protocol: 1, PublicKey: "ab12", Registration: "invite-only"}
+	registerRoutes(app, requireAuth,
+		[]func(fiber.Router){func(r fiber.Router) { r.Get("/api/info", infoHandler(info)) }},
+		[]func(fiber.Router){func(r fiber.Router) { r.Get("/events", func(c *fiber.Ctx) error { return nil }) }},
+	)
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/api/info", nil), -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	want := `{"name":"lumi.work.com","version":"1.2.3","protocol":1,"public_key":"ab12","registration":"invite-only"}`
+	if resp.StatusCode != fiber.StatusOK || authCalls != 0 || string(body) != want {
+		t.Fatalf("info: status=%d authCalls=%d body=%s", resp.StatusCode, authCalls, body)
+	}
+	resp, err = app.Test(httptest.NewRequest(http.MethodGet, "/api/events?token=whatever", nil), -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != fiber.StatusUnauthorized || authCalls != 1 {
+		t.Fatalf("events: status=%d authCalls=%d, want 401 via auth", resp.StatusCode, authCalls)
+	}
+}
+
+func TestServerDisplayName(t *testing.T) {
+	cases := []struct {
+		cfg  config
+		want string
+	}{
+		{config{serverName: "Trabalho", publicBaseURL: "https://x.com"}, "Trabalho"},
+		{config{publicBaseURL: "https://lumi.work.com:8443/base"}, "lumi.work.com"},
+		{config{}, "lumi"},
+	}
+	for _, c := range cases {
+		if got := serverDisplayName(c.cfg); got != c.want {
+			t.Errorf("serverDisplayName(%+v) = %q, want %q", c.cfg, got, c.want)
+		}
+	}
+}
+
+// The access log must not drain a streamed (SSE) body: the first chunk
+// has to reach the client while the stream is still open.
+func TestAccessLog_DoesNotDrainStream(t *testing.T) {
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app.Use(accessLog(zerolog.Nop()))
+	release := make(chan struct{})
+	defer close(release)
+	app.Get("/s", func(c *fiber.Ctx) error {
+		c.Context().SetBodyStreamWriter(func(w *bufio.Writer) {
+			_, _ = w.WriteString("data: 1\n\n")
+			_ = w.Flush()
+			<-release // the stream stays open
+		})
+		return nil
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = app.Listener(ln) }()
+	defer func() { _ = app.ShutdownWithTimeout(time.Second) }()
+
+	got := make(chan string, 1)
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/s")
+		if err != nil {
+			got <- err.Error()
+			return
+		}
+		defer resp.Body.Close()
+		line, _ := bufio.NewReader(resp.Body).ReadString('\n')
+		got <- line
+	}()
+	select {
+	case line := <-got:
+		if line != "data: 1\n" {
+			t.Fatalf("first line %q", line)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first chunk never arrived: middleware is draining the stream")
 	}
 }

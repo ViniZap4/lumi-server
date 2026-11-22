@@ -73,6 +73,12 @@ type Service struct {
 
 	// F3 control plane; nil disables.
 	controlNotify ControlPlaneNotifier
+
+	// Account feed (SetFeedDeps); all nil-safe.
+	heads   HeadReader
+	feds    FederationLister
+	baseURL string
+	feed    FeedNotifier
 }
 
 func NewService(
@@ -315,6 +321,8 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (domain.Vault, err
 		"slug":     created.Slug,
 		"name":     created.Name,
 	})
+	// The creator's other devices learn about the new vault.
+	s.feedAccess(created.ID, in.CreatedBy)
 	return created, nil
 }
 
@@ -326,6 +334,7 @@ func (s *Service) Delete(ctx context.Context, vaultID, actor uuid.UUID, ip, ua s
 	if err := s.repo.Delete(ctx, vaultID); err != nil {
 		return err
 	}
+	s.feedDeleted(vaultID)
 	_ = s.fs.RemoveVaultDir(v.Slug)
 	s.recordAudit(ctx, actor, v.ID, domain.ActionVaultDelete, ip, ua, map[string]any{
 		"vault_id": v.ID,
@@ -342,6 +351,8 @@ func (s *Service) UpdateName(ctx context.Context, vaultID uuid.UUID, newName str
 	if err := s.repo.UpdateName(ctx, vaultID, name); err != nil {
 		return err
 	}
+	// Also for control-applied renames on a follower (actor == Nil).
+	s.feedUpdated(vaultID, "name")
 	s.recordAudit(ctx, actor, vaultID, domain.ActionVaultUpdate, ip, ua, map[string]any{
 		"vault_id": vaultID,
 		"name":     name,
@@ -453,18 +464,39 @@ func userFromCtx(c *fiber.Ctx) (*domain.User, error) {
 	return u, nil
 }
 
+// vaultViewDTO is vaultDTO plus the caller's standing (SPEC-LIVROS §3.5):
+// head = this server's seq for the vault, role/can_edit = the caller's
+// role, federation = how this server relates to the vault's origin.
+type vaultViewDTO struct {
+	vaultDTO
+	Head       int64          `json:"head"`
+	Role       string         `json:"role"`
+	CanEdit    bool           `json:"can_edit"`
+	Federation FederationInfo `json:"federation"`
+}
+
+func toViewDTO(v View) vaultViewDTO {
+	return vaultViewDTO{
+		vaultDTO:   toDTO(v.Vault),
+		Head:       v.Head,
+		Role:       v.Role.Name,
+		CanEdit:    v.CanEdit(),
+		Federation: v.Federation,
+	}
+}
+
 func (h *Handlers) list(c *fiber.Ctx) error {
 	u, err := userFromCtx(c)
 	if err != nil {
 		return mapErr(c, err)
 	}
-	vs, err := h.svc.ListForUser(c.UserContext(), u.ID)
+	vs, err := h.svc.ListViews(c.UserContext(), u.ID)
 	if err != nil {
 		return mapErr(c, err)
 	}
-	out := make([]vaultDTO, 0, len(vs))
+	out := make([]vaultViewDTO, 0, len(vs))
 	for _, v := range vs {
-		out = append(out, toDTO(v))
+		out = append(out, toViewDTO(v))
 	}
 	return c.JSON(fiber.Map{"vaults": out})
 }
@@ -513,17 +545,11 @@ func (h *Handlers) detail(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid_vault_id"})
 	}
-	if _, err := h.svc.resolver.RoleForUser(c.UserContext(), vaultID, u.ID); err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "not_found"})
-		}
-		return mapErr(c, err)
-	}
-	v, err := h.svc.Get(c.UserContext(), vaultID)
+	v, err := h.svc.GetView(c.UserContext(), u.ID, vaultID)
 	if err != nil {
 		return mapErr(c, err)
 	}
-	return c.JSON(toDTO(v))
+	return c.JSON(toViewDTO(v))
 }
 
 type updateReq struct {
@@ -546,11 +572,11 @@ func (h *Handlers) update(c *fiber.Ctx) error {
 	if err := h.svc.UpdateName(c.UserContext(), vaultID, req.Name, u.ID, c.IP(), string(c.Request().Header.UserAgent())); err != nil {
 		return mapErr(c, err)
 	}
-	v, err := h.svc.Get(c.UserContext(), vaultID)
+	v, err := h.svc.GetView(c.UserContext(), u.ID, vaultID)
 	if err != nil {
 		return mapErr(c, err)
 	}
-	return c.JSON(toDTO(v))
+	return c.JSON(toViewDTO(v))
 }
 
 func (h *Handlers) delete(c *fiber.Ctx) error {
