@@ -7,8 +7,8 @@
 #      depends on third_party/y-crdt, so Docker reuses it when only Go code
 #      changes. (Replaces `curl sh.rustup.rs | sh` with a floating "stable".)
 #   2. `builder` stage: Go links the static lib (same steps as `make libyrs`).
-#   3. Runtime: distroless/base (glibc; distroless/static cannot load a cgo
-#      binary), pinned by digest. Ships migrations/ (LUMI_MIGRATIONS_DIR) so
+#   3. Runtime: distroless/cc (glibc + libgcc_s: libyrs is Rust and needs
+#      libgcc_s.so.1 for unwinding; distroless/base lacks it), pinned by digest. Ships migrations/ (LUMI_MIGRATIONS_DIR) so
 #      LUMI_AUTO_MIGRATE=true and `lumi-server migrate up` work in the
 #      container, and /vaults owned by nonroot (65532) so a fresh named
 #      volume inherits a writable owner.
@@ -53,8 +53,8 @@ RUN CGO_ENABLED=1 go build \
     && mkdir -p /out/vaults
 
 # ---- Runtime ---------------------------------------------------------------
-# distroless/base-debian12:nonroot as of 2026-11-22.
-FROM gcr.io/distroless/base-debian12:nonroot@sha256:7f0c72cd138b442ae0deeb69c08b1acf5525439ba251a49ad93c320a061567e5
+# distroless/cc-debian12:nonroot as of 2026-11-22.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 COPY --from=builder /out/lumi-server /lumi-server
 COPY --from=builder /src/migrations /migrations
 COPY --from=builder --chown=65532:65532 /out/vaults /vaults
