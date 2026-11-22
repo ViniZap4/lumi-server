@@ -637,6 +637,11 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		IdleTimeout:           120 * time.Second,
 		DisableStartupMessage: true,
 		Prefork:               false,
+		// Immutable: c.Params/Query/Get return copies instead of views into
+		// fasthttp's reusable request buffer. A ticket once got bound to the
+		// wrong note because a retained Params string was overwritten by a
+		// later request; this closes that class of bug for every handler.
+		Immutable: true,
 	})
 
 	app.Use(requestid.New())

@@ -83,6 +83,7 @@ func (h *HTTP) App() *fiber.App {
 		IdleTimeout:           IdleTimeout,
 		DisableStartupMessage: true,
 		ErrorHandler:          h.errorHandler,
+		Immutable:             true, // copies instead of views into fasthttp buffers
 	})
 	app.Use(requestid.New())
 	app.Use(recover.New())
