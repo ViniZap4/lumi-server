@@ -274,12 +274,17 @@ func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput)
 		return domain.Note{}, err
 	}
 
-	// Seed the CRDT shadow so future /diff and /snapshot calls have a
-	// base state. Best-effort: a CRDT init failure does NOT fail the
-	// create — the FS+pg side is already committed and the registry can
-	// lazily fill in on the next write.
+	// Seed the CRDT so live sync, /snapshot and /diff have a base state.
+	// This server is the note's home, so it is the single seeder (§10 S5).
+	// A failure rolls the create back: leaving a note whose CRDT is
+	// unseeded would let the first live edit race lazy init.
 	if s.crdt != nil {
-		_ = s.crdt.InitFromText(ctx, vaultID, id, in.Body, in.Actor, "snapshot-init")
+		if err := s.crdt.InitFromText(ctx, vaultID, id, in.Body, in.Actor, "snapshot-init"); err != nil {
+			_ = s.notes.Delete(ctx, vaultID, id)
+			s.suppressFSEvent(v.Slug, relPath)
+			_ = s.fs.DeleteNote(v.Slug, relPath)
+			return domain.Note{}, fmt.Errorf("seed crdt: %w", err)
+		}
 	}
 	// InitFromText bypasses PersistChange, so federated peers need an
 	// explicit nudge for brand-new notes (v3 F2).

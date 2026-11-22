@@ -301,6 +301,19 @@ func TestLazyInitForLegacyNote(t *testing.T) {
 	}
 }
 
+// S4: Create must not swallow a CRDT seeding failure.
+func TestCreateRollsBackWhenSeedingFails(t *testing.T) {
+	f := newCRDTFixture(t)
+	f.yjs.upsertErr = errors.New("db down")
+	n, err := f.svc.Create(context.Background(), f.vault.ID, CreateInput{Title: "Doomed", Body: "x"})
+	if err == nil {
+		t.Fatalf("Create succeeded despite seeding failure: %+v", n)
+	}
+	if _, _, err := f.fsm.ReadNote(f.vault.Slug, "doomed.md"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("file left behind after failed create: %v", err)
+	}
+}
+
 func TestMapCRDTErr_Conflicts(t *testing.T) {
 	app := fiber.New()
 	app.Get("/:k", func(c *fiber.Ctx) error {
