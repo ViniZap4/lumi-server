@@ -3,7 +3,9 @@ package notes
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"sync"
 	"testing"
@@ -365,5 +367,62 @@ func TestApplyDiff_ReturnsStateAsNextBase(t *testing.T) {
 	up, err := f.svc.ApplyUpdate(ctx, f.vault.ID, n.ID, nil, "tui", uuid.Nil, "", "")
 	if err != nil || len(up.State) == 0 {
 		t.Fatalf("ApplyUpdate state: len=%d err=%v", len(up.State), err)
+	}
+}
+
+// An unreconstructable base is base_too_old; a foreign-but-valid base
+// stays base_mismatch.
+func TestApplyDiff_BaseTooOldDistinct(t *testing.T) {
+	f := newCRDTFixture(t)
+	ctx := context.Background()
+	n, err := f.svc.Create(ctx, f.vault.ID, CreateInput{Title: "Note", Body: "abc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An update that depends on history it does not carry: the second
+	// edit of a doc without the first.
+	src := crdt.NewDoc()
+	defer src.Close()
+	_, _ = src.ApplyTextDiff("hello", "x")
+	sv, _ := src.StateVectorV1()
+	_, _ = src.ApplyTextDiff("hello world", "x")
+	tail, _ := src.EncodeDiffSince(sv)
+	_, err = f.svc.ApplyDiff(ctx, f.vault.ID, n.ID, DiffInput{Text: "zzz", BaseState: tail}, "tui", uuid.Nil, "", "")
+	if !errors.Is(err, crdt.ErrBaseUnreconstructable) || !errors.Is(err, crdt.ErrBaseMismatch) {
+		t.Fatalf("incomplete base: got %v, want ErrBaseUnreconstructable (wrapping ErrBaseMismatch)", err)
+	}
+
+	foreign := crdt.NewDoc()
+	defer foreign.Close()
+	_, _ = foreign.ApplyTextDiff("something else", "x")
+	st, _ := foreign.EncodeStateAsUpdate()
+	_, err = f.svc.ApplyDiff(ctx, f.vault.ID, n.ID, DiffInput{Text: "zzz", BaseState: st}, "tui", uuid.Nil, "", "")
+	if !errors.Is(err, crdt.ErrBaseMismatch) || errors.Is(err, crdt.ErrBaseUnreconstructable) {
+		t.Fatalf("foreign base: got %v, want plain ErrBaseMismatch", err)
+	}
+}
+
+func TestMapCRDTErr_Codes(t *testing.T) {
+	app := fiber.New()
+	app.Get("/:kind", func(c *fiber.Ctx) error {
+		switch c.Params("kind") {
+		case "old":
+			return mapCRDTErr(c, fmt.Errorf("x: %w", crdt.ErrBaseUnreconstructable))
+		case "mismatch":
+			return mapCRDTErr(c, crdt.ErrBaseMismatch)
+		default:
+			return mapCRDTErr(c, errBaseRequired)
+		}
+	})
+	for kind, want := range map[string]string{"old": "base_too_old", "mismatch": "base_mismatch", "required": "base_required"} {
+		resp, err := app.Test(httptest.NewRequest("GET", "/"+kind, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		if resp.StatusCode != 409 || body["error"] != want {
+			t.Errorf("%s: %d %v, want 409 %s", kind, resp.StatusCode, body["error"], want)
+		}
 	}
 }

@@ -13,6 +13,13 @@ type StateVector map[uint64]uint64
 // from, or when a base-conditioned write finds that the document moved on.
 var ErrBaseMismatch = errors.New("crdt: base does not match document")
 
+// ErrBaseUnreconstructable is returned when a client-supplied base state
+// cannot be rebuilt into a document at all (undecodable, or depends on
+// history it does not carry) — typically a base kept from too long ago or
+// truncated. It wraps ErrBaseMismatch so existing errors.Is checks hold;
+// the REST layer reports it as 409 base_too_old.
+var ErrBaseUnreconstructable = fmt.Errorf("%w: base state cannot be reconstructed", ErrBaseMismatch)
+
 // DecodeStateVector parses a lib0-v1 encoded state vector:
 //
 //	varUint(n) · n × (varUint(clientID) · varUint(clock))

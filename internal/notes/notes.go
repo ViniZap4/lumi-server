@@ -1338,7 +1338,8 @@ func decodeB64Field(c *fiber.Ctx, name, raw string) ([]byte, bool) {
 //     With neither: 409 {"error":"base_required"} (no more LWW).
 //
 // Errors: 409 base_required (no/stale base), 409 base_mismatch
-// (base_state is not an ancestor of the server's state).
+// (base_state is not an ancestor of the server's state), 409 base_too_old
+// (base_state cannot be reconstructed at all — refetch /snapshot).
 // Success: { id, path, text, vector_clock, state } — state (base64 full
 // lib0-v1 doc, as GET /snapshot) is the client's next base_state.
 func (h *Handlers) applyDiff(c *fiber.Ctx) error {
@@ -1417,6 +1418,11 @@ func mapCRDTErr(c *fiber.Ctx, err error) error {
 		return c.Status(http.StatusConflict).JSON(fiber.Map{
 			"error":  "base_required",
 			"detail": "send base_state (from GET /snapshot `state`) so the server can merge instead of overwrite",
+		})
+	case errors.Is(err, crdt.ErrBaseUnreconstructable):
+		return c.Status(http.StatusConflict).JSON(fiber.Map{
+			"error":  "base_too_old",
+			"detail": "base_state cannot be reconstructed; refetch GET /snapshot and redo the edit on it",
 		})
 	case errors.Is(err, crdt.ErrBaseMismatch):
 		return c.Status(http.StatusConflict).JSON(fiber.Map{"error": "base_mismatch", "detail": err.Error()})

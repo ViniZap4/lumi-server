@@ -23,17 +23,18 @@ type ThreeWayResult struct {
 // V10) instead of being overwritten (V9a).
 //
 // baseState must be self-contained: a state with unresolved dependencies
-// cannot be rebuilt into text and yields ErrBaseMismatch.
+// cannot be rebuilt into text and yields ErrBaseUnreconstructable (which
+// wraps ErrBaseMismatch).
 func ThreeWayUpdate(baseState []byte, newText string) (ThreeWayResult, error) {
 	tmp, err := LoadDoc(baseState)
 	if err != nil {
-		return ThreeWayResult{}, fmt.Errorf("%w: %v", ErrBaseMismatch, err)
+		return ThreeWayResult{}, fmt.Errorf("%w: %v", ErrBaseUnreconstructable, err)
 	}
 	defer tmp.Close()
 	if pending, err := tmp.HasPending(); err != nil {
 		return ThreeWayResult{}, err
 	} else if pending {
-		return ThreeWayResult{}, fmt.Errorf("%w: base state is incomplete", ErrBaseMismatch)
+		return ThreeWayResult{}, fmt.Errorf("%w: base state is incomplete", ErrBaseUnreconstructable)
 	}
 	baseText, err := tmp.Text()
 	if err != nil {
