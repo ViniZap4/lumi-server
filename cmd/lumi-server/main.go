@@ -781,11 +781,17 @@ func accessLog(zlog zerolog.Logger) fiber.Handler {
 		if err != nil {
 			evt = zlog.Warn().Err(err)
 		}
+		// Response.Body() drains a body stream (SSE): only count bytes
+		// of buffered responses.
+		bytes := -1
+		if !c.Response().IsBodyStream() {
+			bytes = len(c.Response().Body())
+		}
 		evt.
 			Str("method", c.Method()).
 			Str("path", c.Path()).
 			Int("status", c.Response().StatusCode()).
-			Int("bytes", len(c.Response().Body())).
+			Int("bytes", bytes).
 			Dur("duration", time.Since(start)).
 			Str("ip", c.IP()).
 			Str("request_id", c.Get("X-Request-ID")).
