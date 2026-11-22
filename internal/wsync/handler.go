@@ -10,6 +10,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/websocket/v2"
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 
 	"github.com/ViniZap4/lumi-server/internal/auth"
 	"github.com/ViniZap4/lumi-server/internal/capguard"
@@ -46,7 +47,9 @@ const MaxUserConnections = 10
 // upgrade (they report close 1006), so the server completes the upgrade
 // and closes immediately with one of these:
 //
-//	4401 token missing, invalid or expired → client clears session, re-login
+//	4401 credential missing, invalid or expired, or ws ticket unknown,
+//	     expired, reused or minted for another note → mint a fresh ticket
+//	     once; if that fails too, clear the session and re-login
 //	4403 caller lacks note.edit on the vault → read-only, stop reconnecting
 //	4404 vault or note does not exist      → stop reconnecting
 //	1008 per-user concurrent-socket cap    (policy violation)
@@ -79,6 +82,8 @@ type Handler struct {
 	allowedOrigins []string
 	authenticate   Authenticator
 	noteExists     NoteLookup
+	tickets        *TicketStore
+	log            zerolog.Logger
 }
 
 // NewHandler constructs a Handler. resolver is the capguard resolver
@@ -94,8 +99,18 @@ func NewHandler(hub *Hub, resolver capguard.Resolver, allowedOrigins []string, a
 	if hub == nil || resolver == nil || authenticate == nil {
 		panic("wsync.NewHandler: missing dependency")
 	}
-	return &Handler{hub: hub, resolver: resolver, allowedOrigins: allowedOrigins, authenticate: authenticate, noteExists: noteExists}
+	return &Handler{
+		hub: hub, resolver: resolver, allowedOrigins: allowedOrigins,
+		authenticate: authenticate, noteExists: noteExists,
+		tickets: NewTicketStore(), log: zerolog.Nop(),
+	}
 }
+
+// SetLogger installs the handler's logger (default: discard).
+func (h *Handler) SetLogger(l zerolog.Logger) { h.log = l }
+
+// Tickets exposes the ticket table (tests, metrics).
+func (h *Handler) Tickets() *TicketStore { return h.tickets }
 
 // Register attaches the upgrade route and the WebSocket handler to the
 // supplied router (expected to be rooted at /api and NOT behind the auth
@@ -113,6 +128,12 @@ func (h *Handler) Register(r fiber.Router) {
 	}
 	r.Use(path, h.upgradeGuard)
 	r.Get(path, websocket.New(h.handleConn, cfg))
+}
+
+// RegisterTicket mounts POST /vaults/:vault/notes/:id/ws-ticket. r must be
+// the authenticated /api group (auth.Required ran: user + session bound).
+func (h *Handler) RegisterTicket(r fiber.Router) {
+	r.Post("/vaults/:vault/notes/:id/ws-ticket", h.issueTicket)
 }
 
 type rejection struct {
@@ -136,25 +157,34 @@ func (h *Handler) authorize(ctx context.Context, token string, vaultID uuid.UUID
 			return uuid.Nil, &rejection{websocket.CloseInternalServerErr, "auth_unavailable"}
 		}
 	}
+	if rej := h.authorizeUser(ctx, uid, vaultID, noteID); rej != nil {
+		return uuid.Nil, rej
+	}
+	return uid, nil
+}
+
+// authorizeUser runs the capability and existence gates for an already
+// authenticated user.
+func (h *Handler) authorizeUser(ctx context.Context, uid, vaultID uuid.UUID, noteID string) *rejection {
 	role, err := h.resolver.RoleForUser(ctx, vaultID, uid)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
-			return uuid.Nil, &rejection{CloseForbidden, "capability_missing"}
+			return &rejection{CloseForbidden, "capability_missing"}
 		}
-		return uuid.Nil, &rejection{websocket.CloseInternalServerErr, "authz_unavailable"}
+		return &rejection{websocket.CloseInternalServerErr, "authz_unavailable"}
 	}
 	if !role.Capabilities.Has(domain.CapNoteEdit) {
-		return uuid.Nil, &rejection{CloseForbidden, "capability_missing"}
+		return &rejection{CloseForbidden, "capability_missing"}
 	}
 	if h.noteExists != nil {
 		if err := h.noteExists(ctx, vaultID, noteID); err != nil {
 			if errors.Is(err, domain.ErrNotFound) {
-				return uuid.Nil, &rejection{CloseNotFound, "note_not_found"}
+				return &rejection{CloseNotFound, "note_not_found"}
 			}
-			return uuid.Nil, &rejection{websocket.CloseInternalServerErr, "lookup_failed"}
+			return &rejection{websocket.CloseInternalServerErr, "lookup_failed"}
 		}
 	}
-	return uid, nil
+	return nil
 }
 
 // upgradeGuard runs before the WS upgrade. Non-WS requests get 426. For
@@ -164,37 +194,102 @@ func (h *Handler) upgradeGuard(c *fiber.Ctx) error {
 	if !websocket.IsWebSocketUpgrade(c) {
 		return fiber.ErrUpgradeRequired
 	}
-	token := auth.ExtractToken(c)
-	noteID := strings.TrimSpace(c.Params("id"))
+	// Clone: Fiber strings alias the reusable request buffer and these
+	// values outlive the handler (Locals read by the socket goroutine).
+	noteID := strings.Clone(strings.TrimSpace(c.Params("id")))
 	vaultID, verr := uuid.Parse(c.Params("vault"))
 	var rej *rejection
 	var uid uuid.UUID
-	switch {
-	case verr != nil, noteID == "", strings.ContainsAny(noteID, "/\\"):
-		// Still require a valid token first so the code doesn't leak
-		// existence to anonymous callers.
-		if _, r := h.authorizeTokenOnly(c.UserContext(), token); r != nil {
-			rej = r
-		} else {
-			rej = &rejection{CloseNotFound, "note_not_found"}
-		}
+	var token string
+	switch ticket := strings.TrimSpace(c.Query("ticket")); {
+	case ticket != "":
+		// A presented ticket is consumed here whatever happens next;
+		// it is the only credential considered for this upgrade.
+		token, uid, rej = h.redeemTicket(c, ticket, vaultID, verr == nil, noteID)
 	default:
-		uid, rej = h.authorize(c.UserContext(), token, vaultID, noteID)
-	}
-	// Optional presence identity (legacy JSON presence).
-	var clientID uuid.UUID
-	if raw := strings.TrimSpace(c.Query("client_id")); raw != "" {
-		if id, err := uuid.Parse(raw); err == nil {
-			clientID = id
+		token = auth.ExtractToken(c)
+		if token != "" && headerToken(c) == "" {
+			// Deprecated: session token in the query string. Kept for
+			// clients predating ws-ticket; removal plan in ticket docs.
+			h.log.Debug().Str("path", c.Path()).Msg("wsync: deprecated ?token= on sync upgrade; use POST .../ws-ticket")
 		}
+		uid, rej = h.authorizeLegacy(c.UserContext(), token, vaultID, verr == nil, noteID)
 	}
 	c.Locals("wsync.reject", rej)
-	c.Locals("wsync.token", token)
+	c.Locals("wsync.token", strings.Clone(token))
 	c.Locals("wsync.vault", vaultID)
 	c.Locals("wsync.note", noteID)
 	c.Locals("wsync.user", uid)
-	c.Locals("wsync.client", clientID)
+	c.Locals("wsync.client", clientIDFromQuery(c))
 	return c.Next()
+}
+
+// redeemTicket consumes ticket and checks it against the requested route.
+// It returns the session token the socket re-validates against.
+func (h *Handler) redeemTicket(c *fiber.Ctx, ticket string, vaultID uuid.UUID, vaultOK bool, noteID string) (string, uuid.UUID, *rejection) {
+	invalid := &rejection{CloseUnauthorized, "ticket_invalid"}
+	b, err := h.tickets.Consume(ticket)
+	if err != nil {
+		return "", uuid.Nil, invalid
+	}
+	if !vaultOK || b.VaultID != vaultID || b.NoteID != noteID {
+		return "", uuid.Nil, invalid
+	}
+	ctx := c.UserContext()
+	// The minting session must still be live and still belong to the
+	// bound user (logout between mint and upgrade invalidates).
+	uid, err := h.authenticate(ctx, b.Session)
+	if err != nil || uid != b.UserID {
+		return "", uuid.Nil, invalid
+	}
+	// A header credential for a different user alongside the ticket is a
+	// confused request: refuse rather than guess whose socket this is.
+	if hdr := headerToken(c); hdr != "" {
+		other, err := h.authenticate(ctx, hdr)
+		if err != nil || other != b.UserID {
+			return "", uuid.Nil, invalid
+		}
+	}
+	if rej := h.authorizeUser(ctx, uid, vaultID, noteID); rej != nil {
+		return "", uuid.Nil, rej
+	}
+	return b.Session, uid, nil
+}
+
+// authorizeLegacy is the token (header or deprecated ?token=) path.
+func (h *Handler) authorizeLegacy(ctx context.Context, token string, vaultID uuid.UUID, vaultOK bool, noteID string) (uuid.UUID, *rejection) {
+	switch {
+	case !vaultOK, noteID == "", strings.ContainsAny(noteID, "/\\"):
+		// Still require a valid token first so the code doesn't leak
+		// existence to anonymous callers.
+		if _, r := h.authorizeTokenOnly(ctx, token); r != nil {
+			return uuid.Nil, r
+		}
+		return uuid.Nil, &rejection{CloseNotFound, "note_not_found"}
+	default:
+		return h.authorize(ctx, token, vaultID, noteID)
+	}
+}
+
+// headerToken returns a session token sent in a header (never the query).
+func headerToken(c *fiber.Ctx) string {
+	if t := strings.TrimSpace(c.Get(auth.HeaderToken)); t != "" {
+		return t
+	}
+	if a := strings.TrimSpace(c.Get(auth.HeaderAuthBearer)); len(a) > 7 && strings.EqualFold(a[:7], "Bearer ") {
+		return strings.TrimSpace(a[7:])
+	}
+	return ""
+}
+
+// clientIDFromQuery is the optional presence identity (legacy JSON presence).
+func clientIDFromQuery(c *fiber.Ctx) uuid.UUID {
+	if raw := strings.TrimSpace(c.Query("client_id")); raw != "" {
+		if id, err := uuid.Parse(raw); err == nil {
+			return id
+		}
+	}
+	return uuid.Nil
 }
 
 func (h *Handler) authorizeTokenOnly(ctx context.Context, token string) (uuid.UUID, *rejection) {
@@ -209,6 +304,61 @@ func (h *Handler) authorizeTokenOnly(ctx context.Context, token string) (uuid.UU
 		return uuid.Nil, &rejection{CloseUnauthorized, "unauthorized"}
 	}
 	return uid, nil
+}
+
+// ticketResponse is the 201 body of POST .../ws-ticket.
+type ticketResponse struct {
+	Ticket    string `json:"ticket"`
+	ExpiresAt string `json:"expires_at"` // RFC 3339, UTC
+}
+
+// issueTicket mints a single-use WS ticket for the caller's current
+// session. It applies exactly the gates the upgrade applies (note.edit on
+// the vault, note exists), so a ticket is only handed out for a socket
+// that would be accepted right now.
+func (h *Handler) issueTicket(c *fiber.Ctx) error {
+	sess, user := auth.SessionFromCtx(c), auth.UserFromCtx(c)
+	if sess == nil || user == nil || sess.Token == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	vaultID, err := uuid.Parse(c.Params("vault"))
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_vault_id"})
+	}
+	noteID := strings.TrimSpace(c.Params("id"))
+	if noteID == "" || strings.ContainsAny(noteID, "/\\") {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not_found"})
+	}
+	if rej := h.authorizeUser(c.UserContext(), user.ID, vaultID, noteID); rej != nil {
+		switch rej.code {
+		case CloseForbidden:
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
+		case CloseNotFound:
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not_found"})
+		default:
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "unavailable"})
+		}
+	}
+	// Fiber strings alias the request buffer, which fasthttp reuses after
+	// the handler returns: clone everything the table outlives us with.
+	ticket, exp, err := h.tickets.Issue(TicketBinding{
+		UserID: user.ID, Session: strings.Clone(sess.Token), VaultID: vaultID, NoteID: strings.Clone(noteID),
+	})
+	switch {
+	case errors.Is(err, ErrTicketUserLimit):
+		c.Set(fiber.HeaderRetryAfter, "30")
+		return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "too_many_tickets"})
+	case errors.Is(err, ErrTicketCapacity):
+		c.Set(fiber.HeaderRetryAfter, "5")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "unavailable"})
+	case err != nil:
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal"})
+	}
+	c.Set(fiber.HeaderCacheControl, "no-store")
+	return c.Status(fiber.StatusCreated).JSON(ticketResponse{
+		Ticket:    ticket,
+		ExpiresAt: exp.UTC().Format(time.RFC3339),
+	})
 }
 
 // handleConn is the per-connection lifecycle: join the room, send our

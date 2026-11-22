@@ -648,6 +648,22 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
 
+	// WS note sync authenticates itself so auth/permission/not-found
+	// failures complete the upgrade and close with 4401/4403/4404
+	// (browsers only see 1006 for a rejected HTTP upgrade). Its ws-ticket
+	// mint route lives in the authed group.
+	wsHandler := wsync.NewHandler(wsHub, fedResolver, cfg.allowedOrigins,
+		func(ctx context.Context, token string) (uuid.UUID, error) {
+			_, u, err := authSvc.Validate(ctx, token)
+			return u.ID, err
+		},
+		func(ctx context.Context, vaultID uuid.UUID, noteID string) error {
+			_, err := noteStore.Get(ctx, vaultID, noteID)
+			return err
+		},
+	)
+	wsHandler.SetLogger(zlog)
+
 	registerRoutes(app, auth.Required(authSvc),
 		// Public (or self-guarding) /api routes. Auth handlers mix public
 		// login/register with per-route Required guards.
@@ -665,21 +681,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 			invites.NewHandlers(invitesSvc).RegisterPublic,
 			federation.NewHandlers(federationSvc, fedResolver).RegisterPublic,
 			federation.NewRelayHandlers(federationSvc, relayLinks, zlog).Register,
-			// WS note sync authenticates itself so auth/permission/not-found
-			// failures complete the upgrade and close with 4401/4403/4404
-			// (browsers only see 1006 for a rejected HTTP upgrade).
-			func(r fiber.Router) {
-				wsync.NewHandler(wsHub, fedResolver, cfg.allowedOrigins,
-					func(ctx context.Context, token string) (uuid.UUID, error) {
-						_, u, err := authSvc.Validate(ctx, token)
-						return u.ID, err
-					},
-					func(ctx context.Context, vaultID uuid.UUID, noteID string) error {
-						_, err := noteStore.Get(ctx, vaultID, noteID)
-						return err
-					},
-				).Register(r.Group("/api"))
-			},
+			func(r fiber.Router) { wsHandler.Register(r.Group("/api")) },
 		},
 		[]func(fiber.Router){
 			users.NewHandlers(usersSvc, authSvc).Register,
@@ -691,6 +693,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 			feed.NewHandler(broker).Register,
 			func(r fiber.Router) { invites.NewHandlers(invitesSvc).RegisterAuthed(r, fedResolver) },
 			federation.NewHandlers(federationSvc, fedResolver).RegisterAuthed,
+			wsHandler.RegisterTicket,
 		},
 	)
 
