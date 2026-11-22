@@ -1,0 +1,91 @@
+# lumi-server CI on Gitea: gofmt, go vet, go test and build, with libyrs.a
+# (y-crdt via cargo) built in the job. Same checkout arrangement as the
+# umbrella deploy: Gitea announces itself to jobs as http://gitea:3000, so
+# we clone through the LAN_GIT_URL organisation variable.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.25.14-bookworm
+    timeout-minutes: 30
+    env:
+      GITEA_URL: ${{ vars.LAN_GIT_URL }}
+      # rustup-init pinned by version and sha256 (static.rust-lang.org).
+      RUSTUP_VERSION: "1.29.3"
+      RUSTUP_SHA256: b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
+      RUST_TOOLCHAIN: "1.100.0"
+      CGO_ENABLED: "1"
+    steps:
+      - name: checkout (with third_party/y-crdt)
+        env:
+          TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          YCRDT_GIT_URL: ${{ vars.YCRDT_GIT_URL }}
+        run: |
+          set -eu
+          [ -n "$GITEA_URL" ] || { echo "::error::set the LAN_GIT_URL organisation variable"; exit 1; }
+          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+          git config --global "http.$GITEA_URL/.extraheader" "AUTHORIZATION: basic $auth"
+          git config --global --add safe.directory "$PWD"
+          git init -q .
+          git remote add origin "$GITEA_URL/${{ github.repository }}.git"
+          git fetch -q --depth 1 origin "$SHA"
+          git checkout -q FETCH_HEAD
+          # y-crdt is public on GitHub; optionally use a local mirror.
+          if [ -n "${YCRDT_GIT_URL:-}" ]; then
+            git config --global "url.$YCRDT_GIT_URL.insteadOf" "https://github.com/y-crdt/y-crdt.git"
+          fi
+          git submodule update --init --depth 1 third_party/y-crdt
+          git config --global --unset-all "http.$GITEA_URL/.extraheader"
+          git log --oneline -1
+          git submodule status
+
+      - name: install Rust (pinned)
+        run: |
+          set -eu
+          curl --proto '=https' --tlsv1.2 -sSfL -o /tmp/rustup-init \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+          echo "${RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c -
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y -q --no-modify-path --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+          rm -f /tmp/rustup-init
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: libyrs (cargo build -p yffi)
+        run: |
+          set -eu
+          cargo --version
+          make libyrs
+
+      - name: gofmt
+        run: |
+          set -eu
+          unformatted=$(git ls-files '*.go' | grep -v '^third_party/' | xargs gofmt -l)
+          if [ -n "$unformatted" ]; then
+            echo "::error::files not gofmt-formatted:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        # Real libyrs: the crdt/wsync/notes tests exercise yrs, not a stub.
+        run: go test -race -count=1 ./...
+
+      - name: build
+        run: go build -trimpath -o /tmp/lumi-server ./cmd/lumi-server && /tmp/lumi-server version
