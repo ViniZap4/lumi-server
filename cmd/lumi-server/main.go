@@ -107,6 +107,18 @@ func (a fedMemberAdapter) ListForVault(ctx context.Context, vaultID uuid.UUID) (
 	return out, nil
 }
 
+// relayNoteAdapter is the relay's note-metadata surface: reads go to the
+// store, creations of peer-announced notes go through notes.Service so
+// they bump the local vault seq and reach the account feed.
+type relayNoteAdapter struct {
+	*pg.NoteStore
+	svc *notes.Service
+}
+
+func (a relayNoteAdapter) Upsert(ctx context.Context, n domain.Note) error {
+	return a.svc.CreateFromFederation(ctx, n)
+}
+
 // memberRepoAdapter bridges pg.MemberStore to members.Repo. Same reason.
 type memberRepoAdapter struct{ *pg.MemberStore }
 
@@ -495,7 +507,12 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	}
 
 	notesSvc := notes.NewService(noteStore, vaultStore, fsMgr, auditStore, fedResolver, crdtRegistry, fsWatcher)
-	wsHub := wsync.NewHub(crdtRegistry, wsync.WithFSMirror(notesSvc.WriteBodyFromCRDT))
+	wsHub := wsync.NewHub(crdtRegistry,
+		wsync.WithFSMirror(notesSvc.WriteBodyFromCRDT),
+		// Feed seq: committed content changes bump the vault head at most
+		// once per second per note (SPEC-LIVROS §3.4).
+		wsync.WithContentChanged(notesSvc.BumpContent, wsync.DefaultContentBumpInterval))
+	go pruneTombstones(ctx, zlog, noteStore)
 	// Every CRDT mutation (REST, fs-watcher, federation, live WS) goes
 	// through the hub's single in-memory doc per note.
 	notesSvc.SetLiveDocs(wsHub)
@@ -529,7 +546,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	relayLinks := federation.NewLinks(ctx, federation.RelayDeps{
 		Registry: crdtRegistry,
 		Rooms:    wsHub,
-		Notes:    noteStore,
+		Notes:    relayNoteAdapter{noteStore, notesSvc},
 		Mirror:   notesSvc.WriteBodyFromCRDT,
 		Delete:   notesSvc.DeleteFromFederation,
 		Move:     notesSvc.MoveFromFederation,
@@ -657,6 +674,31 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	return app, shutdown, nil
 }
 
+// Tombstone retention (SPEC-LIVROS §3.4): pruned after 30 days; the prune
+// raises each vault's tombstone_floor.
+const (
+	tombstoneRetention = 30 * 24 * time.Hour
+	tombstonePruneTick = 6 * time.Hour
+)
+
+func pruneTombstones(ctx context.Context, zlog zerolog.Logger, store *pg.NoteStore) {
+	t := time.NewTicker(tombstonePruneTick)
+	defer t.Stop()
+	for {
+		n, err := store.PruneTombstones(ctx, time.Now().Add(-tombstoneRetention))
+		if err != nil && ctx.Err() == nil {
+			zlog.Warn().Err(err).Msg("prune note tombstones")
+		} else if n > 0 {
+			zlog.Info().Int64("pruned", n).Msg("pruned note tombstones")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
 // buildFSHandler stitches an fswatch.Handler that routes external markdown
 // edits into the CRDT layer. Pipeline:
 //
@@ -668,8 +710,9 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 //  4. Apply it as a text diff through the hub's authoritative doc (the
 //     live room's when open), so subscribers see the broadcast and the
 //     write is serialised with live/REST/federation traffic.
-//  5. The note's pg row gets updated_at bumped so list/search reflects
-//     the external edit.
+//  5. The hub's content coalescer bumps the note's change_seq and
+//     updated_at (at most once per second per note), so list/search and
+//     the account feed reflect the external edit.
 //
 // Errors are logged but never propagated — the watcher is a best-effort
 // background process; one bad file should not stall others.
@@ -702,20 +745,11 @@ func buildFSHandler(
 		// when one is open) so connected clients receive the change and
 		// it is serialised with every other writer. No disk mirror: the
 		// file is the source of this change.
-		res, err := hub.ApplyText(ctx, v.ID, n.ID, string(body), nil, wsync.ApplyOptions{
+		if _, err := hub.ApplyText(ctx, v.ID, n.ID, string(body), nil, wsync.ApplyOptions{
 			Origin: wsync.OriginFSWatcher, Mirror: wsync.MirrorNone,
-		})
-		if err != nil {
+		}); err != nil {
 			log.Warn().Err(err).Str("path", n.Path).Msg("apply external edit failed")
-			return
 		}
-		if !res.Changed {
-			return
-		}
-		// Bump updated_at so list/search reflects the external edit.
-		updated := n
-		updated.UpdatedAt = time.Now().UTC()
-		_ = noteStore.Upsert(ctx, updated)
 	})
 }
 

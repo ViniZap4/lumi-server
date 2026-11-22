@@ -197,6 +197,9 @@ type Hub struct {
 	mirrorMu       sync.RWMutex
 	mirrorFn       FSMirrorFunc
 	mirrorDebounce time.Duration
+
+	// bumps coalesces content-change notifications per note (feed seq).
+	bumps *coalescer
 }
 
 // HubOption configures Hub at construction.
@@ -275,6 +278,7 @@ func (h *Hub) Close() {
 		return
 	}
 	h.rootCxl()
+	h.bumps.close()
 	h.mu.Lock()
 	rooms := make([]*Room, 0, len(h.rooms))
 	for _, r := range h.rooms {
@@ -594,6 +598,8 @@ func (r *Room) commitLocked(update []byte, origin *Subscriber, opts ApplyOptions
 	); err != nil {
 		return ApplyResult{}, err
 	}
+	// Feed seq: schedule the coalesced content bump (<= 1/s per note).
+	r.hub.bumps.touch(r.vaultID, r.noteID)
 	r.broadcast(EncodeSyncUpdate(update), origin)
 	var mirrorErr error
 	switch {

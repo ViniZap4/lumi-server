@@ -11,47 +11,6 @@ import (
 	"github.com/ViniZap4/lumi-server/internal/storage/fs"
 )
 
-type fakeNoteRepo struct {
-	byVault map[uuid.UUID][]domain.Note
-}
-
-func (f *fakeNoteRepo) Upsert(_ context.Context, n domain.Note) error {
-	f.byVault[n.VaultID] = append(f.byVault[n.VaultID], n)
-	return nil
-}
-
-func (f *fakeNoteRepo) Get(_ context.Context, vaultID uuid.UUID, id string) (domain.Note, error) {
-	for _, n := range f.byVault[vaultID] {
-		if n.ID == id {
-			return n, nil
-		}
-	}
-	return domain.Note{}, domain.ErrNotFound
-}
-
-func (f *fakeNoteRepo) GetByPath(_ context.Context, vaultID uuid.UUID, path string) (domain.Note, error) {
-	for _, n := range f.byVault[vaultID] {
-		if n.Path == path {
-			return n, nil
-		}
-	}
-	return domain.Note{}, domain.ErrNotFound
-}
-
-func (f *fakeNoteRepo) ListForVault(_ context.Context, vaultID uuid.UUID, limit, offset int) ([]domain.Note, error) {
-	all := f.byVault[vaultID]
-	if offset >= len(all) {
-		return nil, nil
-	}
-	end := offset + limit
-	if end > len(all) {
-		end = len(all)
-	}
-	return all[offset:end], nil
-}
-
-func (f *fakeNoteRepo) Delete(_ context.Context, vaultID uuid.UUID, id string) error { return nil }
-
 type fakeVaultLookup struct {
 	byID map[uuid.UUID]domain.Vault
 }

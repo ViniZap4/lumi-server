@@ -81,6 +81,9 @@ type Invite struct {
 
 // Note is metadata for a markdown file inside a vault. ID is the filename
 // stem; uniqueness is per-vault (composite PK with VaultID).
+//
+// ChangeSeq is the vault seq of the note's last change on this server
+// (SPEC-LIVROS §3.4); stamped by the store, ignored on input.
 type Note struct {
 	ID        string
 	VaultID   uuid.UUID
@@ -88,6 +91,24 @@ type Note struct {
 	Title     string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	ChangeSeq int64
+}
+
+// NoteTombstone records a deleted note id at the vault seq of the delete.
+type NoteTombstone struct {
+	ID  string
+	Seq int64
+}
+
+// NoteChanges is one page of a vault's change log: notes whose ChangeSeq
+// and tombstones whose Seq lie in (after, head], merged in seq order.
+// More reports that the page was cut at the limit; the caller continues
+// from the highest seq it received.
+type NoteChanges struct {
+	Notes   []Note
+	Deleted []NoteTombstone
+	Head    int64
+	More    bool
 }
 
 // Consent records a user's acceptance of a specific ToS+Privacy version pair.

@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,12 +36,24 @@ import (
 // ---- Dependencies ----------------------------------------------------------
 
 // NoteRepo is the persistence boundary for note metadata.
+//
+// Every write bumps the vault's change sequence in the same transaction
+// and returns the new seq (SPEC-LIVROS §3.4): Upsert stamps it on the row,
+// Delete on a tombstone, TouchContent on a coalesced content edit.
 type NoteRepo interface {
-	Upsert(ctx context.Context, n domain.Note) error
+	Upsert(ctx context.Context, n domain.Note) (int64, error)
 	Get(ctx context.Context, vaultID uuid.UUID, id string) (domain.Note, error)
 	GetByPath(ctx context.Context, vaultID uuid.UUID, path string) (domain.Note, error)
 	ListForVault(ctx context.Context, vaultID uuid.UUID, limit, offset int) ([]domain.Note, error)
-	Delete(ctx context.Context, vaultID uuid.UUID, id string) error
+	Delete(ctx context.Context, vaultID uuid.UUID, id string) (int64, error)
+	TouchContent(ctx context.Context, vaultID uuid.UUID, id string, at time.Time) (int64, error)
+	Changes(ctx context.Context, vaultID uuid.UUID, after int64, limit int) (domain.NoteChanges, error)
+}
+
+// HeadPublisher hears every new vault seq so the account feed can emit
+// vault.head (implemented by *feed.Broker). Must not block.
+type HeadPublisher interface {
+	VaultHead(vaultID uuid.UUID, seq int64)
 }
 
 // VaultLookup resolves a vault UUID to the row so the service can derive
@@ -82,7 +95,55 @@ type Service struct {
 	docs      LiveDocs
 	silencer  FSEventSilencer
 	fedNotify FederationNotifier
+	heads     HeadPublisher
 	now       func() time.Time
+}
+
+// SetHeadPublisher wires the account feed; nil disables.
+func (s *Service) SetHeadPublisher(p HeadPublisher) { s.heads = p }
+
+// publishHead forwards a freshly committed seq to the feed.
+func (s *Service) publishHead(vaultID uuid.UUID, seq int64) {
+	if s.heads != nil && seq > 0 {
+		s.heads.VaultHead(vaultID, seq)
+	}
+}
+
+// upsertMeta writes metadata (bumping the vault seq) and publishes the head.
+func (s *Service) upsertMeta(ctx context.Context, n domain.Note) error {
+	seq, err := s.notes.Upsert(ctx, n)
+	if err != nil {
+		return err
+	}
+	s.publishHead(n.VaultID, seq)
+	return nil
+}
+
+// deleteMeta deletes the row (tombstone + seq bump) and publishes the head.
+func (s *Service) deleteMeta(ctx context.Context, vaultID uuid.UUID, id string) error {
+	seq, err := s.notes.Delete(ctx, vaultID, id)
+	if err != nil {
+		return err
+	}
+	s.publishHead(vaultID, seq)
+	return nil
+}
+
+// BumpContent records a live content edit: bumps the vault seq, stamps
+// change_seq and updated_at, publishes vault.head. Called by the Hub's
+// per-note coalescer at most once per second per note. A note deleted in
+// the meantime is ignored.
+func (s *Service) BumpContent(ctx context.Context, vaultID uuid.UUID, noteID string) {
+	seq, err := s.notes.TouchContent(ctx, vaultID, noteID, s.now().UTC())
+	if err != nil {
+		return
+	}
+	s.publishHead(vaultID, seq)
+}
+
+// Changes returns one page of the vault's change log (GET /changes).
+func (s *Service) Changes(ctx context.Context, vaultID uuid.UUID, after int64, limit int) (domain.NoteChanges, error) {
+	return s.notes.Changes(ctx, vaultID, after, limit)
 }
 
 func NewService(
@@ -268,7 +329,8 @@ func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput)
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	if err := s.notes.Upsert(ctx, note); err != nil {
+	seq, err := s.notes.Upsert(ctx, note)
+	if err != nil {
 		// Roll back the on-disk file so we don't leave orphans.
 		_ = s.fs.DeleteNote(v.Slug, relPath)
 		return domain.Note{}, err
@@ -280,12 +342,15 @@ func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput)
 	// unseeded would let the first live edit race lazy init.
 	if s.crdt != nil {
 		if err := s.crdt.InitFromText(ctx, vaultID, id, in.Body, in.Actor, "snapshot-init"); err != nil {
-			_ = s.notes.Delete(ctx, vaultID, id)
+			// The row's seq may already be visible to a reader, so the
+			// rollback is a real (tombstoned) delete.
+			_ = s.deleteMeta(ctx, vaultID, id)
 			s.suppressFSEvent(v.Slug, relPath)
 			_ = s.fs.DeleteNote(v.Slug, relPath)
 			return domain.Note{}, fmt.Errorf("seed crdt: %w", err)
 		}
 	}
+	s.publishHead(vaultID, seq)
 	// InitFromText bypasses PersistChange, so federated peers need an
 	// explicit nudge for brand-new notes (v3 F2).
 	if s.fedNotify != nil {
@@ -451,7 +516,7 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 	if !edited && !moved {
 		return n, nil
 	}
-	if err := s.notes.Upsert(ctx, updated); err != nil {
+	if err := s.upsertMeta(ctx, updated); err != nil {
 		return domain.Note{}, err
 	}
 	// Path/title changes are metadata-only: the CRDT persist hook never
@@ -523,7 +588,7 @@ func (s *Service) deleteInternal(ctx context.Context, vaultID uuid.UUID, id stri
 	if err != nil {
 		return err
 	}
-	if err := s.notes.Delete(ctx, vaultID, id); err != nil {
+	if err := s.deleteMeta(ctx, vaultID, id); err != nil {
 		return err
 	}
 	if notify && s.fedNotify != nil {
@@ -775,15 +840,11 @@ func (s *Service) WriteBodyFromCRDT(ctx context.Context, vaultID uuid.UUID, note
 		front["id"] = noteID
 	}
 	s.suppressFSEvent(v.Slug, n.Path)
-	if err := s.fs.WriteNote(v.Slug, n.Path, front, []byte(text)); err != nil {
-		return err
-	}
-	// Bump updated_at in pg so listings reflect the edit. No audit row
-	// here — the underlying CRDT write is audited by its entry point.
-	updated := n
-	updated.UpdatedAt = now
-	_ = s.notes.Upsert(ctx, updated)
-	return nil
+	// No pg write here: the Hub's content coalescer (BumpContent) owns
+	// notes.updated_at / change_seq for content edits, at most once per
+	// second per note. (The old unconditional upsert could also resurrect
+	// a row deleted between the Get above and the write.)
+	return s.fs.WriteNote(v.Slug, n.Path, front, []byte(text))
 }
 
 // ---- Audit -----------------------------------------------------------------
@@ -868,6 +929,84 @@ func (h *Handlers) Register(r fiber.Router) {
 		capguard.RequireCapability(resolver, domain.CapNoteEdit),
 		h.applyDiff,
 	)
+	// Incremental change log for the account feed (SPEC-LIVROS §3.5).
+	r.Get("/vaults/:vault/changes",
+		capguard.RequireCapability(resolver, domain.CapNoteRead),
+		h.changes,
+	)
+}
+
+// Change-log page size (SPEC-LIVROS §3.5).
+const (
+	defaultChangesLimit = 500
+	maxChangesLimit     = 1000
+)
+
+type changeNoteDTO struct {
+	noteDTO
+	ChangeSeq int64 `json:"change_seq"`
+}
+
+type tombstoneDTO struct {
+	ID  string `json:"id"`
+	Seq int64  `json:"seq"`
+}
+
+// changes — GET /api/vaults/:vault/changes?after=N&limit=500
+//
+// 200 {"notes":[NoteSummary + change_seq],"deleted":[{"id","seq"}],
+//
+//	"head":H,"more":bool}
+//
+// Entries have seq in (after, head], ascending; at most limit of them in
+// total across both arrays. more=true → call again with after = the
+// highest seq received; more=false → the cursor is now head. after=0 (or
+// omitted) means everything. A cursor below the vault's tombstone floor
+// answers 410 {"error":"resync_required","head":H}: list everything with
+// GET /notes and set the cursor to that head.
+func (h *Handlers) changes(c *fiber.Ctx) error {
+	vaultID, err := capguard.WithVaultID(c)
+	if err != nil {
+		return nil
+	}
+	var after int64
+	if raw := c.Query("after"); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n < 0 {
+			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid_after"})
+		}
+		after = n
+	}
+	limit := defaultChangesLimit
+	if raw := c.Query("limit"); raw != "" {
+		n, err := atoiPos(raw)
+		if err != nil || n == 0 {
+			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid_limit"})
+		}
+		limit = min(n, maxChangesLimit)
+	}
+	page, err := h.svc.Changes(c.UserContext(), vaultID, after, limit)
+	if err != nil {
+		var resync *domain.ResyncRequiredError
+		if errors.As(err, &resync) {
+			return c.Status(http.StatusGone).JSON(fiber.Map{"error": "resync_required", "head": resync.Head})
+		}
+		return mapErr(c, err)
+	}
+	notesOut := make([]changeNoteDTO, 0, len(page.Notes))
+	for _, n := range page.Notes {
+		notesOut = append(notesOut, changeNoteDTO{noteDTO: toDTO(n), ChangeSeq: n.ChangeSeq})
+	}
+	deleted := make([]tombstoneDTO, 0, len(page.Deleted))
+	for _, t := range page.Deleted {
+		deleted = append(deleted, tombstoneDTO{ID: t.ID, Seq: t.Seq})
+	}
+	return c.JSON(fiber.Map{
+		"notes":   notesOut,
+		"deleted": deleted,
+		"head":    page.Head,
+		"more":    page.More,
+	})
 }
 
 type noteDTO struct {

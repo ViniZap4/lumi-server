@@ -17,6 +17,19 @@ import (
 // copyPageSize bounds each metadata page while walking the source vault.
 const copyPageSize = 200
 
+// CreateFromFederation inserts the metadata row for a note announced by a
+// federated peer (the file lands with the first mirrored update). Bumps
+// the local vault seq like any other create. Idempotent: an existing row
+// is left alone.
+func (s *Service) CreateFromFederation(ctx context.Context, n domain.Note) error {
+	if _, err := s.notes.Get(ctx, n.VaultID, n.ID); err == nil {
+		return nil
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return err
+	}
+	return s.upsertMeta(ctx, n)
+}
+
 // MoveFromFederation applies a rename/move relayed from a federated peer:
 // row + file update, no notifier re-fire (the relay fans it onward itself).
 // Tolerant of a missing source file (the mirrored content may not have
@@ -55,7 +68,7 @@ func (s *Service) MoveFromFederation(ctx context.Context, vaultID uuid.UUID, id,
 	updated.Path = cleaned
 	updated.Title = title
 	updated.UpdatedAt = s.now().UTC()
-	if err := s.notes.Upsert(ctx, updated); err != nil {
+	if err := s.upsertMeta(ctx, updated); err != nil {
 		return err
 	}
 	s.recordAudit(ctx, uuid.Nil, vaultID, domain.ActionNoteMove, "", "", map[string]any{
@@ -101,7 +114,7 @@ func (s *Service) CopyVaultNotes(ctx context.Context, srcVaultID, dstVaultID, ac
 			}
 			row := n
 			row.VaultID = dstVaultID
-			if err := s.notes.Upsert(ctx, row); err != nil {
+			if err := s.upsertMeta(ctx, row); err != nil {
 				return copied, fmt.Errorf("copy: upsert %q: %w", n.ID, err)
 			}
 			if s.crdt != nil {

@@ -23,4 +23,15 @@ var (
 	ErrSeedRoleProtected  = errors.New("seed role cannot be modified or deleted")
 	ErrRateLimited        = errors.New("rate limited")
 	ErrTLSRequired        = errors.New("TLS required")
+	ErrResyncRequired     = errors.New("resync required")
 )
+
+// ResyncRequiredError is returned by a change-log read whose cursor is
+// below the vault's tombstone floor: deletions it would need were pruned.
+// Head is the vault head to resume from after a full listing.
+type ResyncRequiredError struct {
+	Head int64
+}
+
+func (e *ResyncRequiredError) Error() string { return "resync required" }
+func (e *ResyncRequiredError) Unwrap() error { return ErrResyncRequired }
