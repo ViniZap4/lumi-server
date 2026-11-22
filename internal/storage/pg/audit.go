@@ -23,25 +23,8 @@ func NewAuditStore(pool *pgxpool.Pool) *AuditStore {
 
 // Record appends a single audit entry. Payload is opaque JSON.
 func (s *AuditStore) Record(ctx context.Context, e domain.AuditEntry) error {
-	const q = `
-INSERT INTO audit_log (user_id, vault_id, action, payload, ip, user_agent, created_at)
-VALUES ($1, $2, $3, $4::jsonb, $5::inet, $6, COALESCE($7, NOW()))`
-
-	var payloadArg any
-	if len(e.Payload) > 0 {
-		payloadArg = string(e.Payload)
-	}
-	var createdAt any
-	if !e.CreatedAt.IsZero() {
-		createdAt = e.CreatedAt
-	}
-
-	_, err := s.pool.Exec(ctx, q,
-		uuidArg(e.UserID), uuidArg(e.VaultID), e.Action, payloadArg,
-		nullableStringPtr(e.IP), nullableStringPtr(e.UserAgent), createdAt,
-	)
-	if err != nil {
-		return fmt.Errorf("audit store: record: %w", errMap(err))
+	if err := insertAudit(ctx, s.pool, e); err != nil {
+		return fmt.Errorf("audit store: record: %w", err)
 	}
 	return nil
 }

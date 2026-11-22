@@ -266,6 +266,18 @@ func (b *Broker) Streams(userID uuid.UUID) int {
 	return len(b.users[userID])
 }
 
+// TotalStreams returns the number of open streams across all users
+// (admin status).
+func (b *Broker) TotalStreams() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	for _, set := range b.users {
+		n += len(set)
+	}
+	return n
+}
+
 // subsOf snapshots a user's streams.
 func (b *Broker) subsOf(userID uuid.UUID) []*Subscriber {
 	b.mu.Lock()
@@ -347,7 +359,13 @@ func (b *Broker) VaultAccessChanged(vaultID uuid.UUID) {
 
 // SessionEnded ends every stream opened with token (logout).
 func (b *Broker) SessionEnded(token, reason string) {
-	key := SessionKey(token)
+	b.SessionKeyEnded(SessionKey(token), reason)
+}
+
+// SessionKeyEnded is SessionEnded by the session's stored hash (the
+// sessions.token_hash column, equal to SessionKey of the raw token): the
+// operator revokes a session without ever holding its token.
+func (b *Broker) SessionKeyEnded(key, reason string) {
 	for _, subs := range b.allSubs() {
 		for _, s := range subs {
 			if s.sessionKey == key {

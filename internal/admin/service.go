@@ -1,0 +1,771 @@
+package admin
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+	"github.com/rs/zerolog"
+
+	"github.com/ViniZap4/lumi-server/internal/auth"
+	"github.com/ViniZap4/lumi-server/internal/domain"
+	"github.com/ViniZap4/lumi-server/internal/users"
+)
+
+// Audit actions written by the admin surface. They live in audit_log next
+// to the domain events, with the admin token (never its value) in payload.
+const (
+	ActionTokenCreate      = "admin.token.create"
+	ActionTokenRevoke      = "admin.token.revoke"
+	ActionUserCreate       = "admin.user.create"
+	ActionUserPassword     = "admin.user.password"
+	ActionUserDisable      = "admin.user.disable"
+	ActionUserEnable       = "admin.user.enable"
+	ActionUserUnlock       = "admin.user.unlock"
+	ActionUserDelete       = "admin.user.delete"
+	ActionSessionRevoke    = "admin.session.revoke"
+	ActionVaultDelete      = "admin.vault.delete"
+	ActionFederationRevoke = "admin.federation.revoke"
+)
+
+// Actor is who performs an admin action: an admin token over the API, or
+// the CLI (TokenID nil, TokenName "cli").
+type Actor struct {
+	TokenID   *uuid.UUID
+	TokenName string
+	IP        string
+}
+
+// CLI is the actor of the terminal subcommands.
+var CLI = Actor{TokenName: "cli"}
+
+// ---- rows ---------------------------------------------------------------------
+
+type Token struct {
+	ID         uuid.UUID
+	Name       string
+	CreatedAt  time.Time
+	LastUsedAt *time.Time
+	ExpiresAt  time.Time
+	RevokedAt  *time.Time
+}
+
+// State is "active", "expired" or "revoked".
+func (t Token) State(now time.Time) string {
+	switch {
+	case t.RevokedAt != nil:
+		return "revoked"
+	case !t.ExpiresAt.After(now):
+		return "expired"
+	}
+	return "active"
+}
+
+type User struct {
+	ID           uuid.UUID
+	Username     string
+	DisplayName  string
+	CreatedAt    time.Time
+	DisabledAt   *time.Time
+	FailedLogins int
+	LockedUntil  *time.Time
+	Sessions     int // live (unexpired) sessions
+	OwnedVaults  int
+	Vaults       int // memberships, owned included
+}
+
+// State is "disabled", "locked" or "active" (disabled wins).
+func (u User) State(now time.Time) string {
+	switch {
+	case u.DisabledAt != nil:
+		return "disabled"
+	case u.LockedUntil != nil && u.LockedUntil.After(now):
+		return "locked"
+	}
+	return "active"
+}
+
+// Session is a user session as the operator sees it. ID is the stored
+// SHA-256 of the bearer token: it identifies the row but cannot be used
+// to authenticate.
+type Session struct {
+	ID         string
+	UserID     uuid.UUID
+	Username   string
+	CreatedAt  time.Time
+	LastUsedAt time.Time
+	ExpiresAt  time.Time
+}
+
+type Vault struct {
+	ID                uuid.UUID
+	Slug              string
+	Name              string
+	OwnerID           uuid.UUID
+	OwnerUsername     string
+	Members           int // local members, owner included
+	FederatedMembers  int // home side: members living on other servers
+	Notes             int
+	CRDTBytes         int64 // stored Yjs snapshots + pending updates
+	FederationRole    *string
+	ActiveFederations int
+	CreatedAt         time.Time
+}
+
+type Federation struct {
+	ID           uuid.UUID
+	VaultID      uuid.UUID
+	VaultSlug    string
+	VaultName    string
+	Role         string
+	PeerURL      string
+	Jurisdiction *string
+	Status       string
+	LastAckedSeq int64
+	ControlSeq   *int64
+	CreatedAt    time.Time
+	RevokedAt    *time.Time
+}
+
+type Counts struct {
+	Users         int64
+	Sessions      int64
+	Vaults        int64
+	Notes         int64
+	Federations   int64 // active links
+	SchemaVersion int64
+	SchemaDirty   bool
+}
+
+// AuditQuery pages audit_log newest first. Before is an exclusive id bound
+// (0 = from the newest). Scope "admin" keeps only admin.* actions.
+type AuditQuery struct {
+	Before  int64
+	Limit   int
+	AdminOn bool
+	UserID  *uuid.UUID
+	VaultID *uuid.UUID
+}
+
+// Cursor pages list routes ordered by (Time, Key).
+type Cursor struct {
+	Time time.Time
+	Key  string
+}
+
+// ---- collaborators -------------------------------------------------------------
+
+// Store is the admin persistence boundary (implemented by *pg.AdminStore).
+// Every method that takes a domain.AuditEntry writes it in the same
+// transaction as the change: if the row cannot be written, nothing changes.
+type Store interface {
+	CreateToken(ctx context.Context, t Token, digest []byte, e domain.AuditEntry) error
+	TokenByDigest(ctx context.Context, digest []byte) (Token, error)
+	GetToken(ctx context.Context, id uuid.UUID) (Token, error)
+	TouchToken(ctx context.Context, id uuid.UUID, at time.Time) error
+	ListTokens(ctx context.Context, after *Cursor, limit int) ([]Token, bool, error)
+	RevokeToken(ctx context.Context, id uuid.UUID, at time.Time, e domain.AuditEntry) error
+
+	Counts(ctx context.Context) (Counts, error)
+
+	ListUsers(ctx context.Context, afterUsername string, limit int) ([]User, bool, error)
+	GetUser(ctx context.Context, id uuid.UUID) (User, error)
+	GetUserByUsername(ctx context.Context, username string) (User, error)
+	OwnedVaultIDs(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error)
+	CreateUser(ctx context.Context, u domain.User, e domain.AuditEntry) error
+	SetPassword(ctx context.Context, id uuid.UUID, hash string, e domain.AuditEntry) error
+	SetDisabled(ctx context.Context, id uuid.UUID, disabled bool, e domain.AuditEntry) error
+	Unlock(ctx context.Context, id uuid.UUID, e domain.AuditEntry) error
+
+	ListSessions(ctx context.Context, userID *uuid.UUID, after *Cursor, limit int) ([]Session, bool, error)
+	GetSession(ctx context.Context, id string) (Session, error)
+	DeleteSession(ctx context.Context, id string, e domain.AuditEntry) error
+
+	ListVaults(ctx context.Context, userID *uuid.UUID, afterSlug string, limit int) ([]Vault, bool, error)
+	GetVault(ctx context.Context, id uuid.UUID) (Vault, error)
+	GetVaultBySlug(ctx context.Context, slug string) (Vault, error)
+
+	ListFederations(ctx context.Context, vaultID *uuid.UUID, after *Cursor, limit int) ([]Federation, bool, error)
+	GetFederation(ctx context.Context, id uuid.UUID) (Federation, error)
+
+	RecordAudit(ctx context.Context, e domain.AuditEntry) error
+	ListAudit(ctx context.Context, q AuditQuery) ([]domain.AuditEntry, bool, error)
+}
+
+// UserEraser is the LGPD erasure flow (*users.Service).
+type UserEraser interface {
+	Delete(ctx context.Context, id uuid.UUID, forceVaults bool, ip, ua *string) error
+}
+
+// VaultDeleter is the vault deletion flow (*vaults.Service).
+type VaultDeleter interface {
+	Delete(ctx context.Context, vaultID, actor uuid.UUID, ip, ua string) error
+}
+
+// FederationRevoker is the federation revoke flow (*federation.Service).
+type FederationRevoker interface {
+	RevokeFederation(ctx context.Context, vaultID, fedID, actor uuid.UUID, ip, ua string) error
+}
+
+// PasswordHasher hashes with the server's bcrypt cost (*auth.Service).
+type PasswordHasher interface {
+	HashPassword(plaintext string) (string, error)
+}
+
+// Live reaches the long-lived streams of the running server (*feed.Broker).
+// Nil in the CLI: there, open streams close at their next periodic
+// re-check, since their sessions are gone from the database.
+type Live interface {
+	UserSessionsEnded(userID uuid.UUID, reason string)
+	SessionKeyEnded(key, reason string)
+}
+
+// Service is shared by the admin API and the CLI.
+type Service struct {
+	Store       Store
+	Users       UserEraser
+	Vaults      VaultDeleter
+	Federations FederationRevoker
+	Hasher      PasswordHasher
+	Live        Live
+	Log         zerolog.Logger
+
+	Version       string
+	MigrationsDir string
+
+	now func() time.Time
+}
+
+func (s *Service) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+// ---- errors ----------------------------------------------------------------------
+
+// InvalidError is a 400 naming the offending field.
+type InvalidError struct {
+	Field  string
+	Detail string
+}
+
+func (e *InvalidError) Error() string { return e.Field + ": " + e.Detail }
+func (e *InvalidError) Unwrap() error { return domain.ErrValidation }
+
+func invalid(field, detail string) error { return &InvalidError{Field: field, Detail: detail} }
+
+// cleanDetail turns "auth: password shorter than 8 characters: validation
+// failed" into "password shorter than 8 characters".
+func cleanDetail(err error) string {
+	msg := err.Error()
+	msg = strings.TrimPrefix(msg, "auth: ")
+	msg = strings.TrimSuffix(msg, ": "+domain.ErrValidation.Error())
+	return msg
+}
+
+// ---- tokens ---------------------------------------------------------------------
+
+// Authenticate resolves a raw bearer token. Every failure (malformed,
+// unknown, expired, revoked) is domain.ErrUnauthorized, so callers answer
+// them identically. Other errors are infrastructure failures.
+func (s *Service) Authenticate(ctx context.Context, raw string) (Token, error) {
+	digest, err := ParseToken(raw)
+	if err != nil {
+		return Token{}, domain.ErrUnauthorized
+	}
+	t, err := s.Store.TokenByDigest(ctx, digest)
+	if errors.Is(err, domain.ErrNotFound) {
+		return Token{}, domain.ErrUnauthorized
+	}
+	if err != nil {
+		return Token{}, err
+	}
+	now := s.clock()
+	if t.State(now) != "active" {
+		return Token{}, domain.ErrUnauthorized
+	}
+	if t.LastUsedAt == nil || now.Sub(*t.LastUsedAt) >= TouchInterval {
+		if err := s.Store.TouchToken(ctx, t.ID, now); err != nil {
+			s.Log.Warn().Err(err).Str("token_id", t.ID.String()).Msg("admin: touch token")
+		} else {
+			t.LastUsedAt = &now
+		}
+	}
+	return t, nil
+}
+
+// ValidateTokenName applies the token naming rule: 1-64 characters, no
+// control characters, surrounding space trimmed.
+func ValidateTokenName(raw string) (string, error) {
+	name := strings.TrimSpace(raw)
+	if name == "" || utf8.RuneCountInString(name) > maxTokenName {
+		return "", invalid("name", fmt.Sprintf("must have 1 to %d characters", maxTokenName))
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return "", invalid("name", "must not contain control characters")
+		}
+	}
+	return name, nil
+}
+
+// CreateToken mints an admin token. Only the CLI calls it: the API has no
+// route that creates tokens, so a leaked token cannot perpetuate itself.
+func (s *Service) CreateToken(ctx context.Context, a Actor, name string, ttl time.Duration) (string, Token, error) {
+	name, err := ValidateTokenName(name)
+	if err != nil {
+		return "", Token{}, err
+	}
+	if ttl < MinTokenTTL || ttl > MaxTokenTTL {
+		return "", Token{}, invalid("ttl", fmt.Sprintf("must be between %s and %s", MinTokenTTL, MaxTokenTTL))
+	}
+	raw, digest := NewToken()
+	now := s.clock().UTC()
+	t := Token{ID: uuid.New(), Name: name, CreatedAt: now, ExpiresAt: now.Add(ttl)}
+	e := s.entry(a, ActionTokenCreate, nil, nil, map[string]any{
+		"target_token_id":   t.ID,
+		"target_token_name": t.Name,
+		"expires_at":        t.ExpiresAt.Format(time.RFC3339),
+	})
+	if err := s.Store.CreateToken(ctx, t, digest, e); err != nil {
+		return "", Token{}, err
+	}
+	s.logAction(a, ActionTokenCreate).Str("target_token_id", t.ID.String()).Str("target_token_name", t.Name).Msg("admin action")
+	return raw, t, nil
+}
+
+func (s *Service) ListTokens(ctx context.Context, after *Cursor, limit int) ([]Token, bool, error) {
+	return s.Store.ListTokens(ctx, after, limit)
+}
+
+// RevokeToken revokes any token, the caller's own included (effective on
+// its next call). Revoking an already revoked token is a no-op success
+// that is still audited.
+func (s *Service) RevokeToken(ctx context.Context, a Actor, id uuid.UUID) error {
+	t, err := s.Store.GetToken(ctx, id)
+	if err != nil {
+		return err
+	}
+	e := s.entry(a, ActionTokenRevoke, nil, nil, map[string]any{
+		"target_token_id":   t.ID,
+		"target_token_name": t.Name,
+	})
+	if err := s.Store.RevokeToken(ctx, id, s.clock().UTC(), e); err != nil {
+		return err
+	}
+	s.logAction(a, ActionTokenRevoke).Str("target_token_id", id.String()).Msg("admin action")
+	return nil
+}
+
+// ---- status ------------------------------------------------------------------------
+
+type Status struct {
+	Version           string
+	SchemaVersion     int64
+	SchemaDirty       bool
+	PendingMigrations int
+	Counts
+}
+
+func (s *Service) Status(ctx context.Context) (Status, error) {
+	c, err := s.Store.Counts(ctx)
+	if err != nil {
+		return Status{}, err
+	}
+	pending, err := PendingMigrations(s.MigrationsDir, c.SchemaVersion)
+	if err != nil {
+		s.Log.Warn().Err(err).Msg("admin: count pending migrations")
+		pending = -1
+	}
+	return Status{
+		Version:           s.Version,
+		SchemaVersion:     c.SchemaVersion,
+		SchemaDirty:       c.SchemaDirty,
+		PendingMigrations: pending,
+		Counts:            c,
+	}, nil
+}
+
+var migrationFile = regexp.MustCompile(`^(\d+)_.+\.up\.sql$`)
+
+// PendingMigrations counts the up-migrations in dir newer than current.
+func PendingMigrations(dir string, current int64) (int, error) {
+	if dir == "" {
+		return 0, errors.New("no migrations directory")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, e := range entries {
+		m := migrationFile.FindStringSubmatch(filepath.Base(e.Name()))
+		if m == nil {
+			continue
+		}
+		v, err := strconv.ParseInt(m[1], 10, 64)
+		if err == nil && v > current {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// ---- users --------------------------------------------------------------------------
+
+func (s *Service) ListUsers(ctx context.Context, after string, limit int) ([]User, bool, error) {
+	return s.Store.ListUsers(ctx, after, limit)
+}
+
+func (s *Service) GetUser(ctx context.Context, id uuid.UUID) (User, error) {
+	return s.Store.GetUser(ctx, id)
+}
+
+// ResolveUser accepts a user id or a username (CLI convenience).
+func (s *Service) ResolveUser(ctx context.Context, ref string) (User, error) {
+	if id, err := uuid.Parse(ref); err == nil {
+		return s.Store.GetUser(ctx, id)
+	}
+	name, err := auth.CanonicaliseUsername(ref)
+	if err != nil {
+		return User{}, fmt.Errorf("user %q: %w", ref, domain.ErrNotFound)
+	}
+	return s.Store.GetUserByUsername(ctx, name)
+}
+
+// ValidatePassword applies the registration password rules.
+func ValidatePassword(pw string) error {
+	if err := auth.ValidatePassword(pw); err != nil {
+		return invalid("password", cleanDetail(err))
+	}
+	return nil
+}
+
+// CreateUser creates an account under the registration rules. No consent
+// is recorded on the user's behalf: the operator cannot consent for them.
+func (s *Service) CreateUser(ctx context.Context, a Actor, username, password, displayName string) (User, error) {
+	name, err := auth.CanonicaliseUsername(username)
+	if err != nil {
+		return User{}, invalid("username", cleanDetail(err))
+	}
+	if err := ValidatePassword(password); err != nil {
+		return User{}, err
+	}
+	displayName = strings.TrimSpace(displayName)
+	if utf8.RuneCountInString(displayName) > users.MaxDisplayNameLen {
+		return User{}, invalid("display_name", fmt.Sprintf("must have at most %d characters", users.MaxDisplayNameLen))
+	}
+	for _, r := range displayName {
+		if unicode.IsControl(r) {
+			return User{}, invalid("display_name", "must not contain control characters")
+		}
+	}
+	hash, err := s.Hasher.HashPassword(password)
+	if err != nil {
+		return User{}, err
+	}
+	u := domain.User{
+		ID:           uuid.New(),
+		Username:     name,
+		PasswordHash: hash,
+		DisplayName:  displayName,
+		CreatedAt:    s.clock().UTC(),
+	}
+	e := s.entry(a, ActionUserCreate, &u.ID, nil, map[string]any{"username": name})
+	if err := s.Store.CreateUser(ctx, u, e); err != nil {
+		if errors.Is(err, domain.ErrConflict) {
+			return User{}, fmt.Errorf("username taken: %w", domain.ErrConflict)
+		}
+		return User{}, err
+	}
+	s.logAction(a, ActionUserCreate).Str("user_id", u.ID.String()).Msg("admin action")
+	return s.Store.GetUser(ctx, u.ID)
+}
+
+// SetPassword replaces the password, clears the lockout and ends every
+// session of the user.
+func (s *Service) SetPassword(ctx context.Context, a Actor, id uuid.UUID, password string) error {
+	if err := ValidatePassword(password); err != nil {
+		return err
+	}
+	u, err := s.Store.GetUser(ctx, id)
+	if err != nil {
+		return err
+	}
+	hash, err := s.Hasher.HashPassword(password)
+	if err != nil {
+		return err
+	}
+	e := s.entry(a, ActionUserPassword, &u.ID, nil, map[string]any{"username": u.Username})
+	if err := s.Store.SetPassword(ctx, id, hash, e); err != nil {
+		return err
+	}
+	s.endUserSessions(id)
+	s.logAction(a, ActionUserPassword).Str("user_id", id.String()).Msg("admin action")
+	return nil
+}
+
+// Disable blocks login and ends every session. Idempotent.
+func (s *Service) Disable(ctx context.Context, a Actor, id uuid.UUID) error {
+	return s.setDisabled(ctx, a, id, true)
+}
+
+// Enable lifts a disable. Idempotent.
+func (s *Service) Enable(ctx context.Context, a Actor, id uuid.UUID) error {
+	return s.setDisabled(ctx, a, id, false)
+}
+
+func (s *Service) setDisabled(ctx context.Context, a Actor, id uuid.UUID, disabled bool) error {
+	u, err := s.Store.GetUser(ctx, id)
+	if err != nil {
+		return err
+	}
+	action := ActionUserEnable
+	if disabled {
+		action = ActionUserDisable
+	}
+	e := s.entry(a, action, &u.ID, nil, map[string]any{"username": u.Username})
+	if err := s.Store.SetDisabled(ctx, id, disabled, e); err != nil {
+		return err
+	}
+	if disabled {
+		s.endUserSessions(id)
+	}
+	s.logAction(a, action).Str("user_id", id.String()).Msg("admin action")
+	return nil
+}
+
+// Unlock clears the failed-login counter and the lock.
+func (s *Service) Unlock(ctx context.Context, a Actor, id uuid.UUID) error {
+	u, err := s.Store.GetUser(ctx, id)
+	if err != nil {
+		return err
+	}
+	e := s.entry(a, ActionUserUnlock, &u.ID, nil, map[string]any{"username": u.Username})
+	if err := s.Store.Unlock(ctx, id, e); err != nil {
+		return err
+	}
+	s.logAction(a, ActionUserUnlock).Str("user_id", id.String()).Msg("admin action")
+	return nil
+}
+
+// DeleteUser is the LGPD erasure of the users service, with its rules:
+// a user who owns vaults is refused (users.SoleAdminError, listing them)
+// unless deleteOwnedVaults opts into deleting those vaults too. Shared
+// vaults the user merely belongs to survive without them; their audit
+// rows are anonymised; federated followers hear the membership change.
+//
+// The admin audit row is written before the erasure and carries the
+// target in user_id, so the erasure anonymises it like every other row
+// about that user.
+func (s *Service) DeleteUser(ctx context.Context, a Actor, id uuid.UUID, deleteOwnedVaults bool) error {
+	u, err := s.Store.GetUser(ctx, id)
+	if err != nil {
+		return err
+	}
+	owned, err := s.Store.OwnedVaultIDs(ctx, id)
+	if err != nil {
+		return err
+	}
+	if len(owned) > 0 && !deleteOwnedVaults {
+		return users.SoleAdminError{VaultIDs: owned}
+	}
+	e := s.entry(a, ActionUserDelete, &u.ID, nil, map[string]any{
+		"username":            u.Username,
+		"delete_owned_vaults": deleteOwnedVaults,
+		"owned_vault_ids":     owned,
+	})
+	if err := s.Store.RecordAudit(ctx, e); err != nil {
+		return fmt.Errorf("audit %s: %w", ActionUserDelete, err)
+	}
+	if err := s.Users.Delete(ctx, id, deleteOwnedVaults, ipPtr(a.IP), nil); err != nil {
+		s.logFailure(a, ActionUserDelete, err).Str("user_id", id.String()).Msg("admin action failed after audit")
+		return err
+	}
+	s.logAction(a, ActionUserDelete).Str("user_id", id.String()).Int("owned_vaults_deleted", len(owned)).Msg("admin action")
+	return nil
+}
+
+// ---- sessions ------------------------------------------------------------------------
+
+func (s *Service) ListSessions(ctx context.Context, userID *uuid.UUID, after *Cursor, limit int) ([]Session, bool, error) {
+	return s.Store.ListSessions(ctx, userID, after, limit)
+}
+
+var sessionIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// RevokeSession deletes one session by its id (the stored token hash).
+func (s *Service) RevokeSession(ctx context.Context, a Actor, id string) error {
+	if !sessionIDPattern.MatchString(id) {
+		return fmt.Errorf("session: %w", domain.ErrNotFound)
+	}
+	sess, err := s.Store.GetSession(ctx, id)
+	if err != nil {
+		return err
+	}
+	e := s.entry(a, ActionSessionRevoke, &sess.UserID, nil, map[string]any{
+		"username":   sess.Username,
+		"session_id": id[:12],
+	})
+	if err := s.Store.DeleteSession(ctx, id, e); err != nil {
+		return err
+	}
+	if s.Live != nil {
+		s.Live.SessionKeyEnded(id, "revoked")
+	}
+	s.logAction(a, ActionSessionRevoke).Str("user_id", sess.UserID.String()).Str("session_id", id[:12]).Msg("admin action")
+	return nil
+}
+
+// ---- vaults ---------------------------------------------------------------------------
+
+func (s *Service) ListVaults(ctx context.Context, userID *uuid.UUID, after string, limit int) ([]Vault, bool, error) {
+	return s.Store.ListVaults(ctx, userID, after, limit)
+}
+
+func (s *Service) GetVault(ctx context.Context, id uuid.UUID) (Vault, error) {
+	return s.Store.GetVault(ctx, id)
+}
+
+// ResolveVault accepts a vault id or slug (CLI convenience).
+func (s *Service) ResolveVault(ctx context.Context, ref string) (Vault, error) {
+	if id, err := uuid.Parse(ref); err == nil {
+		return s.Store.GetVault(ctx, id)
+	}
+	return s.Store.GetVaultBySlug(ctx, ref)
+}
+
+// DeleteVault deletes the vault through the vaults service, as its owner
+// would: rows (notes, roles, members, invites, federation links) cascade,
+// the directory is removed and members' feeds are told.
+func (s *Service) DeleteVault(ctx context.Context, a Actor, id uuid.UUID) error {
+	v, err := s.Store.GetVault(ctx, id)
+	if err != nil {
+		return err
+	}
+	e := s.entry(a, ActionVaultDelete, nil, &v.ID, map[string]any{
+		"slug":     v.Slug,
+		"owner_id": v.OwnerID,
+	})
+	if err := s.Store.RecordAudit(ctx, e); err != nil {
+		return fmt.Errorf("audit %s: %w", ActionVaultDelete, err)
+	}
+	if err := s.Vaults.Delete(ctx, id, uuid.Nil, a.IP, ""); err != nil {
+		s.logFailure(a, ActionVaultDelete, err).Str("vault_id", id.String()).Msg("admin action failed after audit")
+		return err
+	}
+	s.logAction(a, ActionVaultDelete).Str("vault_id", id.String()).Str("slug", v.Slug).Msg("admin action")
+	return nil
+}
+
+// ---- federations ------------------------------------------------------------------------
+
+func (s *Service) ListFederations(ctx context.Context, vaultID *uuid.UUID, after *Cursor, limit int) ([]Federation, bool, error) {
+	return s.Store.ListFederations(ctx, vaultID, after, limit)
+}
+
+// RevokeFederation revokes an active link through the federation service,
+// with its rule: a link that is not active is refused (409). The local
+// vault stays; the relay link stops.
+func (s *Service) RevokeFederation(ctx context.Context, a Actor, id uuid.UUID) error {
+	f, err := s.Store.GetFederation(ctx, id)
+	if err != nil {
+		return err
+	}
+	if f.Status != "active" {
+		return fmt.Errorf("%w: federation already %s", domain.ErrConflict, f.Status)
+	}
+	e := s.entry(a, ActionFederationRevoke, nil, &f.VaultID, map[string]any{
+		"federation_id": f.ID,
+		"peer_url":      f.PeerURL,
+		"role":          f.Role,
+	})
+	if err := s.Store.RecordAudit(ctx, e); err != nil {
+		return fmt.Errorf("audit %s: %w", ActionFederationRevoke, err)
+	}
+	if err := s.Federations.RevokeFederation(ctx, f.VaultID, f.ID, uuid.Nil, a.IP, ""); err != nil {
+		s.logFailure(a, ActionFederationRevoke, err).Str("federation_id", id.String()).Msg("admin action failed after audit")
+		return err
+	}
+	s.logAction(a, ActionFederationRevoke).Str("federation_id", id.String()).Str("peer_url", f.PeerURL).Msg("admin action")
+	return nil
+}
+
+// ---- audit ------------------------------------------------------------------------------
+
+func (s *Service) ListAudit(ctx context.Context, q AuditQuery) ([]domain.AuditEntry, bool, error) {
+	return s.Store.ListAudit(ctx, q)
+}
+
+// ---- helpers ----------------------------------------------------------------------------
+
+// entry builds the audit row of an admin action. user_id carries the
+// target user when there is one, so LGPD erasure anonymises it; ip is
+// the admin client's address (empty for the CLI).
+func (s *Service) entry(a Actor, action string, userID, vaultID *uuid.UUID, fields map[string]any) domain.AuditEntry {
+	payload := map[string]any{"actor": "admin", "token_name": a.TokenName}
+	if a.TokenID != nil {
+		payload["token_id"] = a.TokenID.String()
+	} else {
+		payload["token_id"] = nil
+	}
+	for k, v := range fields {
+		payload[k] = v
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		body = []byte(`{}`)
+	}
+	return domain.AuditEntry{
+		UserID:    userID,
+		VaultID:   vaultID,
+		Action:    action,
+		Payload:   body,
+		IP:        ipPtr(a.IP),
+		CreatedAt: s.clock().UTC(),
+	}
+}
+
+func (s *Service) endUserSessions(id uuid.UUID) {
+	if s.Live != nil {
+		s.Live.UserSessionsEnded(id, "revoked")
+	}
+}
+
+func (s *Service) logAction(a Actor, action string) *zerolog.Event {
+	return s.actorEvent(s.Log.Info(), a, action)
+}
+
+func (s *Service) logFailure(a Actor, action string, err error) *zerolog.Event {
+	return s.actorEvent(s.Log.Error().Err(err), a, action)
+}
+
+func (s *Service) actorEvent(ev *zerolog.Event, a Actor, action string) *zerolog.Event {
+	ev = ev.Str("component", "admin").Str("action", action).Str("token_name", a.TokenName)
+	if a.TokenID != nil {
+		ev = ev.Str("token_id", a.TokenID.String())
+	}
+	if a.IP != "" {
+		ev = ev.Str("ip", a.IP)
+	}
+	return ev
+}
+
+func ipPtr(ip string) *string {
+	if ip == "" {
+		return nil
+	}
+	return &ip
+}
