@@ -1,0 +1,80 @@
+# API de administração do servidor
+
+Contrato entre o `lumi-server` e um futuro painel de administração. Espelha os comandos do terminal (`lumi-server token|user|session|vault|federation|audit|status`): mesmas regras, mesmas recusas. Inspirado no ADR 0037 do porvia; as diferenças estão no fim.
+
+## Transporte
+- Listener próprio em `LUMI_ADMIN_ADDR` (ex.: `0.0.0.0:8081` na rede interna do compose, sem porta publicada). Vazio: desligado. Não confundir com `LUMI_ADMIN_USERNAME`/`LUMI_ADMIN_PASSWORD`, que só criam o primeiro usuário.
+- Recusa subir (código de saída 78) se colidir com a API pública (`LUMI_BIND_ADDR:LUMI_PORT`), comparando endereços resolvidos: mesma porta e hosts que se sobrepõem (`0.0.0.0`/`::` cobrem tudo; `localhost`, `127.0.0.1`, `::1` e `::ffff:127.0.0.1` são o mesmo loopback; um nome de host não resolvido na mesma porta também é recusado). A porta é aberta na partida: se estiver ocupada, o servidor não sobe.
+- Fora do loopback, avisa no log: o lumi não termina TLS, então o token trafega em claro; use só numa rede privada.
+- IP do cliente: `X-Forwarded-For` só vale quando o par TCP está em `LUMI_ADMIN_TRUSTED_PROXIES` (lista de CIDRs ou IPs; no compose, `172.16.0.0/12`). O cabeçalho é lido da direita para a esquerda e vale o primeiro salto que não é proxy confiável. O painel deve enviar o IP de quem o usa: vai para a auditoria e para o limite de falhas.
+- Mesmos timeouts da API pública (leitura 30 s, escrita 60 s, ociosidade 120 s) e os mesmos cabeçalhos de segurança, mais `Cache-Control: no-store`. Corpo limitado a 16 KiB (`413`). Sem CORS: quem chama é o servidor do painel, nunca o navegador.
+- Base `/admin/v1`. Toda rota exige `Authorization: Bearer lpa_…`. Rotas desconhecidas sob `/admin/v1` respondem `404` só depois da autenticação.
+- `GET /admin/healthz` responde `200 {"status":"ok"}` sem token, para o healthcheck do contêiner.
+- Datas em RFC 3339 UTC (como o resto da API do lumi); `null` quando não há.
+- Corpo JSON estrito: `Content-Type: application/json`, campos desconhecidos e dados depois do objeto são recusados com `400`.
+
+## Tokens
+- `lpa_` + 32 bytes aleatórios em base64url (47 caracteres); o banco guarda só o SHA-256 (`admin_tokens.token_hash`).
+- Criados só no terminal: `lumi-server token create <nome> [--ttl 30d]` imprime o token uma única vez, sozinho no stdout (`TOKEN=$(lumi-server token create painel)`). `token list` e `token revoke <id>` completam. A API lista e revoga, mas nunca cria: um token vazado não se perpetua.
+- Nome: 1 a 64 caracteres, sem caracteres de controle. Validade padrão de 30 dias, mínima de 1 minuto e máxima de 1 ano (`--ttl` aceita `720h`, `90m` ou `30d`).
+- `last_used_at` é gravado no máximo uma vez por minuto.
+- Token ausente, malformado, desconhecido, expirado ou revogado (ou um token de sessão de usuário): sempre `401 {"error":"unauthorized"}` com `WWW-Authenticate: Bearer realm="lumi-admin"`. Só as falhas gastam e consultam o limite por IP (10 de rajada, uma a mais a cada 6 s; IPv6 agrupado por /64); acima dele, as falhas recebem `429 {"error":"rate_limited","retry_after_s":N}` com `Retry-After`. Um token válido passa sempre, mesmo desse IP.
+
+## Rotas
+Todas sob `/admin/v1`.
+
+| Método e rota | Corpo | Resposta |
+|---|---|---|
+| `GET /status` | — | `{"version", "schema_version", "schema_dirty", "pending_migrations", "users", "sessions", "vaults", "notes", "federations", "feed_connections", "ws_connections", "started_at", "token": {"id", "name", "expires_at"}}` |
+| `GET /users` | — | página de usuários por `username` |
+| `GET /users/{id}` | — | um usuário, com `"owned_vault_ids": [...]` |
+| `POST /users` | `{"username", "password", "display_name"?}` | `201` usuário |
+| `POST /users/{id}/password` | `{"password"}` | `204`; zera falhas e bloqueio e encerra todas as sessões do usuário |
+| `POST /users/{id}/disable` | — | `204`; encerra as sessões; idempotente |
+| `POST /users/{id}/enable` | — | `204`; idempotente |
+| `POST /users/{id}/unlock` | — | `204`; zera `failed_logins` e `locked_until` |
+| `DELETE /users/{id}?delete_owned_vaults=true` | — | `204`; apagamento LGPD (abaixo) |
+| `GET /sessions?user={id}` | — | página de sessões, mais novas primeiro; sem `user`, todas |
+| `DELETE /sessions/{id}` | — | `204` |
+| `GET /vaults?user={id}` | — | página de cofres por `slug`; com `user`, os que ele possui ou dos quais é membro |
+| `GET /vaults/{id}` | — | um cofre |
+| `DELETE /vaults/{id}` | — | `204`; apaga notas, papéis, membros, convites e vínculos de federação, e o diretório |
+| `GET /federations?vault={id}` | — | página de vínculos de federação por criação |
+| `DELETE /federations/{id}` | — | `204`; revoga (a linha fica com `status: "revoked"`; o cofre local fica); `409` se já não estava ativo |
+| `GET /tokens` | — | página de tokens por criação |
+| `DELETE /tokens/{id}` | — | `204`; revoga (o próprio também, com efeito na próxima chamada); idempotente |
+| `GET /audit?before={id}&limit={n}&scope=all\|admin&user={id}&vault={id}` | — | `{"entries": [...], "more", "next"}`, mais novas primeiro; `limit` padrão e máximo 100; `next` é o `before` da próxima página |
+
+### Formatos
+- Usuário: `{"id", "username", "display_name", "state", "disabled_at", "failed_logins", "locked_until", "sessions", "owned_vaults", "vaults", "created_at"}`. `state` é `"active"`, `"disabled"` ou `"locked"` (desativado vence). `sessions` conta as não expiradas; `vaults` conta participações (inclui as que possui).
+- Sessão: `{"id", "user_id", "username", "created_at", "last_used_at", "expires_at"}`. `id` é o SHA-256 (hex, 64 caracteres) do token guardado no banco: identifica a sessão, mas não serve para autenticar.
+- Cofre: `{"id", "slug", "name", "owner": {"id", "username"}, "members", "federated_members", "notes", "crdt_bytes", "federation": {"role": "home"|"follower", "active_links"} | null, "created_at"}`. `crdt_bytes` soma snapshots e atualizações Yjs guardados (não o tamanho em disco).
+- Federação: `{"id", "vault": {"id", "slug", "name"}, "role", "peer_url", "jurisdiction", "status", "last_acked_seq", "control_seq", "created_at", "revoked_at"}`. `role` é o papel **deste** servidor; `control_seq` só no lado `home`; `status` é `active`, `revoked` ou `severed`.
+- Token: `{"id", "name", "state", "created_at", "last_used_at", "expires_at", "revoked_at", "current"}`; `state` é `active`, `expired` ou `revoked`; `current` marca o token da chamada.
+- Auditoria: `{"id", "created_at", "action", "user_id", "vault_id", "ip", "user_agent", "payload"}`. É o `audit_log` inteiro (ações dos usuários também); `scope=admin` filtra as `admin.*`.
+- Páginas: `{"items": [...], "more", "next"}`. `?limit=` de 1 a 200 (padrão 200) e `?after={next}` para a seguinte; `next` é opaco e `null` na última.
+- Ids inválidos no caminho respondem `404`, como ids desconhecidos.
+
+### Regras
+- Usuário e senha seguem as regras do cadastro: nome com 3 a 32 de `[a-z0-9_-]`, em minúsculas, sem separador nas pontas; senha com 8 a 72 bytes, não só dígitos, e só letras exige 10. `display_name` até 80 caracteres. Nenhum consentimento é registrado em nome do usuário.
+- Bloqueio: depois de 10 senhas erradas seguidas numa conta existente, o login é recusado por 2^(n−10) s, até 15 min. Conta desativada ou bloqueada recebe no login a mesma resposta de senha errada (`401 invalid_credentials`), e toda sessão de conta desativada deixa de valer.
+- Apagamento (`DELETE /users/{id}`): o mesmo fluxo do `DELETE /api/users/me`. Quem é dono de cofres é recusado com `409 {"error":"sole_admin_vaults","vault_ids":[...]}`, sem nada apagado nem auditado, a menos que `delete_owned_vaults=true` (os cofres e diretórios vão junto). Cofres em que só é membro continuam sem ele; as linhas de auditoria dele são anonimizadas (`user_id`, `ip`, `user_agent` nulos; `username` vira `<redacted>`); as sessões e streams do feed são encerrados; os servidores seguidores recebem o novo estado de controle.
+- Erros no formato da API pública, `{"error": código, "detail"?}`: `400 validation_failed` (com `"field"` e `"detail"`), `401 unauthorized`, `404 not_found`, `409 conflict` (ex.: nome de usuário em uso, federação já revogada; `detail` diz o motivo), `409 sole_admin_vaults`, `413 payload_too_large`, `429 rate_limited`, `500 internal`.
+
+## Auditoria
+- Toda ação que muda algo grava uma linha em `audit_log` e uma entrada no log do servidor (`component=admin`) com o token usado (id e nome, nunca o valor), o alvo e o IP.
+- `action`: `admin.token.create` (só no terminal), `admin.token.revoke`, `admin.user.create`, `admin.user.password`, `admin.user.disable`, `admin.user.enable`, `admin.user.unlock`, `admin.user.delete`, `admin.session.revoke`, `admin.vault.delete`, `admin.federation.revoke`.
+- `payload`: `{"actor": "admin", "token_id", "token_name", ...alvo}`; nunca senha nem token. Ações do terminal têm `token_id` nulo e `token_name` `"cli"`. `ip` é o do cliente do painel (nulo no terminal).
+- Quando o alvo é um usuário, a linha leva o id dele em `user_id` e o nome em `payload.username`: o apagamento LGPD dele anonimiza também essas linhas (inclusive o IP do admin nelas).
+- Mudanças feitas só pelo serviço de administração (senha, desativar, ativar, desbloquear, encerrar sessão, tokens, criar usuário) gravam a auditoria na mesma transação: se a linha não puder ser escrita, nada muda. Apagar usuário, apagar cofre e revogar federação passam pelos serviços de domínio: a linha é gravada antes e, se falhar, a ação não acontece; se a ação falhar depois, o log do servidor registra a falha. Esses serviços gravam ainda os seus próprios eventos (`user.delete`, `vault.delete`, `federation.revoke`).
+
+## Terminal
+`lumi-server help` lista os comandos. `<user>` aceita nome ou id; `<vault>`, slug ou id. As listas aceitam `--json` (mesmos formatos da API, sem paginação). Senhas: `--password-stdin` lê uma linha do stdin; sem ele, pede duas vezes no terminal, sem eco. `user delete` e `vault delete` pedem para digitar o nome do alvo, ou `--yes` quando o stdin não é um terminal. O terminal só precisa do banco e de `LUMI_ROOT` (as mesmas variáveis do servidor); com o servidor rodando, o efeito no banco é imediato, mas streams do feed abertas fecham na próxima checagem (até 1 min), WebSockets de notas ficam até reconectar e um vínculo de federação já aberto continua até reconectar ou reiniciar — por isso, com o servidor no ar, prefira a API.
+
+## Diferenças em relação ao porvia (ADR 0037)
+- Erros em `{"error", "detail"}` como no resto do lumi, em vez de `application/problem+json`; datas em RFC 3339, não milissegundos.
+- Auditoria no `audit_log` existente (com filtro `scope=admin`), não numa tabela à parte, para o apagamento LGPD alcançar também as linhas de admin.
+- Ids do lumi são UUIDv4: páginas por `username`, `slug` ou `(criação, id)`, com cursor opaco.
+- Sessões não têm id próprio: o id é o hash do token.
+- Sem TLS no processo: o aviso fora do loopback vale sempre.
+- O bloqueio por falhas de login passou a ser persistente (migração 0007), para o painel poder mostrá-lo e desbloquear; os limites em memória da API pública continuam.
