@@ -117,6 +117,7 @@ func (h *RelayHandlers) handleConn(conn *websocket.Conn) {
 		_ = conn.Close()
 		return
 	}
+	conn.SetReadLimit(maxRelayMessageBytes)
 	h.log.Info().Str("peer", peerURL).Str("vault", vaultID.String()).Msg("federation: follower connected")
 	sess := h.links.NewSession(nil, conn, vaultID, peerURL, "home")
 	if err := sess.Run(); err != nil {

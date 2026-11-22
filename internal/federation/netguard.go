@@ -227,6 +227,7 @@ func (p NetPolicy) WSDialer() Dialer {
 		if err != nil {
 			return nil, err
 		}
+		conn.SetReadLimit(maxRelayMessageBytes)
 		return conn, nil
 	}
 }

@@ -37,6 +37,27 @@ func SyncAuthMessage(nonce, vaultID, followerURL string) []byte {
 
 var errFrameTruncated = errors.New("federation: truncated frame")
 
+// Relay resource caps. A federated peer is authenticated but not trusted
+// with our memory: every WebSocket read and every decoded frame is bounded.
+const (
+	// maxRelayMessageBytes caps a single WS message (both sides call
+	// SetReadLimit with it) and therefore any frame. Generous enough for a
+	// full y-doc state of a note at the 4 MiB REST body limit plus history,
+	// or a manifest of maxManifestEntries typical notes.
+	maxRelayMessageBytes = 32 << 20
+	// maxManifestEntries bounds how many notes one manifest may list.
+	maxManifestEntries = 200_000
+	// Per-field caps on note metadata (ids are <= 80 bytes server-side).
+	maxNoteIDBytes    = 256
+	maxNotePathBytes  = 4096
+	maxNoteTitleBytes = 4096
+	// minNoteMetaBytes is the smallest encoded NoteMeta (three empty
+	// varBytes); used to bound manifest pre-allocation by the input size.
+	minNoteMetaBytes = 3
+)
+
+var errFrameTooLarge = errors.New("federation: frame exceeds size limit")
+
 // NoteMeta identifies a note across the link. Path/title are creation
 // metadata for peers that don't have the note yet.
 type NoteMeta struct {
@@ -115,6 +136,9 @@ func readNoteMeta(buf []byte) (NoteMeta, int, error) {
 	if err != nil {
 		return NoteMeta{}, 0, err
 	}
+	if len(id) > maxNoteIDBytes || len(path) > maxNotePathBytes || len(title) > maxNoteTitleBytes {
+		return NoteMeta{}, 0, fmt.Errorf("%w: note metadata field too long", errFrameTooLarge)
+	}
 	return NoteMeta{ID: id, Path: path, Title: title}, n1 + n2 + n3, nil
 }
 
@@ -181,6 +205,9 @@ type Frame struct {
 }
 
 func DecodeFrame(buf []byte) (Frame, error) {
+	if len(buf) > maxRelayMessageBytes {
+		return Frame{}, errFrameTooLarge
+	}
 	typ, n, err := readVarUint(buf)
 	if err != nil {
 		return Frame{}, err
@@ -193,8 +220,13 @@ func DecodeFrame(buf []byte) (Frame, error) {
 			return Frame{}, err
 		}
 		body = body[n:]
-		if count > 1_000_000 {
-			return Frame{}, fmt.Errorf("federation: absurd manifest size %d", count)
+		if count > maxManifestEntries {
+			return Frame{}, fmt.Errorf("%w: manifest lists %d notes (max %d)", errFrameTooLarge, count, maxManifestEntries)
+		}
+		// Each entry needs at least minNoteMetaBytes, so a count the body
+		// cannot possibly hold is a lie: reject before allocating.
+		if count > uint64(len(body)/minNoteMetaBytes) {
+			return Frame{}, errFrameTruncated
 		}
 		notes := make([]NoteMeta, 0, count)
 		for i := uint64(0); i < count; i++ {

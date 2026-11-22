@@ -266,6 +266,11 @@ func (l *Links) NewSession(ctx context.Context, conn wsConn, vaultID uuid.UUID, 
 	if ctx == nil {
 		ctx = l.rootCtx
 	}
+	// Bound every inbound WS message regardless of which side created the
+	// connection (home handler or follower dialer).
+	if rl, ok := conn.(interface{ SetReadLimit(int64) }); ok {
+		rl.SetReadLimit(maxRelayMessageBytes)
+	}
 	return &Session{
 		conn:      conn,
 		vaultID:   vaultID,
