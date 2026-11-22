@@ -533,7 +533,13 @@ func (h *Handlers) create(c *fiber.Ctx) error {
 		}
 		return mapErr(c, err)
 	}
-	return c.Status(http.StatusCreated).JSON(toDTO(v))
+	// Same shape as list/detail (head, role, can_edit, federation) so
+	// clients can insert the new vault without a follow-up GET.
+	view, err := h.svc.GetView(c.UserContext(), u.ID, v.ID)
+	if err != nil {
+		return mapErr(c, err)
+	}
+	return c.Status(http.StatusCreated).JSON(toViewDTO(view))
 }
 
 func (h *Handlers) detail(c *fiber.Ctx) error {
