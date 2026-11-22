@@ -13,6 +13,7 @@ package capguard
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -137,6 +138,38 @@ func RequireCapability(r Resolver, cap domain.Capability) fiber.Handler {
 		}
 		return c.Next()
 	}
+}
+
+// AuthorizeGrant enforces the no-escalation rule for handing out a role
+// (invites, role changes): the vault owner may grant any role of the vault;
+// everyone else may only grant a role whose capabilities are a subset of
+// the role they themselves hold in that vault. The target role must belong
+// to the vault. Returns a wrapped domain.ErrValidation for a foreign role
+// and domain.ErrForbidden for an escalation attempt or non-member actor.
+func AuthorizeGrant(ctx context.Context, r Resolver, vault domain.Vault, actorID uuid.UUID, target domain.Role) error {
+	if target.VaultID != vault.ID || vault.ID == uuid.Nil {
+		return fmt.Errorf("%w: role does not belong to vault", domain.ErrValidation)
+	}
+	if actorID != uuid.Nil && actorID == vault.OwnerUserID {
+		return nil
+	}
+	if r == nil {
+		return fmt.Errorf("%w: no capability resolver configured", domain.ErrForbidden)
+	}
+	actorRole, err := r.RoleForUser(ctx, vault.ID, actorID)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return fmt.Errorf("%w: actor is not a member of the vault", domain.ErrForbidden)
+		}
+		return err
+	}
+	if actorRole.VaultID != uuid.Nil && actorRole.VaultID != vault.ID {
+		return fmt.Errorf("%w: actor role does not belong to vault", domain.ErrForbidden)
+	}
+	if !actorRole.Capabilities.Covers(target.Capabilities) {
+		return fmt.Errorf("%w: cannot grant a role with capabilities beyond your own", domain.ErrForbidden)
+	}
+	return nil
 }
 
 func respondForbidden(c *fiber.Ctx, cap domain.Capability) error {

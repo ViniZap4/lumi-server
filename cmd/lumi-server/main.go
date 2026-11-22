@@ -450,11 +450,13 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	rolesSvc := roles.NewService(roleStore, auditStore)
 	membersSvc := members.NewService(memberRepoAdapter{memberStore}, auditStore)
 	membersSvc.SetVaultLookup(vaultStore)
+	membersSvc.SetRoleLookup(roleStore)
 	// F3: capability checks route through the federation-aware resolver —
 	// for vaults this server follows, authorization comes from home's
 	// replicated control state. Bound to the federation service below;
 	// until then it transparently delegates to membersSvc.
 	fedResolver := federation.NewControlResolver(membersSvc, userStore)
+	membersSvc.SetGrantResolver(fedResolver)
 	vaultsSvc := vaults.NewService(vaultStore, roleStore, memberStore, fsMgr, auditStore, fedResolver)
 	usersSvc := users.NewService(userStore, consentStore, auditStore, auditStore, vaultStore)
 	usersSvc.SetVaultDirRemover(fsMgr)
@@ -542,6 +544,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		Hasher:        authSvc,
 		Tokens:        authSvc,
 		Audit:         auditStore,
+		Resolver:      fedResolver,
 		PublicBaseURL: cfg.publicBaseURL,
 	})
 

@@ -120,8 +120,10 @@ func newGuardFixture(t *testing.T) *guardFixture {
 	repo := newFakeRepo()
 	vaultID, owner, editor := uuid.New(), uuid.New(), uuid.New()
 
-	admin := domain.Role{ID: uuid.New(), VaultID: vaultID, Name: "Admin", IsSeed: true}
-	editRole := domain.Role{ID: uuid.New(), VaultID: vaultID, Name: "Editor", IsSeed: true}
+	admin := domain.Role{ID: uuid.New(), VaultID: vaultID, Name: "Admin", IsSeed: true,
+		Capabilities: domain.CapabilitySet{domain.CapAll}}
+	editRole := domain.Role{ID: uuid.New(), VaultID: vaultID, Name: "Editor", IsSeed: true,
+		Capabilities: domain.CapabilitySet{domain.CapNoteRead, domain.CapNoteEdit}}
 	repo.roles[admin.ID] = admin
 	repo.roles[editRole.ID] = editRole
 	repo.members[key(vaultID, owner)] = domain.Member{VaultID: vaultID, UserID: owner, RoleID: admin.ID}

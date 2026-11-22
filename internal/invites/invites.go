@@ -108,21 +108,25 @@ type Service struct {
 	hasher        AuthHasher
 	tokens        TokenIssuer
 	audit         audit.Recorder
+	grants        capguard.Resolver
 	publicBaseURL string
 	now           func() time.Time
 }
 
 type Deps struct {
-	Repo          Repo
-	Users         UserRepo
-	Members       MemberRepo
-	Vaults        VaultRepo
-	Roles         RoleRepo
-	Consents      ConsentRepo
-	Sessions      SessionRepo
-	Hasher        AuthHasher
-	Tokens        TokenIssuer
-	Audit         audit.Recorder
+	Repo     Repo
+	Users    UserRepo
+	Members  MemberRepo
+	Vaults   VaultRepo
+	Roles    RoleRepo
+	Consents ConsentRepo
+	Sessions SessionRepo
+	Hasher   AuthHasher
+	Tokens   TokenIssuer
+	Audit    audit.Recorder
+	// Resolver reads the inviter's role for the no-escalation check. nil
+	// means only the vault owner can mint invites (fail closed).
+	Resolver      capguard.Resolver
 	PublicBaseURL string
 	Now           func() time.Time
 }
@@ -152,6 +156,7 @@ func NewService(d Deps) *Service {
 		hasher:        d.Hasher,
 		tokens:        d.Tokens,
 		audit:         a,
+		grants:        d.Resolver,
 		publicBaseURL: strings.TrimRight(d.PublicBaseURL, "/"),
 		now:           now,
 	}
@@ -188,6 +193,14 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (domain.Invite, er
 	}
 	if role.VaultID != in.VaultID {
 		return domain.Invite{}, fmt.Errorf("%w: role does not belong to vault", domain.ErrValidation)
+	}
+	vault, err := s.vaults.GetByID(ctx, in.VaultID)
+	if err != nil {
+		return domain.Invite{}, fmt.Errorf("load vault: %w", err)
+	}
+	// No escalation: members.invite alone must not mint an Admin invite.
+	if err := capguard.AuthorizeGrant(ctx, s.grants, vault, in.InviterID, role); err != nil {
+		return domain.Invite{}, err
 	}
 
 	inv := domain.Invite{

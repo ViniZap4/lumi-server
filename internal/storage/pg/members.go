@@ -23,9 +23,14 @@ func NewMemberStore(pool *pgxpool.Pool) *MemberStore {
 func (s *MemberStore) Add(ctx context.Context, m domain.Member) error {
 	const q = `
 INSERT INTO vault_members (vault_id, user_id, role_id, joined_at)
-VALUES ($1, $2, $3, $4)`
-	if _, err := s.pool.Exec(ctx, q, m.VaultID, m.UserID, m.RoleID, m.JoinedAt); err != nil {
+SELECT $1::uuid, $2::uuid, $3::uuid, $4::timestamptz
+ WHERE EXISTS (SELECT 1 FROM vault_roles WHERE id = $3::uuid AND vault_id = $1::uuid)`
+	tag, err := s.pool.Exec(ctx, q, m.VaultID, m.UserID, m.RoleID, m.JoinedAt)
+	if err != nil {
 		return fmt.Errorf("member store: add: %w", errMap(err))
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("member store: add: %w: role does not belong to vault", domain.ErrValidation)
 	}
 	return nil
 }
@@ -46,7 +51,8 @@ func (s *MemberStore) ChangeRole(ctx context.Context, vaultID, userID, newRoleID
 	const q = `
 UPDATE vault_members
    SET role_id = $3
- WHERE vault_id = $1 AND user_id = $2`
+ WHERE vault_id = $1 AND user_id = $2
+   AND EXISTS (SELECT 1 FROM vault_roles WHERE id = $3 AND vault_id = $1)`
 	tag, err := s.pool.Exec(ctx, q, vaultID, userID, newRoleID)
 	if err != nil {
 		return fmt.Errorf("member store: change role: %w", errMap(err))
@@ -89,7 +95,7 @@ SELECT m.vault_id, m.user_id, m.role_id, m.joined_at,
        r.id, r.vault_id, r.name, r.capabilities, r.is_seed
   FROM vault_members m
   JOIN users u ON u.id = m.user_id
-  JOIN vault_roles r ON r.id = m.role_id
+  JOIN vault_roles r ON r.id = m.role_id AND r.vault_id = m.vault_id
  WHERE m.vault_id = $1
  ORDER BY m.joined_at ASC`
 	rows, err := s.pool.Query(ctx, q, vaultID)
@@ -131,13 +137,13 @@ func (s *MemberStore) IsSoleAdmin(ctx context.Context, vaultID, userID uuid.UUID
 SELECT
   EXISTS (
     SELECT 1 FROM vault_members vm
-    JOIN vault_roles vr ON vr.id = vm.role_id
+    JOIN vault_roles vr ON vr.id = vm.role_id AND vr.vault_id = vm.vault_id
     WHERE vm.vault_id = $1 AND vm.user_id = $2
       AND vr.is_seed = TRUE AND vr.name = 'Admin'
   ) AS is_admin,
   (
     SELECT COUNT(*) FROM vault_members vm
-    JOIN vault_roles vr ON vr.id = vm.role_id
+    JOIN vault_roles vr ON vr.id = vm.role_id AND vr.vault_id = vm.vault_id
     WHERE vm.vault_id = $1
       AND vr.is_seed = TRUE AND vr.name = 'Admin'
   ) AS admin_count`
@@ -155,7 +161,7 @@ func (s *MemberStore) RoleForUser(ctx context.Context, vaultID, userID uuid.UUID
 	const q = `
 SELECT vr.id, vr.vault_id, vr.name, vr.capabilities, vr.is_seed
   FROM vault_members vm
-  JOIN vault_roles vr ON vr.id = vm.role_id
+  JOIN vault_roles vr ON vr.id = vm.role_id AND vr.vault_id = vm.vault_id
  WHERE vm.vault_id = $1 AND vm.user_id = $2`
 
 	row := s.pool.QueryRow(ctx, q, vaultID, userID)

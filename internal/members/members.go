@@ -41,11 +41,19 @@ type VaultOwnerLookup interface {
 	GetByID(ctx context.Context, id uuid.UUID) (domain.Vault, error)
 }
 
+// RoleLookup resolves a role by id so ChangeRole can verify the target
+// role's vault and capabilities. Implemented by *pg.RoleStore.
+type RoleLookup interface {
+	GetByID(ctx context.Context, roleID uuid.UUID) (domain.Role, error)
+}
+
 // Service is the business-logic layer.
 type Service struct {
 	repo          Repo
 	audit         audit.Recorder
 	vaults        VaultOwnerLookup
+	roles         RoleLookup
+	grants        capguard.Resolver
 	controlNotify ControlPlaneNotifier
 }
 
@@ -60,6 +68,50 @@ func NewService(r Repo, a audit.Recorder) *Service {
 // cannot be removed or demoted below Admin). nil disables — sole-admin
 // protection still applies.
 func (s *Service) SetVaultLookup(v VaultOwnerLookup) { s.vaults = v }
+
+// SetRoleLookup wires direct role lookup for ChangeRole. When nil the role
+// is searched among the vault's member rows (which only finds roles that
+// someone already holds).
+func (s *Service) SetRoleLookup(r RoleLookup) { s.roles = r }
+
+// SetGrantResolver overrides the resolver used to read the ACTOR's role
+// for the no-escalation check (e.g. the federation-aware resolver). nil
+// falls back to this service's own repo.
+func (s *Service) SetGrantResolver(r capguard.Resolver) { s.grants = r }
+
+func (s *Service) grantResolver() capguard.Resolver {
+	if s.grants != nil {
+		return s.grants
+	}
+	return s
+}
+
+// lookupRole resolves roleID and verifies it belongs to vaultID.
+func (s *Service) lookupRole(ctx context.Context, vaultID, roleID uuid.UUID) (domain.Role, error) {
+	if s.roles != nil {
+		r, err := s.roles.GetByID(ctx, roleID)
+		if err != nil {
+			if errors.Is(err, domain.ErrNotFound) {
+				return domain.Role{}, fmt.Errorf("%w: role does not belong to vault", domain.ErrValidation)
+			}
+			return domain.Role{}, err
+		}
+		if r.VaultID != vaultID {
+			return domain.Role{}, fmt.Errorf("%w: role does not belong to vault", domain.ErrValidation)
+		}
+		return r, nil
+	}
+	joined, err := s.repo.ListForVault(ctx, vaultID)
+	if err != nil {
+		return domain.Role{}, err
+	}
+	for i := range joined {
+		if joined[i].Role.ID == roleID && joined[i].Role.VaultID == vaultID {
+			return joined[i].Role, nil
+		}
+	}
+	return domain.Role{}, fmt.Errorf("%w: role does not belong to vault", domain.ErrValidation)
+}
 
 // ControlPlaneNotifier hears about membership changes so the federation
 // control plane can re-push signed state to followers (v3 F3). Must be
@@ -111,7 +163,11 @@ func (s *Service) Add(ctx context.Context, m domain.Member, ip, ua string) error
 	return nil
 }
 
-// ChangeRole refuses to demote the sole admin or the vault owner.
+// ChangeRole refuses to demote the sole admin or the vault owner, rejects
+// roles from another vault, and enforces no-escalation: a non-owner actor
+// may only assign a role whose capabilities they already hold, and may only
+// re-role a member whose current role they also cover (so members.manage
+// cannot demote an Admin either).
 func (s *Service) ChangeRole(
 	ctx context.Context,
 	vaultID, userID, newRoleID uuid.UUID,
@@ -125,9 +181,26 @@ func (s *Service) ChangeRole(
 	if current.RoleID == newRoleID {
 		return nil
 	}
+	newRole, err := s.lookupRole(ctx, vaultID, newRoleID)
+	if err != nil {
+		return err
+	}
 	owner, err := s.vaultOwner(ctx, vaultID)
 	if err != nil {
 		return err
+	}
+	if owner == uuid.Nil || actorID != owner {
+		vault := domain.Vault{ID: vaultID, OwnerUserID: owner}
+		if err := capguard.AuthorizeGrant(ctx, s.grantResolver(), vault, actorID, newRole); err != nil {
+			return err
+		}
+		if currentRole, err := s.lookupRole(ctx, vaultID, current.RoleID); err == nil {
+			if err := capguard.AuthorizeGrant(ctx, s.grantResolver(), vault, actorID, currentRole); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, domain.ErrValidation) {
+			return err
+		}
 	}
 	sole, err := s.repo.IsSoleAdmin(ctx, vaultID, userID)
 	if err != nil {
@@ -136,18 +209,7 @@ func (s *Service) ChangeRole(
 	if sole || userID == owner {
 		// The target must land on the seed Admin role: the sole admin (and
 		// always the owner) keeps an Admin-equivalent grant.
-		joined, err := s.repo.ListForVault(ctx, vaultID)
-		if err != nil {
-			return err
-		}
-		var newRole *domain.Role
-		for i := range joined {
-			if joined[i].Role.ID == newRoleID {
-				newRole = &joined[i].Role
-				break
-			}
-		}
-		if newRole == nil || !(newRole.IsSeed && newRole.Name == "Admin") {
+		if !(newRole.IsSeed && newRole.Name == "Admin") {
 			if userID == owner {
 				return ErrOwnerProtection{VaultID: vaultID, UserID: userID}
 			}
@@ -399,7 +461,10 @@ func mapError(c *fiber.Ctx, err error) error {
 			"message": err.Error(),
 		})
 	case errors.Is(err, domain.ErrForbidden):
-		return nil
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{
+			"error":   "forbidden",
+			"message": err.Error(),
+		})
 	default:
 		return c.Status(http.StatusInternalServerError).JSON(fiber.Map{"error": "internal"})
 	}

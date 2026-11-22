@@ -68,7 +68,7 @@ func (s *FederatedMemberStore) ListForVault(ctx context.Context, vaultID uuid.UU
 	const q = `
 SELECT fm.vault_id, fm.member_key, fm.role_id, vr.name, fm.joined_at
   FROM federated_vault_members fm
-  JOIN vault_roles vr ON vr.id = fm.role_id
+  JOIN vault_roles vr ON vr.id = fm.role_id AND vr.vault_id = fm.vault_id
  WHERE fm.vault_id = $1
  ORDER BY fm.member_key ASC`
 	rows, err := s.pool.Query(ctx, q, vaultID)

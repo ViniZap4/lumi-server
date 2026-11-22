@@ -63,6 +63,20 @@ func (cs CapabilitySet) Has(c Capability) bool {
 	return false
 }
 
+// Covers reports whether cs grants everything other grants, i.e. whether a
+// holder of cs may hand out a role carrying other without escalating. Each
+// entry of other (wildcards included) must be matched by Has: "*" is only
+// covered by "*", "note.*" by "*" or "note.*", and an exact capability by
+// any pattern that matches it. An empty other is always covered.
+func (cs CapabilitySet) Covers(other CapabilitySet) bool {
+	for _, c := range other {
+		if !cs.Has(c) {
+			return false
+		}
+	}
+	return true
+}
+
 // SeedRoles returns the canonical seed-role definitions. Vault creation seeds
 // these into vault_roles with is_seed = true.
 func SeedRoles() map[string]CapabilitySet {
