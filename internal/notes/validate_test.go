@@ -114,10 +114,10 @@ func TestValidateNoteRelPath_NormalisesCleanly(t *testing.T) {
 	// accidentally turn "ok//note.md" into something fs.SafeJoin
 	// rejects as malformed.
 	cases := map[string]string{
-		"note.md/":         "note.md",
-		"sub/./note.md":    "sub/note.md",
-		"sub//note.md":     "sub/note.md",
-		"  trim.md  ":      "trim.md",
+		"note.md/":      "note.md",
+		"sub/./note.md": "sub/note.md",
+		"sub//note.md":  "sub/note.md",
+		"  trim.md  ":   "trim.md",
 	}
 	for in, want := range cases {
 		t.Run(in, func(t *testing.T) {

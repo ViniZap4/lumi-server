@@ -106,10 +106,10 @@ func TestEncodeDecodeAwareness(t *testing.T) {
 func TestDecodeRejectsShortFrames(t *testing.T) {
 	cases := [][]byte{
 		{},
-		{MessageSync},                   // no sub-type
-		{MessageSync, SyncStep1},        // no body length
-		{MessageSync, SyncStep1, 0x05},  // length=5 but no bytes
-		{MessageAwareness},              // no length
+		{MessageSync},                  // no sub-type
+		{MessageSync, SyncStep1},       // no body length
+		{MessageSync, SyncStep1, 0x05}, // length=5 but no bytes
+		{MessageAwareness},             // no length
 	}
 	for i, frame := range cases {
 		if _, err := DecodeMessage(frame); err == nil {

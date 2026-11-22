@@ -101,9 +101,9 @@ func (f HandlerFunc) HandleFSWrite(ctx context.Context, ev Event) { f(ctx, ev) }
 // Manager owns the watcher, suppression registry, and debounce
 // scheduler. Construct via New; drive via Run; tear down via Close.
 type Manager struct {
-	root    string
-	fsMgr   *fs.Manager
-	log     zerolog.Logger
+	root  string
+	fsMgr *fs.Manager
+	log   zerolog.Logger
 
 	handler   Handler
 	handlerMu sync.RWMutex
@@ -114,8 +114,8 @@ type Manager struct {
 	suppressMu  sync.Mutex
 	suppressTTL time.Duration
 
-	debounce   map[string]*time.Timer
-	debounceMu sync.Mutex
+	debounce    map[string]*time.Timer
+	debounceMu  sync.Mutex
 	debounceFor time.Duration
 
 	rootCtx    context.Context

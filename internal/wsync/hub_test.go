@@ -598,7 +598,7 @@ func TestLeaveSkipsPresenceLeaveFrameForNilClientID(t *testing.T) {
 	vault := uuid.New()
 	note := "anon-leave"
 
-	leaver := hub.NewSubscriber(uuid.New())     // no ClientID
+	leaver := hub.NewSubscriber(uuid.New()) // no ClientID
 	observer := hub.NewSubscriber(uuid.New())
 
 	room, err := hub.Join(context.Background(), vault, note, leaver)

@@ -27,7 +27,9 @@ func (f *fakeRoleRepo) Get(_ context.Context, _ uuid.UUID, id uuid.UUID) (domain
 func (f *fakeRoleRepo) GetByName(context.Context, uuid.UUID, string) (domain.Role, error) {
 	return domain.Role{}, domain.ErrNotFound
 }
-func (f *fakeRoleRepo) ListForVault(context.Context, uuid.UUID) ([]domain.Role, error) { return nil, nil }
+func (f *fakeRoleRepo) ListForVault(context.Context, uuid.UUID) ([]domain.Role, error) {
+	return nil, nil
+}
 func (f *fakeRoleRepo) Update(_ context.Context, r domain.Role) error {
 	f.roles[r.ID] = r
 	return nil

@@ -18,8 +18,8 @@ import (
 // recorder is a tiny Handler that pushes every dispatched event into a
 // channel so tests can assert on what arrived.
 type recorder struct {
-	ch     chan Event
-	count  atomic.Int64
+	ch    chan Event
+	count atomic.Int64
 }
 
 func newRecorder() *recorder { return &recorder{ch: make(chan Event, 32)} }
