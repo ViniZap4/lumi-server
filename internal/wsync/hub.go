@@ -137,6 +137,10 @@ type Room struct {
 	opMu    sync.Mutex
 	evicted atomic.Bool
 
+	// awareness register (presence.go)
+	awMu sync.Mutex
+	aw   map[uint64]*awEntry
+
 	mirrorTimer *time.Timer
 	mirrorGen   uint64
 	mirrorMu    sync.Mutex

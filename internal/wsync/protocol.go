@@ -7,7 +7,10 @@
 // Wire format (https://github.com/yjs/y-protocols/blob/master/PROTOCOL.md):
 //
 //	Message     ::= varInt(messageType) + payload
-//	messageType ::= 0 Sync | 1 Awareness | 3 Auth | 4 QueryAwareness
+//	messageType ::= 0 Sync | 1 Awareness | 2 Auth | 3 QueryAwareness
+//
+// (numbering matches y-websocket: messageSync=0, messageAwareness=1,
+// messageAuth=2, messageQueryAwareness=3)
 //
 //	Sync payload ::= varInt(syncSubType) + body
 //	syncSubType  ::= 0 Step1 (body=stateVector)
@@ -15,6 +18,8 @@
 //	                | 2 Update (body=update)
 //
 //	Awareness payload ::= varBytes(awarenessUpdate)
+//	awarenessUpdate   ::= varUint(n) · n × (varUint(clientID) ·
+//	                      varUint(clock) · varString(stateJSON | "null"))
 //
 // varInt is lib0's unsigned LEB128. varBytes is varInt(len) + bytes.
 package wsync
@@ -28,10 +33,10 @@ import (
 
 // Message types (top-level).
 const (
-	MessageSync            byte = 0
-	MessageAwareness       byte = 1
-	MessageAuth            byte = 3
-	MessageQueryAwareness  byte = 4
+	MessageSync           byte = 0
+	MessageAwareness      byte = 1
+	MessageAuth           byte = 2
+	MessageQueryAwareness byte = 3
 )
 
 // Sync sub-types.
@@ -169,8 +174,7 @@ func DecodeMessage(buf []byte) (ParsedMessage, error) {
 		return m, nil
 
 	case MessageQueryAwareness:
-		// No body. We do not maintain a server-side awareness register
-		// in slice 2.3 — reply is just an empty awareness fan-out.
+		// No body. The server answers with its awareness register.
 		return m, nil
 
 	case MessageAuth:

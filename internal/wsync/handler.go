@@ -256,10 +256,9 @@ func (h *Handler) handleMessage(room *Room, sub *Subscriber, userID uuid.UUID, m
 		if len(msg.Body) == 0 {
 			return
 		}
-		room.BroadcastAwareness(msg.Body, sub)
+		room.handleAwareness(msg.Body, sub)
 	case MessageQueryAwareness:
-		// We don't keep a server-side awareness register; nothing to
-		// reply with. Slice 2.3 tradeoff.
+		room.queryAwareness(sub)
 	case MessageAuth:
 		// Yjs's auth message has no agreed semantics across clients;
 		// our gate runs at upgrade time. Drop.

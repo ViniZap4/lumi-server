@@ -522,7 +522,7 @@ func TestRoomAwarenessRelay(t *testing.T) {
 
 // TestLeaveBroadcastsPresenceLeaveFrame verifies that when a subscriber
 // with a non-nil ClientID departs, remaining subscribers receive a
-// synthetic awareness frame carrying `{client_id, left: true}`. Without
+// synthetic legacy-JSON awareness frame carrying `{client_id, left: true}`. Without
 // this, peers would only drop the departing presence after the
 // client-side TTL elapses. Post-H follow-up.
 func TestLeaveBroadcastsPresenceLeaveFrame(t *testing.T) {
@@ -546,6 +546,12 @@ func TestLeaveBroadcastsPresenceLeaveFrame(t *testing.T) {
 		t.Fatalf("Join observer: %v", err)
 	}
 	defer hub.Leave(room, observer)
+
+	// Both speak the legacy JSON presence dialect (Apple client); the JSON
+	// "left" frame is only delivered to legacy subscribers.
+	room.handleAwareness([]byte(`{"client_id":"`+uuid.NewString()+`"}`), observer)
+	room.handleAwareness([]byte(`{"client_id":"`+leaverClient.String()+`"}`), leaver)
+	<-observer.Out // leaver's presence relayed to the legacy observer
 
 	hub.Leave(room, leaver)
 
