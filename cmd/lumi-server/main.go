@@ -7,6 +7,7 @@
 //	lumi-server migrate down N     roll back N migrations
 //	lumi-server migrate status     print current migration version
 //	lumi-server version            print version
+//	lumi-server token|user|...     administration (see admin_cli.go)
 package main
 
 import (
@@ -164,6 +165,9 @@ func realMain(args []string) int {
 			printUsage()
 			return exitOK
 		default:
+			if isAdminCommand(args[0]) {
+				return adminCLI(args) // docs/ADMIN.md
+			}
 			fmt.Fprintf(os.Stderr, "unknown command %q\n", args[0])
 			printUsage()
 			return exitUsage
@@ -183,6 +187,7 @@ Usage:
   lumi-server version            print version
 
 Configuration is via environment variables. See .env.example.`)
+	fmt.Fprintln(os.Stderr, "\n"+adminUsage)
 }
 
 // ---------------------------------------------------------------- config ----
@@ -209,6 +214,8 @@ type config struct {
 	// Federation outbound policy + who may join remote vaults.
 	federationNet       federation.NetPolicy
 	federationOperators []string
+
+	admin adminConfig // LUMI_ADMIN_ADDR, LUMI_ADMIN_TRUSTED_PROXIES (admin.go)
 }
 
 func loadConfig() (config, error) {
@@ -264,6 +271,9 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("LUMI_FEDERATION_ALLOWED_CIDRS: %w", err)
 	}
 	c.federationNet.AllowedCIDRs = cidrs
+	if c.admin, err = loadAdminConfig(c); err != nil {
+		return config{}, err
+	}
 	if err := c.validate(); err != nil {
 		return config{}, err
 	}
@@ -697,8 +707,18 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		},
 	)
 
+	// ---- admin listener (docs/ADMIN.md; off unless LUMI_ADMIN_ADDR) ----
+	adminShutdown, err := startAdmin(ctx, cfg, zlog, pool, adminLive{
+		auth: authSvc, users: usersSvc, vaults: vaultsSvc, federation: federationSvc,
+		broker: broker, hub: wsHub,
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// ---- end admin listener ----
+
 	shutdown := func(ctx context.Context) error {
-		_ = ctx
+		_ = adminShutdown(ctx)
 		_ = fsWatcher.Close()
 		wsHub.Close()
 		return nil

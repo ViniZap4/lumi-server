@@ -92,6 +92,11 @@ const (
 	usernameMax = 32
 )
 
+// CanonicaliseUsername applies the registration rules (trim, lower-case,
+// 3-32 of [a-z0-9_-], no leading/trailing separator). Exposed so operator
+// tooling creates accounts under exactly the same rules as Register.
+func CanonicaliseUsername(raw string) (string, error) { return canonicaliseUsername(raw) }
+
 func canonicaliseUsername(raw string) (string, error) {
 	u := strings.TrimSpace(strings.ToLower(raw))
 	if len(u) < usernameMin || len(u) > usernameMax {
@@ -229,18 +234,34 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (domain.Session, err
 		return domain.Session{}, domain.ErrInvalidCredentials
 	}
 
+	// A disabled or locked account gets the same answer as a wrong
+	// password, after the same bcrypt cost, so the response reveals
+	// neither the state nor that the account exists.
+	if realUser {
+		if reason := blockedReason(user, time.Now()); reason != "" {
+			_ = CheckPassword(s.dummyHash, in.Password)
+			id := user.ID
+			s.recordLoginFailure(ctx, &id, in, reason)
+			return domain.Session{}, domain.ErrInvalidCredentials
+		}
+	}
+
 	cmpErr := CheckPassword(hash, in.Password)
 	if !realUser || cmpErr != nil {
 		var uid *uuid.UUID
 		if realUser {
 			id := user.ID
 			uid = &id
+			s.countLoginFailure(ctx, id)
 		}
 		s.recordLoginFailure(ctx, uid, in, "invalid_credentials")
 		return domain.Session{}, domain.ErrInvalidCredentials
 	}
 
 	s.rlUser.Reset(username)
+	if user.FailedLogins > 0 || user.LockedUntil != nil {
+		s.resetLoginFailures(ctx, user.ID)
+	}
 
 	session, err := s.issueSession(ctx, user.ID)
 	if err != nil {
@@ -366,7 +387,7 @@ func (s *Service) Validate(ctx context.Context, token string) (domain.Session, d
 	}
 
 	user, err := s.users.GetByID(ctx, sess.UserID)
-	if err != nil {
+	if err != nil || user.DisabledAt != nil {
 		_ = s.sessions.DeleteSession(ctx, token)
 		return domain.Session{}, domain.User{}, domain.ErrTokenInvalid
 	}
@@ -400,11 +421,15 @@ func (s *Service) Check(ctx context.Context, token string) (reason string, err e
 	if !sess.ExpiresAt.After(time.Now().UTC()) {
 		return "expired", nil
 	}
-	if _, err := s.users.GetByID(ctx, sess.UserID); err != nil {
+	user, err := s.users.GetByID(ctx, sess.UserID)
+	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return "deleted", nil
 		}
 		return "", fmt.Errorf("auth: check user: %w", err)
+	}
+	if user.DisabledAt != nil {
+		return "revoked", nil
 	}
 	return "", nil
 }
@@ -439,6 +464,53 @@ func (s *Service) HashPassword(plaintext string) (string, error) {
 func (s *Service) NewSessionToken() string {
 	t, _ := IssueToken()
 	return t
+}
+
+// Persistent lockout (docs/ADMIN.md): after LockoutThreshold consecutive
+// wrong passwords an existing account refuses logins for 2^(n-threshold)
+// seconds, capped at LockoutMax. Unlike the in-memory limiters it survives
+// restarts and is visible to (and cleared by) the operator.
+const (
+	LockoutThreshold = 10
+	LockoutMax       = 15 * time.Minute
+)
+
+// LoginAttempts is the optional persistent-lockout surface of a UserRepo
+// (implemented by *pg.UserStore). Repos without it skip the lockout.
+type LoginAttempts interface {
+	RecordLoginFailure(ctx context.Context, id uuid.UUID, threshold int, maxLock time.Duration) error
+	ResetLoginFailures(ctx context.Context, id uuid.UUID) error
+}
+
+// blockedReason is "account_disabled", "account_locked" or "".
+func blockedReason(u domain.User, now time.Time) string {
+	switch {
+	case u.DisabledAt != nil:
+		return "account_disabled"
+	case u.LockedUntil != nil && u.LockedUntil.After(now):
+		return "account_locked"
+	}
+	return ""
+}
+
+func (s *Service) countLoginFailure(ctx context.Context, id uuid.UUID) {
+	la, ok := s.users.(LoginAttempts)
+	if !ok {
+		return
+	}
+	if err := la.RecordLoginFailure(ctx, id, LockoutThreshold, LockoutMax); err != nil {
+		s.cfg.Logger.Warn().Err(err).Msg("auth: record login failure")
+	}
+}
+
+func (s *Service) resetLoginFailures(ctx context.Context, id uuid.UUID) {
+	la, ok := s.users.(LoginAttempts)
+	if !ok {
+		return
+	}
+	if err := la.ResetLoginFailures(ctx, id); err != nil {
+		s.cfg.Logger.Warn().Err(err).Msg("auth: reset login failures")
+	}
 }
 
 func (s *Service) consumeFailureBudget(username, ip string) {

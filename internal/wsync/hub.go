@@ -824,3 +824,15 @@ func (h *Hub) UserConnections(userID uuid.UUID) int {
 	defer h.slotsMu.Unlock()
 	return h.userSlots[userID]
 }
+
+// TotalConnections returns the number of authenticated WS connections
+// across all users (admin status).
+func (h *Hub) TotalConnections() int {
+	h.slotsMu.Lock()
+	defer h.slotsMu.Unlock()
+	n := 0
+	for _, c := range h.userSlots {
+		n += c
+	}
+	return n
+}
