@@ -21,6 +21,9 @@ type fakeNoteRepo struct {
 	heads   map[uuid.UUID]int64
 	floors  map[uuid.UUID]int64
 	tombs   map[uuid.UUID][]domain.NoteTombstone
+	// onDelete, when set, plays the FK cascade from notes to the CRDT
+	// tables (called after the row is gone, outside the repo lock).
+	onDelete func(vaultID uuid.UUID, id string)
 }
 
 func (f *fakeNoteRepo) bumpLocked(vaultID uuid.UUID) int64 {
@@ -40,12 +43,37 @@ func (f *fakeNoteRepo) Upsert(_ context.Context, n domain.Note) (int64, error) {
 	for i := range rows {
 		if rows[i].ID == n.ID {
 			n.CreatedAt = rows[i].CreatedAt
+			// Like the pg store: an update never touches crdt_epoch.
+			n.CRDTEpoch = rows[i].CRDTEpoch
 			rows[i] = n
 			return seq, nil
 		}
 	}
+	if n.CRDTEpoch == "" {
+		n.CRDTEpoch = domain.NewCRDTEpoch()
+	}
 	f.byVault[n.VaultID] = append(rows, n)
 	return seq, nil
+}
+
+// setEpoch mirrors pg.NoteYjsStore.SeedSnapshot's notes-row half: stamp
+// epoch, bumping the seq only when it changes.
+func (f *fakeNoteRepo) setEpoch(vaultID uuid.UUID, id, epoch string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rows := f.byVault[vaultID]
+	for i := range rows {
+		if rows[i].ID == id {
+			if rows[i].CRDTEpoch == epoch {
+				return 0, nil
+			}
+			seq := f.bumpLocked(vaultID)
+			rows[i].CRDTEpoch = epoch
+			rows[i].ChangeSeq = seq
+			return seq, nil
+		}
+	}
+	return 0, domain.ErrNotFound
 }
 
 func (f *fakeNoteRepo) TouchContent(_ context.Context, vaultID uuid.UUID, id string, at time.Time) (int64, error) {
@@ -99,7 +127,15 @@ func (f *fakeNoteRepo) ListForVault(_ context.Context, vaultID uuid.UUID, limit,
 	return append([]domain.Note(nil), all[offset:end]...), nil
 }
 
-func (f *fakeNoteRepo) Delete(_ context.Context, vaultID uuid.UUID, id string) (int64, error) {
+func (f *fakeNoteRepo) Delete(ctx context.Context, vaultID uuid.UUID, id string) (int64, error) {
+	seq, err := f.deleteRow(ctx, vaultID, id)
+	if err == nil && f.onDelete != nil {
+		f.onDelete(vaultID, id)
+	}
+	return seq, err
+}
+
+func (f *fakeNoteRepo) deleteRow(_ context.Context, vaultID uuid.UUID, id string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	rows := f.byVault[vaultID]

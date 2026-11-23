@@ -255,6 +255,8 @@ type memStore struct {
 	snapErr   error
 	upserts   int
 	appendLog []string
+	epochs    map[string]string
+	seq       int64
 }
 
 func newMemStore() *memStore {
@@ -281,6 +283,22 @@ func (m *memStore) UpsertSnapshot(_ context.Context, v uuid.UUID, n string, stat
 	m.upserts++
 	m.snaps[mk(v, n)] = append([]byte(nil), state...)
 	return nil
+}
+func (m *memStore) SeedSnapshot(_ context.Context, v uuid.UUID, n string, state []byte, epoch string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.upserts++
+	m.snaps[mk(v, n)] = append([]byte(nil), state...)
+	delete(m.updates, mk(v, n))
+	if m.epochs == nil {
+		m.epochs = map[string]string{}
+	}
+	if m.epochs[mk(v, n)] == epoch {
+		return 0, nil
+	}
+	m.epochs[mk(v, n)] = epoch
+	m.seq++
+	return m.seq, nil
 }
 func (m *memStore) AppendUpdate(_ context.Context, v uuid.UUID, n string, u []byte, _ uuid.UUID, origin string) (int64, error) {
 	m.mu.Lock()

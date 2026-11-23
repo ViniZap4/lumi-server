@@ -161,6 +161,14 @@ func (m *memSnapRepo) UpsertSnapshot(_ context.Context, vaultID uuid.UUID, noteI
 	return nil
 }
 
+func (m *memSnapRepo) SeedSnapshot(_ context.Context, vaultID uuid.UUID, noteID string, state []byte, _ string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.snaps[snKey(vaultID, noteID)] = state
+	delete(m.updates, snKey(vaultID, noteID))
+	return 0, nil
+}
+
 func (m *memSnapRepo) AppendUpdate(_ context.Context, vaultID uuid.UUID, noteID string, update []byte, _ uuid.UUID, originKind string) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

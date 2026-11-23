@@ -27,6 +27,9 @@ type memYjs struct {
 	updates   map[string][]crdt.UpdateRow
 	next      int64
 	upsertErr error
+	// notes, when set, plays the notes table for SeedSnapshot's epoch
+	// stamp (the pg store does both in one transaction).
+	notes *fakeNoteRepo
 }
 
 func newMemYjs() *memYjs {
@@ -50,6 +53,23 @@ func (m *memYjs) UpsertSnapshot(_ context.Context, v uuid.UUID, n string, st []b
 	}
 	m.snaps[yk(v, n)] = append([]byte(nil), st...)
 	return nil
+}
+func (m *memYjs) SeedSnapshot(_ context.Context, v uuid.UUID, n string, st []byte, epoch string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.upsertErr != nil {
+		return 0, m.upsertErr
+	}
+	var seq int64
+	if m.notes != nil {
+		var err error
+		if seq, err = m.notes.setEpoch(v, n, epoch); err != nil {
+			return 0, err
+		}
+	}
+	m.snaps[yk(v, n)] = append([]byte(nil), st...)
+	delete(m.updates, yk(v, n))
+	return seq, nil
 }
 func (m *memYjs) AppendUpdate(_ context.Context, v uuid.UUID, n string, u []byte, _ uuid.UUID, o string) (int64, error) {
 	m.mu.Lock()
@@ -99,8 +119,16 @@ func newCRDTFixture(t *testing.T) *crdtFixture {
 		t.Fatal(err)
 	}
 	yjs := newMemYjs()
+	repo := &fakeNoteRepo{byVault: map[uuid.UUID][]domain.Note{}}
+	yjs.notes = repo
+	repo.onDelete = func(v uuid.UUID, id string) { // ON DELETE CASCADE
+		yjs.mu.Lock()
+		defer yjs.mu.Unlock()
+		delete(yjs.snaps, yk(v, id))
+		delete(yjs.updates, yk(v, id))
+	}
 	reg := crdt.NewRegistry(yjs)
-	svc := NewService(&fakeNoteRepo{byVault: map[uuid.UUID][]domain.Note{}},
+	svc := NewService(repo,
 		&fakeVaultLookup{byID: map[uuid.UUID]domain.Vault{vault.ID: vault}},
 		mgr, nil, fakeCopyResolver{}, reg, nil)
 	hub := wsync.NewHub(reg, wsync.WithFSMirror(svc.WriteBodyFromCRDT), wsync.WithMirrorDebounce(20*time.Millisecond))

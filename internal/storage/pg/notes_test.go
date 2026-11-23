@@ -109,6 +109,73 @@ func TestMigration0006_UpDown(t *testing.T) {
 	}
 }
 
+// The CRDT epoch contract (protocol §12), pinned statically like the seq
+// contract above: Upsert writes crdt_epoch on INSERT only, and the seed
+// path rotates it together with the snapshot and the update log in one
+// transaction, taking the vault head before touching the notes row.
+func TestNoteStore_EpochSQLContract(t *testing.T) {
+	src, err := os.ReadFile("notes.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := funcBody(t, string(src), "func (s *NoteStore) Upsert(")
+	if !strings.Contains(up, "change_seq, crdt_epoch)") || !strings.Contains(up, "domain.NewCRDTEpoch()") {
+		t.Error("Upsert must insert crdt_epoch (fresh when empty)")
+	}
+	conflict := up[strings.Index(up, "ON CONFLICT"):]
+	if strings.Contains(conflict[:strings.Index(conflict, "`")], "crdt_epoch") {
+		t.Error("Upsert must not change crdt_epoch on conflict (moves keep the lineage)")
+	}
+	if !strings.Contains(string(src), "change_seq, crdt_epoch`") {
+		t.Error("noteCols must select crdt_epoch")
+	}
+
+	ysrc, err := os.ReadFile("note_yjs.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := funcBody(t, string(ysrc), "func (s *NoteYjsStore) SeedSnapshot(")
+	for _, want := range []string{
+		"runTx(ctx, s.pool",
+		"DELETE FROM note_yjs_updates WHERE vault_id = $1 AND note_id = $2`",
+		"UPDATE notes SET crdt_epoch = $3, change_seq = $4",
+		"INSERT INTO note_yjs_snapshots",
+	} {
+		if !strings.Contains(seed, want) {
+			t.Errorf("SeedSnapshot lacks %q", want)
+		}
+	}
+	b := strings.Index(seed, "bumpHead(ctx, tx,")
+	w := strings.Index(seed, "UPDATE notes SET crdt_epoch")
+	if b < 0 || b > w {
+		t.Error("SeedSnapshot must take the vault head before writing the notes row")
+	}
+}
+
+func TestMigration0008_UpDown(t *testing.T) {
+	up, err := os.ReadFile("../../../migrations/0008_crdt_epoch.up.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	down, err := os.ReadFile("../../../migrations/0008_crdt_epoch.down.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := string(up)
+	add := strings.Index(u, "ALTER TABLE notes ADD COLUMN crdt_epoch TEXT;")
+	fill := strings.Index(u, "UPDATE notes SET crdt_epoch = replace(gen_random_uuid()::text, '-', '');")
+	notNull := strings.Index(u, "SET NOT NULL")
+	if add < 0 || fill < add || notNull < fill {
+		t.Errorf("up migration must add the column, backfill every row with a fresh epoch, then set NOT NULL")
+	}
+	if !strings.Contains(u, "SET DEFAULT replace(gen_random_uuid()::text, '-', '')") {
+		t.Error("up migration lacks the random default")
+	}
+	if !strings.Contains(string(down), "ALTER TABLE notes DROP COLUMN IF EXISTS crdt_epoch") {
+		t.Error("down migration must drop crdt_epoch")
+	}
+}
+
 func funcBody(t *testing.T, code, sig string) string {
 	t.Helper()
 	i := strings.Index(code, sig)

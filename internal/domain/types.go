@@ -91,6 +91,13 @@ type Invite struct {
 //
 // ChangeSeq is the vault seq of the note's last change on this server
 // (SPEC-LIVROS §3.4); stamped by the store, ignored on input.
+//
+// CRDTEpoch identifies the note's CRDT history ("lineage", see
+// docs/CRDT-CLIENT-PROTOCOL.md §12). It is opaque and changes whenever a
+// new history starts for the id: creation, delete+recreate, seeding from
+// the file. Edits, FS diff merges, compaction and moves keep it. On
+// insert an empty value is replaced by a fresh epoch; on update the
+// stored value is kept (only the CRDT registry rotates it).
 type Note struct {
 	ID        string
 	VaultID   uuid.UUID
@@ -99,6 +106,7 @@ type Note struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 	ChangeSeq int64
+	CRDTEpoch string
 }
 
 // NoteTombstone records a deleted note id at the vault seq of the delete.

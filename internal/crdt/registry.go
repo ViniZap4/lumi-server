@@ -25,6 +25,11 @@ const (
 type SnapshotRepo interface {
 	GetSnapshot(ctx context.Context, vaultID uuid.UUID, noteID string) (SnapshotRow, error)
 	UpsertSnapshot(ctx context.Context, vaultID uuid.UUID, noteID string, state []byte) error
+	// SeedSnapshot starts a new CRDT history atomically: replace the
+	// snapshot with state, drop every update-log row and stamp epoch on
+	// the note's metadata. Returns the vault seq bumped for the epoch
+	// change, 0 when the stored epoch already equalled epoch.
+	SeedSnapshot(ctx context.Context, vaultID uuid.UUID, noteID string, state []byte, epoch string) (int64, error)
 
 	AppendUpdate(ctx context.Context, vaultID uuid.UUID, noteID string,
 		update []byte, originUserID uuid.UUID, originKind string) (int64, error)
@@ -59,6 +64,7 @@ type Registry struct {
 
 	hookMu     sync.RWMutex
 	onPersist  PersistHook
+	onEpoch    EpochHook
 	initSource InitSource
 
 	seedLocks [64]sync.Mutex
@@ -70,6 +76,27 @@ type Registry struct {
 // and inbound federation itself). Implementations MUST be fast and
 // non-blocking; they run synchronously on the write path.
 type PersistHook func(vaultID uuid.UUID, noteID string, update []byte, originKind string)
+
+// EpochHook observes a CRDT epoch rotation committed by a seed (lazy
+// init, InitFromText with a new epoch). seq is the vault seq the rotation
+// was stamped with (> 0). Must be fast and non-blocking.
+type EpochHook func(vaultID uuid.UUID, noteID, epoch string, seq int64)
+
+// SetOnEpochChange installs the epoch-rotation hook. Pass nil to remove.
+func (r *Registry) SetOnEpochChange(h EpochHook) {
+	r.hookMu.Lock()
+	defer r.hookMu.Unlock()
+	r.onEpoch = h
+}
+
+func (r *Registry) fireEpochHook(vaultID uuid.UUID, noteID, epoch string, seq int64) {
+	r.hookMu.RLock()
+	h := r.onEpoch
+	r.hookMu.RUnlock()
+	if h != nil && seq > 0 {
+		h(vaultID, noteID, epoch, seq)
+	}
+}
 
 // NewRegistry constructs a Registry around the storage. store must not
 // be nil.
@@ -173,7 +200,9 @@ func (r *Registry) LoadDoc(ctx context.Context, vaultID uuid.UUID, noteID string
 		return doc, nil
 	}
 	_ = doc.Close()
-	seeded, err := r.seed(ctx, vaultID, noteID, body, "lazy-init")
+	// Lazy init starts a new history: a fresh epoch, so a client replica
+	// tagged with the note's previous epoch is never merged into it.
+	seeded, _, err := r.seed(ctx, vaultID, noteID, body, "lazy-init", "")
 	if err != nil {
 		return nil, err
 	}
@@ -249,52 +278,88 @@ func (r *Registry) PersistChange(
 	return r.compact(ctx, vaultID, noteID, doc)
 }
 
-// InitFromText creates a fresh doc, applies `body` as the initial text,
-// and stores the resulting state as the snapshot. Use during note create
-// (and vault copy / federation import, on the home server only) to seed
-// the CRDT so subsequent updates have a base state.
-//
-// originUserID may be uuid.Nil; originKind is typically
-// "snapshot-init".
+// InitFromText seeds a brand-new note's CRDT: a fresh doc holding body
+// is stored as the snapshot and a fresh epoch is stamped on the note.
+// Equivalent to InitFromTextEpoch with epoch "".
 func (r *Registry) InitFromText(
 	ctx context.Context,
 	vaultID uuid.UUID, noteID string,
 	body string,
 	originUserID uuid.UUID, originKind string,
 ) error {
+	_, err := r.InitFromTextEpoch(ctx, vaultID, noteID, body, "", originUserID, originKind)
+	return err
+}
+
+// InitFromTextEpoch creates a fresh doc, applies `body` as the initial
+// text, and stores the resulting state as the snapshot, starting a new
+// CRDT history tagged epoch (a fresh one when ""). Use during note
+// create (and vault copy, on the home server only) to seed the CRDT so
+// subsequent updates have a base state. Callers that inserted the note
+// row with an epoch pass that epoch so the seed does not rotate it again.
+//
+// Seeding is exactly-once per history: when state is already persisted
+// for the note (a concurrent first load lazily seeded it from the same
+// freshly written file), nothing is replaced and ("", nil) is returned;
+// the note row then carries the epoch that seed stamped. Otherwise the
+// epoch written is returned.
+//
+// originUserID may be uuid.Nil; originKind is typically
+// "snapshot-init".
+func (r *Registry) InitFromTextEpoch(
+	ctx context.Context,
+	vaultID uuid.UUID, noteID string,
+	body, epoch string,
+	originUserID uuid.UUID, originKind string,
+) (string, error) {
 	_ = originUserID
 	mu := r.noteLock(vaultID, noteID)
 	mu.Lock()
 	defer mu.Unlock()
-	doc, err := r.seed(ctx, vaultID, noteID, body, originKind)
+	existing, empty, err := r.loadPersisted(ctx, vaultID, noteID)
 	if err != nil {
-		return err
+		return "", err
+	}
+	_ = existing.Close()
+	if !empty {
+		return "", nil
+	}
+	doc, written, err := r.seed(ctx, vaultID, noteID, body, originKind, epoch)
+	if err != nil {
+		return "", err
 	}
 	_ = doc.Close()
-	return nil
+	return written, nil
 }
 
-// seed builds a doc holding body and stores it as the snapshot. No log
-// row is appended: the snapshot is the full base state. Caller holds the
-// note's seed lock and owns the returned doc.
-func (r *Registry) seed(ctx context.Context, vaultID uuid.UUID, noteID, body, originKind string) (*Doc, error) {
+// seed builds a doc holding body and stores it as the snapshot of a new
+// CRDT history tagged epoch (fresh when ""), atomically with the epoch
+// and the removal of any stale update-log rows. No log row is appended:
+// the snapshot is the full base state. Caller holds the note's seed lock
+// and owns the returned doc.
+func (r *Registry) seed(ctx context.Context, vaultID uuid.UUID, noteID, body, originKind, epoch string) (*Doc, string, error) {
+	if epoch == "" {
+		epoch = domain.NewCRDTEpoch()
+	}
 	doc := NewDoc()
 	if body != "" {
 		if _, err := doc.ApplyTextDiff(body, originKind); err != nil {
 			_ = doc.Close()
-			return nil, fmt.Errorf("crdt registry: seed text: %w", err)
+			return nil, "", fmt.Errorf("crdt registry: seed text: %w", err)
 		}
 	}
 	state, err := doc.EncodeStateAsUpdate()
 	if err != nil {
 		_ = doc.Close()
-		return nil, fmt.Errorf("crdt registry: encode initial state: %w", err)
+		return nil, "", fmt.Errorf("crdt registry: encode initial state: %w", err)
 	}
-	if err := r.store.UpsertSnapshot(ctx, vaultID, noteID, state); err != nil {
+	seq, err := r.store.SeedSnapshot(ctx, vaultID, noteID, state, epoch)
+	if err != nil {
 		_ = doc.Close()
-		return nil, err
+		return nil, "", err
 	}
-	return doc, nil
+	r.fireEpochHook(vaultID, noteID, epoch, seq)
+	return doc, epoch, nil
 }
 
 // compact captures the current doc state as a new snapshot and deletes
