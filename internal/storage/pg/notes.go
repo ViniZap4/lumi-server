@@ -29,7 +29,7 @@ func NewNoteStore(pool *pgxpool.Pool) *NoteStore {
 	return &NoteStore{pool: pool}
 }
 
-const noteCols = `id, vault_id, path, title, created_at, updated_at, change_seq`
+const noteCols = `id, vault_id, path, title, created_at, updated_at, change_seq, crdt_epoch`
 
 // bumpHeadSQL hands out the next seq for a vault. INSERT … ON CONFLICT
 // covers vaults created after migration 0006 (no head row yet); either
@@ -50,22 +50,30 @@ func bumpHead(ctx context.Context, tx pgx.Tx, vaultID uuid.UUID) (int64, error) 
 
 // Upsert writes note metadata (create, move, rename, copy, federation
 // create) and returns the vault seq stamped on the row.
+//
+// crdt_epoch is written on INSERT only (n.CRDTEpoch, or a fresh epoch
+// when empty). An update keeps the stored epoch: metadata changes never
+// start a new CRDT history; only SeedSnapshot rotates it.
 func (s *NoteStore) Upsert(ctx context.Context, n domain.Note) (int64, error) {
 	const q = `
-INSERT INTO notes (id, vault_id, path, title, created_at, updated_at, change_seq)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO notes (id, vault_id, path, title, created_at, updated_at, change_seq, crdt_epoch)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (vault_id, id) DO UPDATE
    SET path       = EXCLUDED.path,
        title      = EXCLUDED.title,
        updated_at = EXCLUDED.updated_at,
        change_seq = EXCLUDED.change_seq`
+	epoch := n.CRDTEpoch
+	if epoch == "" {
+		epoch = domain.NewCRDTEpoch()
+	}
 	var seq int64
 	err := runTx(ctx, s.pool, func(tx pgx.Tx) error {
 		var err error
 		if seq, err = bumpHead(ctx, tx, n.VaultID); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, q, n.ID, n.VaultID, n.Path, n.Title, n.CreatedAt, n.UpdatedAt, seq)
+		_, err = tx.Exec(ctx, q, n.ID, n.VaultID, n.Path, n.Title, n.CreatedAt, n.UpdatedAt, seq, epoch)
 		return err
 	})
 	if err != nil {
@@ -302,7 +310,7 @@ func collectNotes(rows pgx.Rows) ([]domain.Note, error) {
 	for rows.Next() {
 		var n domain.Note
 		if err := rows.Scan(
-			&n.ID, &n.VaultID, &n.Path, &n.Title, &n.CreatedAt, &n.UpdatedAt, &n.ChangeSeq,
+			&n.ID, &n.VaultID, &n.Path, &n.Title, &n.CreatedAt, &n.UpdatedAt, &n.ChangeSeq, &n.CRDTEpoch,
 		); err != nil {
 			return nil, fmt.Errorf("note store: scan: %w", err)
 		}
@@ -317,7 +325,7 @@ func collectNotes(rows pgx.Rows) ([]domain.Note, error) {
 func (s *NoteStore) scanOne(ctx context.Context, q string, args ...any) (domain.Note, error) {
 	var n domain.Note
 	err := s.pool.QueryRow(ctx, q, args...).Scan(
-		&n.ID, &n.VaultID, &n.Path, &n.Title, &n.CreatedAt, &n.UpdatedAt, &n.ChangeSeq,
+		&n.ID, &n.VaultID, &n.Path, &n.Title, &n.CreatedAt, &n.UpdatedAt, &n.ChangeSeq, &n.CRDTEpoch,
 	)
 	if err != nil {
 		if errors.Is(errMap(err), domain.ErrNotFound) {

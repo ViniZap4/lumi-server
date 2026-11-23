@@ -50,6 +50,14 @@ func (m *memRepo) UpsertSnapshot(_ context.Context, v uuid.UUID, n string, state
 	return nil
 }
 
+func (m *memRepo) SeedSnapshot(_ context.Context, v uuid.UUID, n string, state []byte, _ string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.snapshots[key(v, n)] = append([]byte(nil), state...)
+	delete(m.updates, key(v, n))
+	return 0, nil
+}
+
 func (m *memRepo) AppendUpdate(_ context.Context, v uuid.UUID, n string, u []byte, _ uuid.UUID, origin string) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

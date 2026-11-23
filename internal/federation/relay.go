@@ -192,7 +192,13 @@ func (l *Links) NoteCreated(vaultID uuid.UUID, noteID, path, title string) {
 		l.deps.Log.Warn().Err(err).Str("note", noteID).Msg("federation: note-created load")
 		return
 	}
-	announce := EncodeNoteAnnounce(NoteMeta{ID: noteID, Path: path, Title: title})
+	// The announce carries our epoch so the peer's row names the same
+	// CRDT history as the state that follows (protocol §12).
+	meta := NoteMeta{ID: noteID, Path: path, Title: title}
+	if n, err := l.deps.Notes.Get(l.rootCtx, vaultID, noteID); err == nil {
+		meta.Epoch = n.CRDTEpoch
+	}
+	announce := EncodeNoteAnnounce(meta)
 	update := EncodeNoteSync(noteID, wsync.EncodeSyncUpdate(state))
 	for _, s := range sessions {
 		s.send(announce)
@@ -384,7 +390,7 @@ func (s *Session) listAllNotes() ([]NoteMeta, error) {
 			return nil, err
 		}
 		for _, n := range batch {
-			out = append(out, NoteMeta{ID: n.ID, Path: n.Path, Title: n.Title})
+			out = append(out, NoteMeta{ID: n.ID, Path: n.Path, Title: n.Title, Epoch: n.CRDTEpoch})
 		}
 		if len(batch) < page {
 			return out, nil
@@ -632,6 +638,8 @@ func (s *Session) ensureNote(m NoteMeta) error {
 		return err
 	}
 	now := time.Now().UTC()
+	// Adopt the sender's epoch (when it sent one): the doc this row will
+	// hold is the sender's history, relayed. Existing rows keep theirs.
 	return s.deps.Notes.Upsert(s.ctx, domain.Note{
 		ID:        m.ID,
 		VaultID:   s.vaultID,
@@ -639,6 +647,7 @@ func (s *Session) ensureNote(m NoteMeta) error {
 		Title:     m.Title,
 		CreatedAt: now,
 		UpdatedAt: now,
+		CRDTEpoch: m.Epoch,
 	})
 }
 

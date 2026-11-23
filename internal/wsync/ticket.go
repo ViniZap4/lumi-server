@@ -75,6 +75,12 @@ type TicketBinding struct {
 	Session string
 	VaultID uuid.UUID
 	NoteID  string
+	// CRDTEpoch is the note's CRDT lineage when the ticket was minted
+	// (empty when the handler has no epoch lookup). A redeem against a
+	// note whose epoch has changed since is refused (4401 ticket_stale),
+	// so a client never joins a history other than the one the ticket
+	// response told it about.
+	CRDTEpoch string
 }
 
 type ticketEntry struct {

@@ -51,7 +51,14 @@ const MaxUserConnections = 10
 //	     expired, reused or minted for another note → mint a fresh ticket
 //	     once; if that fails too, clear the session and re-login
 //	4403 caller lacks note.edit on the vault → read-only, stop reconnecting
-//	4404 vault or note does not exist      → stop reconnecting
+//	4404 vault or note does not exist, or the note was deleted while
+//	     the socket was open                → stop reconnecting
+//
+// A ticket minted for a note whose CRDT epoch changed before the upgrade
+// (delete+recreate, seeding) is refused with 4401 "ticket_stale": the
+// client mints a fresh ticket and learns the new epoch from it.
+// 4409 ("lineage changed") is client-side only: never sent by the server.
+//
 //	1008 per-user concurrent-socket cap    (policy violation)
 //	1011 internal error while authorising  (transient, may retry)
 //
@@ -75,6 +82,10 @@ type Authenticator func(ctx context.Context, token string) (uuid.UUID, error)
 // NoteLookup reports whether the note exists (domain.ErrNotFound if not).
 type NoteLookup func(ctx context.Context, vaultID uuid.UUID, noteID string) error
 
+// EpochLookup returns the note's current CRDT epoch (domain.ErrNotFound if
+// the note does not exist).
+type EpochLookup func(ctx context.Context, vaultID uuid.UUID, noteID string) (string, error)
+
 // Handler bundles the dependencies a WS sync endpoint needs.
 type Handler struct {
 	hub            *Hub
@@ -82,6 +93,7 @@ type Handler struct {
 	allowedOrigins []string
 	authenticate   Authenticator
 	noteExists     NoteLookup
+	epochOf        EpochLookup
 	tickets        *TicketStore
 	log            zerolog.Logger
 }
@@ -108,6 +120,12 @@ func NewHandler(hub *Hub, resolver capguard.Resolver, allowedOrigins []string, a
 
 // SetLogger installs the handler's logger (default: discard).
 func (h *Handler) SetLogger(l zerolog.Logger) { h.log = l }
+
+// SetEpochLookup enables CRDT-epoch support: ws-ticket responses carry
+// the note's crdt_epoch (after pre-warming the room so lazy init has
+// already settled it) and a ticket is refused if the epoch changed
+// before redeem. nil disables.
+func (h *Handler) SetEpochLookup(fn EpochLookup) { h.epochOf = fn }
 
 // Tickets exposes the ticket table (tests, metrics).
 func (h *Handler) Tickets() *TicketStore { return h.tickets }
@@ -253,6 +271,17 @@ func (h *Handler) redeemTicket(c *fiber.Ctx, ticket string, vaultID uuid.UUID, v
 	if rej := h.authorizeUser(ctx, uid, vaultID, noteID); rej != nil {
 		return "", uuid.Nil, rej
 	}
+	if b.CRDTEpoch != "" && h.epochOf != nil {
+		cur, err := h.epochOf(ctx, vaultID, noteID)
+		switch {
+		case errors.Is(err, domain.ErrNotFound):
+			return "", uuid.Nil, &rejection{CloseNotFound, "note_not_found"}
+		case err != nil:
+			return "", uuid.Nil, &rejection{websocket.CloseInternalServerErr, "lookup_failed"}
+		case cur != b.CRDTEpoch:
+			return "", uuid.Nil, &rejection{CloseUnauthorized, "ticket_stale"}
+		}
+	}
 	return b.Session, uid, nil
 }
 
@@ -310,6 +339,9 @@ func (h *Handler) authorizeTokenOnly(ctx context.Context, token string) (uuid.UU
 type ticketResponse struct {
 	Ticket    string `json:"ticket"`
 	ExpiresAt string `json:"expires_at"` // RFC 3339, UTC
+	// CRDTEpoch is the lineage of the doc the socket will join (protocol
+	// §12). Omitted when the server runs without epoch support.
+	CRDTEpoch string `json:"crdt_epoch,omitempty"`
 }
 
 // issueTicket mints a single-use WS ticket for the caller's current
@@ -339,10 +371,31 @@ func (h *Handler) issueTicket(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "unavailable"})
 		}
 	}
+	var epoch string
+	if h.epochOf != nil {
+		// Load the room first: a never-seeded note is lazily initialised
+		// now (rotating its epoch), not at join time, so the epoch below
+		// is the lineage the socket will actually join. The room lingers
+		// for the idle TTL, so the upgrade that follows is warm.
+		ctx := c.UserContext()
+		if err := h.hub.Prewarm(ctx, vaultID, noteID); err != nil {
+			if errors.Is(err, domain.ErrNotFound) {
+				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not_found"})
+			}
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "unavailable"})
+		}
+		if epoch, err = h.epochOf(ctx, vaultID, noteID); err != nil {
+			if errors.Is(err, domain.ErrNotFound) {
+				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not_found"})
+			}
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "unavailable"})
+		}
+	}
 	// Fiber strings alias the request buffer, which fasthttp reuses after
 	// the handler returns: clone everything the table outlives us with.
 	ticket, exp, err := h.tickets.Issue(TicketBinding{
 		UserID: user.ID, Session: strings.Clone(sess.Token), VaultID: vaultID, NoteID: strings.Clone(noteID),
+		CRDTEpoch: epoch,
 	})
 	switch {
 	case errors.Is(err, ErrTicketUserLimit):
@@ -358,6 +411,7 @@ func (h *Handler) issueTicket(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(ticketResponse{
 		Ticket:    ticket,
 		ExpiresAt: exp.UTC().Format(time.RFC3339),
+		CRDTEpoch: epoch,
 	})
 }
 
@@ -441,6 +495,11 @@ func (h *Handler) handleConn(c *websocket.Conn) {
 	go func() {
 		defer close(closerDone)
 		<-sub.Done
+		if code, reason := sub.CloseCode(); code != 0 {
+			// Server-ended subscription (e.g. 4404 note deleted).
+			_ = writeCloseCode(c, code, reason)
+			return
+		}
 		_ = c.Close()
 	}()
 

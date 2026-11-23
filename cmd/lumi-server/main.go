@@ -545,6 +545,9 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	notesSvc.SetLiveDocs(wsHub)
 	// Lazily seed never-initialised notes (legacy / failed create) from disk.
 	crdtRegistry.SetInitSource(notesSvc.CRDTInitBody)
+	// A seed that rotates a note's CRDT epoch (lazy init) bumps the vault
+	// seq; tell the account feed (protocol §12).
+	crdtRegistry.SetOnEpochChange(notesSvc.EpochRotated)
 
 	fsWatcher.SetHandler(buildFSHandler(zlog, vaultStore, noteStore, fsMgr, wsHub))
 	vaultsSvc.SetWatcher(fsWatcher)
@@ -678,6 +681,12 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		},
 	)
 	wsHandler.SetLogger(zlog)
+	// ws-ticket carries crdt_epoch; a ticket outliving its note's lineage
+	// is refused at redeem (protocol §12).
+	wsHandler.SetEpochLookup(func(ctx context.Context, vaultID uuid.UUID, noteID string) (string, error) {
+		n, err := noteStore.Get(ctx, vaultID, noteID)
+		return n.CRDTEpoch, err
+	})
 
 	registerRoutes(app, auth.Required(authSvc),
 		// Public (or self-guarding) /api routes. Auth handlers mix public

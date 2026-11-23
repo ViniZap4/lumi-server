@@ -14,8 +14,15 @@ import (
 //	noteMeta    := varBytes(id) varBytes(path) varBytes(title)
 //	noteSync    := varBytes(id) varBytes(payload) — payload is a y-protocols
 //	                                                sync message (Step1/2/Update)
-//	noteAnnounce:= noteMeta                       — peer may lack this note;
+//	noteAnnounce:= noteMeta [varBytes(epoch)]     — peer may lack this note;
 //	                                                create metadata before sync
+//
+// CRDT epochs (docs/CRDT-CLIENT-PROTOCOL.md §12) ride as OPTIONAL trailing
+// data so peers predating them (whose decoders ignore trailing bytes)
+// keep working: a manifest may end with varUint(n) n×varBytes(epoch),
+// positional with its entries ("" = unknown), and an announce with one
+// varBytes(epoch). A receiver creating the note's row adopts the epoch:
+// the doc it then receives over the relay IS that history.
 const (
 	frameManifest     uint64 = 1
 	frameNoteSync     uint64 = 2
@@ -51,6 +58,7 @@ const (
 	maxNoteIDBytes    = 256
 	maxNotePathBytes  = 4096
 	maxNoteTitleBytes = 4096
+	maxNoteEpochBytes = 64
 	// minNoteMetaBytes is the smallest encoded NoteMeta (three empty
 	// varBytes); used to bound manifest pre-allocation by the input size.
 	minNoteMetaBytes = 3
@@ -64,6 +72,9 @@ type NoteMeta struct {
 	ID    string
 	Path  string
 	Title string
+	// Epoch is the sender's crdt_epoch for the note ("" when unknown or
+	// sent by a peer predating epochs). Optional on the wire.
+	Epoch string
 }
 
 // ---- lib0 varint helpers (mirrors wsync's unexported codec) --------------------
@@ -142,14 +153,30 @@ func readNoteMeta(buf []byte) (NoteMeta, int, error) {
 	return NoteMeta{ID: id, Path: path, Title: title}, n1 + n2 + n3, nil
 }
 
-// EncodeManifest lists every note the sender has for the vault.
+// EncodeManifest lists every note the sender has for the vault, followed
+// by the optional trailing epoch list.
 func EncodeManifest(notes []NoteMeta) []byte {
 	out := writeVarUint(nil, frameManifest)
 	out = writeVarUint(out, uint64(len(notes)))
 	for _, m := range notes {
 		out = appendNoteMeta(out, m)
 	}
+	out = writeVarUint(out, uint64(len(notes)))
+	for _, m := range notes {
+		out = writeVarBytes(out, []byte(m.Epoch))
+	}
 	return out
+}
+
+func readEpoch(buf []byte) (string, int, error) {
+	e, n, err := readVarString(buf)
+	if err != nil {
+		return "", 0, err
+	}
+	if len(e) > maxNoteEpochBytes {
+		return "", 0, fmt.Errorf("%w: note epoch too long", errFrameTooLarge)
+	}
+	return e, n, nil
 }
 
 // EncodeNoteSync wraps a per-note y-protocols sync payload.
@@ -159,10 +186,15 @@ func EncodeNoteSync(noteID string, payload []byte) []byte {
 	return writeVarBytes(out, payload)
 }
 
-// EncodeNoteAnnounce advertises a note the peer may not have yet.
+// EncodeNoteAnnounce advertises a note the peer may not have yet, with
+// its epoch as optional trailing data.
 func EncodeNoteAnnounce(m NoteMeta) []byte {
 	out := writeVarUint(nil, frameNoteAnnounce)
-	return appendNoteMeta(out, m)
+	out = appendNoteMeta(out, m)
+	if m.Epoch != "" {
+		out = writeVarBytes(out, []byte(m.Epoch))
+	}
+	return out
 }
 
 // EncodeNoteDelete propagates a note deletion.
@@ -237,6 +269,25 @@ func DecodeFrame(buf []byte) (Frame, error) {
 			notes = append(notes, m)
 			body = body[n:]
 		}
+		if len(body) > 0 {
+			// Optional epoch list (peers predating epochs omit it).
+			ecount, n, err := readVarUint(body)
+			if err != nil {
+				return Frame{}, err
+			}
+			if ecount != count {
+				return Frame{}, fmt.Errorf("federation: manifest lists %d epochs for %d notes", ecount, count)
+			}
+			body = body[n:]
+			for i := range notes {
+				e, n, err := readEpoch(body)
+				if err != nil {
+					return Frame{}, err
+				}
+				notes[i].Epoch = e
+				body = body[n:]
+			}
+		}
 		return Frame{Type: typ, Manifest: notes}, nil
 	case frameNoteSync:
 		noteID, n, err := readVarString(body)
@@ -249,9 +300,14 @@ func DecodeFrame(buf []byte) (Frame, error) {
 		}
 		return Frame{Type: typ, NoteID: noteID, Payload: payload}, nil
 	case frameNoteAnnounce, frameNoteMove:
-		m, _, err := readNoteMeta(body)
+		m, n, err := readNoteMeta(body)
 		if err != nil {
 			return Frame{}, err
+		}
+		if typ == frameNoteAnnounce && len(body) > n {
+			if m.Epoch, _, err = readEpoch(body[n:]); err != nil {
+				return Frame{}, err
+			}
 		}
 		return Frame{Type: typ, Note: m}, nil
 	case frameNoteDelete:

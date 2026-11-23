@@ -197,6 +197,24 @@ type LiveDocs interface {
 	ApplyUpdate(ctx context.Context, vaultID uuid.UUID, noteID string, update []byte, opts wsync.ApplyOptions) (wsync.ApplyResult, error)
 	ApplyText(ctx context.Context, vaultID uuid.UUID, noteID, newText string, expectSV []byte, opts wsync.ApplyOptions) (wsync.ApplyResult, error)
 	View(ctx context.Context, vaultID uuid.UUID, noteID string, fn func(*crdt.Doc) error) error
+	// DropNote discards any in-memory doc of the note's current CRDT
+	// history and closes its live sockets with code (protocol §12).
+	DropNote(vaultID uuid.UUID, noteID string, code int, reason string)
+}
+
+// dropLiveDoc ends the note's in-memory CRDT history (if a room holds
+// one) and closes its sockets with 4404.
+func (s *Service) dropLiveDoc(vaultID uuid.UUID, noteID string) {
+	if s.docs != nil {
+		s.docs.DropNote(vaultID, noteID, wsync.CloseNotFound, "note_deleted")
+	}
+}
+
+// EpochRotated is the crdt.Registry epoch hook: a seed (lazy init)
+// started a new CRDT history and stamped the new epoch at seq, so the
+// account feed learns the vault head moved and /changes serves the note.
+func (s *Service) EpochRotated(vaultID uuid.UUID, _ string, _ string, seq int64) {
+	s.publishHead(vaultID, seq)
 }
 
 // SetLiveDocs wires the doc authority. Without it the CRDT write
@@ -321,6 +339,8 @@ func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput)
 		return domain.Note{}, fmt.Errorf("write note: %w", err)
 	}
 
+	// A new note id starts a new CRDT history: fresh epoch, written with
+	// the row and reused by the seed below (no second rotation).
 	note := domain.Note{
 		ID:        id,
 		VaultID:   vaultID,
@@ -328,6 +348,7 @@ func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput)
 		Title:     title,
 		CreatedAt: now,
 		UpdatedAt: now,
+		CRDTEpoch: domain.NewCRDTEpoch(),
 	}
 	seq, err := s.notes.Upsert(ctx, note)
 	if err != nil {
@@ -341,7 +362,10 @@ func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput)
 	// A failure rolls the create back: leaving a note whose CRDT is
 	// unseeded would let the first live edit race lazy init.
 	if s.crdt != nil {
-		if err := s.crdt.InitFromText(ctx, vaultID, id, in.Body, in.Actor, "snapshot-init"); err != nil {
+		// A room left over from a deleted note with this id must not
+		// serve (or persist onto) the new history.
+		s.dropLiveDoc(vaultID, id)
+		if _, err := s.crdt.InitFromTextEpoch(ctx, vaultID, id, in.Body, note.CRDTEpoch, in.Actor, "snapshot-init"); err != nil {
 			// The row's seq may already be visible to a reader, so the
 			// rollback is a real (tombstoned) delete.
 			_ = s.deleteMeta(ctx, vaultID, id)
@@ -349,6 +373,12 @@ func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput)
 			_ = s.fs.DeleteNote(v.Slug, relPath)
 			return domain.Note{}, fmt.Errorf("seed crdt: %w", err)
 		}
+	}
+	// Re-read: if a concurrent first load seeded the note from the file
+	// before us, the row carries that seed's epoch (and seq).
+	if fresh, err := s.notes.Get(ctx, vaultID, id); err == nil {
+		note = fresh
+		seq = max(seq, fresh.ChangeSeq)
 	}
 	s.publishHead(vaultID, seq)
 	// InitFromText bypasses PersistChange, so federated peers need an
@@ -591,6 +621,10 @@ func (s *Service) deleteInternal(ctx context.Context, vaultID uuid.UUID, id stri
 	if err := s.deleteMeta(ctx, vaultID, id); err != nil {
 		return err
 	}
+	// The CRDT history ends with the row (snapshot + log cascade): drop
+	// the live room so sockets get 4404 and a recreate under the same id
+	// starts from the new seed, never from this doc.
+	s.dropLiveDoc(vaultID, id)
 	if notify && s.fedNotify != nil {
 		s.fedNotify.NoteDeleted(vaultID, id)
 	}
@@ -625,8 +659,10 @@ var errBaseRequired = fmt.Errorf("%w: base_required", domain.ErrConflict)
 // text + opaque state vector (lib0 v1) + full encoded state. The handler
 // base64-encodes the binary fields.
 type SnapshotResult struct {
-	NoteID      string
-	Path        string
+	NoteID string
+	Path   string
+	// CRDTEpoch is the lineage the state below belongs to (protocol §12).
+	CRDTEpoch   string
 	Text        string
 	VectorClock []byte
 	// State is the full lib0-v1 encoded document (EncodeStateAsUpdate).
@@ -640,12 +676,8 @@ func (s *Service) GetSnapshot(ctx context.Context, vaultID uuid.UUID, id string)
 	if s.crdt == nil || s.docs == nil {
 		return SnapshotResult{}, errCRDTUnavailable
 	}
-	n, err := s.notes.Get(ctx, vaultID, id)
-	if err != nil {
-		return SnapshotResult{}, err
-	}
-	out := SnapshotResult{NoteID: n.ID, Path: n.Path}
-	err = s.docs.View(ctx, vaultID, id, func(doc *crdt.Doc) error {
+	var out SnapshotResult
+	n, err := s.viewWithEpoch(ctx, vaultID, id, func(doc *crdt.Doc) error {
 		var err error
 		if out.Text, err = doc.Text(); err != nil {
 			return err
@@ -659,7 +691,64 @@ func (s *Service) GetSnapshot(ctx context.Context, vaultID uuid.UUID, id string)
 	if err != nil {
 		return SnapshotResult{}, err
 	}
+	out.NoteID, out.Path, out.CRDTEpoch = n.ID, n.Path, n.CRDTEpoch
 	return out, nil
+}
+
+// StateVectorResult is the wire shape of GET /state-vector.
+type StateVectorResult struct {
+	NoteID      string
+	CRDTEpoch   string
+	StateVector []byte
+}
+
+// GetStateVector returns the note's CRDT epoch and current state vector:
+// the cheap way for an offline-replica client to confirm the server has
+// absorbed its updates (sv covers the replica's) without downloading the
+// full state from /snapshot.
+func (s *Service) GetStateVector(ctx context.Context, vaultID uuid.UUID, id string) (StateVectorResult, error) {
+	if s.crdt == nil || s.docs == nil {
+		return StateVectorResult{}, errCRDTUnavailable
+	}
+	var sv []byte
+	n, err := s.viewWithEpoch(ctx, vaultID, id, func(doc *crdt.Doc) error {
+		var err error
+		sv, err = doc.StateVectorV1()
+		return err
+	})
+	if err != nil {
+		return StateVectorResult{}, err
+	}
+	return StateVectorResult{NoteID: n.ID, CRDTEpoch: n.CRDTEpoch, StateVector: sv}, nil
+}
+
+// errEpochUnstable: the note's lineage kept changing while being read.
+var errEpochUnstable = fmt.Errorf("%w: crdt_epoch changed while reading; retry", domain.ErrConflict)
+
+// viewWithEpoch runs fn on the note's authoritative doc and returns the
+// note row whose crdt_epoch is guaranteed to describe the doc fn saw:
+// the epoch is read before and after the view and must match (epochs
+// are random, so equal values mean no new history started in between —
+// e.g. the view itself lazily seeding the note, or a delete+recreate).
+// A changed epoch re-runs the read.
+func (s *Service) viewWithEpoch(ctx context.Context, vaultID uuid.UUID, id string, fn func(*crdt.Doc) error) (domain.Note, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		before, err := s.notes.Get(ctx, vaultID, id)
+		if err != nil {
+			return domain.Note{}, err
+		}
+		if err := s.docs.View(ctx, vaultID, id, fn); err != nil {
+			return domain.Note{}, err
+		}
+		after, err := s.notes.Get(ctx, vaultID, id)
+		if err != nil {
+			return domain.Note{}, err
+		}
+		if after.CRDTEpoch == before.CRDTEpoch {
+			return after, nil
+		}
+	}
+	return domain.Note{}, errEpochUnstable
 }
 
 // DiffInput is the text-merge form of POST /diff.
@@ -799,9 +888,16 @@ func (s *Service) finishCRDTWrite(ctx context.Context, vaultID uuid.UUID, n doma
 			"bytes":   len(res.Update),
 		})
 	}
+	// The write went into the history the row's epoch names now; re-read
+	// it in case the write's own room load lazily seeded the note.
+	epoch := n.CRDTEpoch
+	if cur, err := s.notes.Get(ctx, vaultID, n.ID); err == nil {
+		epoch = cur.CRDTEpoch
+	}
 	return SnapshotResult{
 		NoteID:      n.ID,
 		Path:        n.Path,
+		CRDTEpoch:   epoch,
 		Text:        res.Text,
 		VectorClock: res.StateVector,
 		State:       res.State,
@@ -928,6 +1024,11 @@ func (h *Handlers) Register(r fiber.Router) {
 		capguard.RequireCapability(resolver, domain.CapNoteRead),
 		h.getSnapshot,
 	)
+	// Cheap ack probe for offline-replica clients: epoch + state vector.
+	r.Get("/vaults/:vault/notes/:id/state-vector",
+		capguard.RequireCapability(resolver, domain.CapNoteRead),
+		h.getStateVector,
+	)
 	r.Post("/vaults/:vault/notes/:id/diff",
 		capguard.RequireCapability(resolver, domain.CapNoteEdit),
 		h.applyDiff,
@@ -1019,6 +1120,9 @@ type noteDTO struct {
 	Title     string `json:"title"`
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
+	// CRDTEpoch: opaque CRDT lineage id (protocol §12); compare for
+	// equality only.
+	CRDTEpoch string `json:"crdt_epoch,omitempty"`
 }
 
 func toDTO(n domain.Note) noteDTO {
@@ -1029,6 +1133,7 @@ func toDTO(n domain.Note) noteDTO {
 		Title:     n.Title,
 		CreatedAt: n.CreatedAt.UTC().Format(time.RFC3339),
 		UpdatedAt: n.UpdatedAt.UTC().Format(time.RFC3339),
+		CRDTEpoch: n.CRDTEpoch,
 	}
 }
 
@@ -1236,7 +1341,8 @@ func (h *Handlers) delete(c *fiber.Ctx) error {
 
 // getSnapshot — GET /api/vaults/:vault/notes/:id/snapshot
 //
-// Returns { id, path, text, vector_clock, state }:
+// Returns { id, path, crdt_epoch, text, vector_clock, state }:
+//   - crdt_epoch: the CRDT lineage the state belongs to (protocol §12).
 //   - vector_clock: base64 lib0-v1 state vector (unchanged; REST-only CRDT
 //     clients use it as lastServerSV for encodeStateAsUpdate).
 //   - state: base64 full lib0-v1 update (EncodeStateAsUpdate). Opaque
@@ -1257,9 +1363,38 @@ func (h *Handlers) getSnapshot(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"id":           r.NoteID,
 		"path":         r.Path,
+		"crdt_epoch":   r.CRDTEpoch,
 		"text":         r.Text,
 		"vector_clock": base64.StdEncoding.EncodeToString(r.VectorClock),
 		"state":        base64.StdEncoding.EncodeToString(r.State),
+	})
+}
+
+// getStateVector — GET /api/vaults/:vault/notes/:id/state-vector
+//
+// Returns { id, crdt_epoch, state_vector } where state_vector is the
+// base64 lib0-v1 state vector (same encoding as /snapshot vector_clock).
+// Same auth as /snapshot (note.read); a fraction of its cost: no text,
+// no full state. Clients use it to confirm a replica's updates were
+// absorbed (sv covers the replica's) and that the lineage still matches.
+func (h *Handlers) getStateVector(c *fiber.Ctx) error {
+	vaultID, err := capguard.WithVaultID(c)
+	if err != nil {
+		return nil
+	}
+	id, err := noteIDParam(c)
+	if err != nil {
+		return nil
+	}
+	r, err := h.svc.GetStateVector(c.UserContext(), vaultID, id)
+	if err != nil {
+		return mapCRDTErr(c, err)
+	}
+	c.Set(fiber.HeaderCacheControl, "no-store")
+	return c.JSON(fiber.Map{
+		"id":           r.NoteID,
+		"crdt_epoch":   r.CRDTEpoch,
+		"state_vector": base64.StdEncoding.EncodeToString(r.StateVector),
 	})
 }
 
@@ -1399,6 +1534,7 @@ func (h *Handlers) applyDiff(c *fiber.Ctx) error {
 	out := fiber.Map{
 		"id":           r.NoteID,
 		"path":         r.Path,
+		"crdt_epoch":   r.CRDTEpoch,
 		"text":         r.Text,
 		"vector_clock": base64.StdEncoding.EncodeToString(r.VectorClock),
 	}

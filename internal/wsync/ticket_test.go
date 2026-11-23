@@ -162,6 +162,7 @@ type ticketEnv struct {
 	base    string // ws://host:port
 	vault   uuid.UUID
 	handler *Handler
+	hub     *Hub
 
 	mu     sync.Mutex
 	tokens map[string]uuid.UUID
@@ -199,6 +200,7 @@ func startTicketServer(t *testing.T, tokens map[string]uuid.UUID, res stubResolv
 	}
 	h := NewHandler(hub, res, nil, authn, exists)
 	env.handler = h
+	env.hub = hub
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	h.Register(app.Group("/api"))
 	// Stand-in for auth.Required: binds session + user under the same

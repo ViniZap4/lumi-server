@@ -80,6 +80,64 @@ ON CONFLICT (vault_id, note_id) DO UPDATE
 	return nil
 }
 
+// SeedSnapshot starts a NEW CRDT history for the note in one transaction
+// (docs/CRDT-CLIENT-PROTOCOL.md §12): it replaces the snapshot with
+// state, drops every update-log row (a leftover row belongs to an older
+// history and must never be replayed onto the new one) and stamps epoch
+// on the notes row. When the epoch actually changes the vault seq is
+// bumped and stamped on the row, so GET /changes carries the new epoch;
+// that seq is returned (0 when the row already held epoch, e.g. create
+// inserted the row with it).
+//
+// Lock order matches every other note write: the vault head is taken
+// (bumpHead) before the notes row is written. The pre-check runs without
+// a row lock; callers serialise seeding per note (crdt.Registry seed lock).
+func (s *NoteYjsStore) SeedSnapshot(ctx context.Context, vaultID uuid.UUID, noteID string, state []byte, epoch string) (int64, error) {
+	if epoch == "" {
+		return 0, fmt.Errorf("note_yjs seed: %w: empty epoch", domain.ErrValidation)
+	}
+	const upsertSnap = `
+INSERT INTO note_yjs_snapshots (vault_id, note_id, state)
+VALUES ($1, $2, $3)
+ON CONFLICT (vault_id, note_id) DO UPDATE
+   SET state          = EXCLUDED.state,
+       snapshotted_at = NOW()`
+	var seq int64
+	err := runTx(ctx, s.pool, func(tx pgx.Tx) error {
+		var current string
+		err := tx.QueryRow(ctx,
+			`SELECT crdt_epoch FROM notes WHERE vault_id = $1 AND id = $2`,
+			vaultID, noteID).Scan(&current)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrNotFound
+			}
+			return err
+		}
+		if current != epoch {
+			if seq, err = bumpHead(ctx, tx, vaultID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx,
+				`UPDATE notes SET crdt_epoch = $3, change_seq = $4 WHERE vault_id = $1 AND id = $2`,
+				vaultID, noteID, epoch, seq); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM note_yjs_updates WHERE vault_id = $1 AND note_id = $2`,
+			vaultID, noteID); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, upsertSnap, vaultID, noteID, state)
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("note_yjs seed: %w", errMap(err))
+	}
+	return seq, nil
+}
+
 // AppendUpdate adds a row to the update log and returns the assigned id.
 // originUserID may be uuid.Nil to record NULL.
 func (s *NoteYjsStore) AppendUpdate(

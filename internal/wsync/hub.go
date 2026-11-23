@@ -130,6 +130,9 @@ type Room struct {
 
 	// refs counts subscribers plus transient holders. Guarded by hub.mu.
 	refs int
+	// dropped marks a room removed by DropNote while still referenced:
+	// the last release shuts it down. Guarded by hub.mu.
+	dropped bool
 	// idleTimer is guarded by hub.mu.
 	idleTimer *time.Timer
 
@@ -168,12 +171,37 @@ type Subscriber struct {
 	Done     chan struct{}
 	doneCh   sync.Once
 
+	// closeCode/closeReason are set (before Done closes) when the server
+	// ends the subscription for a reason the client must see as a close
+	// code, e.g. 4404 when the note is deleted.
+	closeMu     sync.Mutex
+	closeCode   int
+	closeReason string
+
 	aw awarenessTracker
 }
 
 // CloseSubscriber closes Done idempotently so the pump goroutine can exit.
 func (s *Subscriber) CloseSubscriber() {
 	s.doneCh.Do(func() { close(s.Done) })
+}
+
+// CloseWithCode records a WebSocket close code for the connection pump to
+// send, then closes Done. The first recorded code wins.
+func (s *Subscriber) CloseWithCode(code int, reason string) {
+	s.closeMu.Lock()
+	if s.closeCode == 0 {
+		s.closeCode, s.closeReason = code, reason
+	}
+	s.closeMu.Unlock()
+	s.CloseSubscriber()
+}
+
+// CloseCode returns the code recorded by CloseWithCode (0 when none).
+func (s *Subscriber) CloseCode() (int, string) {
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	return s.closeCode, s.closeReason
 }
 
 // Hub indexes rooms by (vault_id, note_id) so every reader and writer of
@@ -380,6 +408,12 @@ func (h *Hub) release(room *Room, linger bool) {
 	key := roomKey(room.vaultID, room.noteID)
 	h.mu.Lock()
 	room.refs--
+	if room.dropped && room.refs == 0 && room.loadErr == nil {
+		room.dropped = false // shut down exactly once
+		h.mu.Unlock()
+		room.shutdown()
+		return
+	}
 	if room.refs > 0 || h.rooms[key] != room || room.loadErr != nil {
 		h.mu.Unlock()
 		return
@@ -411,6 +445,68 @@ func (h *Hub) tryEvict(room *Room) {
 	room.evicted.Store(true)
 	h.mu.Unlock()
 	room.shutdown()
+}
+
+// DropNote ends the note's in-memory CRDT history, if a room holds one.
+// Called when the note is deleted (and defensively before a note id is
+// seeded again), so a lingering room can never serve — or persist onto
+// the new note — the previous lineage's doc (protocol §12). The room is
+// unregistered at once (the next acquirer loads the new history), its
+// pending debounced mirror is discarded (the file now belongs to nobody
+// or to the new note), every subscriber is closed with code/reason, and
+// the doc is closed once the last in-flight holder releases it.
+func (h *Hub) DropNote(vaultID uuid.UUID, noteID string, code int, reason string) {
+	key := roomKey(vaultID, noteID)
+	h.mu.Lock()
+	room := h.rooms[key]
+	if room == nil {
+		h.mu.Unlock()
+		return
+	}
+	delete(h.rooms, key)
+	room.evicted.Store(true)
+	if room.idleTimer != nil {
+		room.idleTimer.Stop()
+		room.idleTimer = nil
+	}
+	idle := room.refs == 0
+	if !idle {
+		room.dropped = true
+	}
+	h.mu.Unlock()
+
+	room.mirrorMu.Lock()
+	if room.mirrorTimer != nil {
+		room.mirrorTimer.Stop()
+		room.mirrorTimer = nil
+	}
+	room.mirrorMu.Unlock()
+
+	room.subsMu.RLock()
+	subs := make([]*Subscriber, 0, len(room.subs))
+	for sub := range room.subs {
+		subs = append(subs, sub)
+	}
+	room.subsMu.RUnlock()
+	for _, sub := range subs {
+		sub.CloseWithCode(code, reason)
+	}
+	if idle {
+		room.shutdown()
+	}
+}
+
+// Prewarm loads the note's room (running lazy init if the note was never
+// seeded) and lets it linger for the idle TTL, so a WebSocket join that
+// follows (ws-ticket → upgrade) finds the doc — and the note's CRDT
+// epoch — already settled.
+func (h *Hub) Prewarm(ctx context.Context, vaultID uuid.UUID, noteID string) error {
+	room, err := h.acquire(ctx, vaultID, noteID)
+	if err != nil {
+		return err
+	}
+	h.release(room, true)
+	return nil
 }
 
 // Join attaches sub to the (vault_id, note_id) room, loading the doc

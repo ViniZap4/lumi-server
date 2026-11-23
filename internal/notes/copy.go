@@ -21,6 +21,11 @@ const copyPageSize = 200
 // federated peer (the file lands with the first mirrored update). Bumps
 // the local vault seq like any other create. Idempotent: an existing row
 // is left alone.
+//
+// n.CRDTEpoch carries the announcing peer's epoch when it sent one: the
+// local row then names the same CRDT history the peer's doc belongs to
+// (the state arrives over the relay; this server never seeds it). An
+// existing row is left untouched, epoch included.
 func (s *Service) CreateFromFederation(ctx context.Context, n domain.Note) error {
 	if _, err := s.notes.Get(ctx, n.VaultID, n.ID); err == nil {
 		return nil
@@ -114,11 +119,14 @@ func (s *Service) CopyVaultNotes(ctx context.Context, srcVaultID, dstVaultID, ac
 			}
 			row := n
 			row.VaultID = dstVaultID
+			// The copy is seeded from text: a new CRDT history, so a new
+			// epoch (never the source note's).
+			row.CRDTEpoch = domain.NewCRDTEpoch()
 			if err := s.upsertMeta(ctx, row); err != nil {
 				return copied, fmt.Errorf("copy: upsert %q: %w", n.ID, err)
 			}
 			if s.crdt != nil {
-				if err := s.crdt.InitFromText(ctx, dstVaultID, n.ID, string(body), actor, "vault-copy"); err != nil {
+				if _, err := s.crdt.InitFromTextEpoch(ctx, dstVaultID, n.ID, string(body), row.CRDTEpoch, actor, "vault-copy"); err != nil {
 					return copied, fmt.Errorf("copy: crdt init %q: %w", n.ID, err)
 				}
 			}
