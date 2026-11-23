@@ -124,7 +124,10 @@ func (h *Handler) Register(r fiber.Router) {
 		// attack surface and Yjs binary updates are already
 		// well-compressed by lib0 v1 encoding.
 		EnableCompression: false,
-		Origins:           h.allowedOrigins,
+		// Origin is enforced in upgradeGuard (originAllowed), not here:
+		// the library rejects an ABSENT Origin whenever a list is set,
+		// which locked out native clients (Apple, TUI) in production.
+		Origins: []string{"*"},
 	}
 	r.Use(path, h.upgradeGuard)
 	r.Get(path, websocket.New(h.handleConn, cfg))
@@ -193,6 +196,9 @@ func (h *Handler) authorizeUser(ctx context.Context, uid, vaultID uuid.UUID, not
 func (h *Handler) upgradeGuard(c *fiber.Ctx) error {
 	if !websocket.IsWebSocketUpgrade(c) {
 		return fiber.ErrUpgradeRequired
+	}
+	if !originAllowed(h.allowedOrigins, c.Get(fiber.HeaderOrigin)) {
+		return fiber.ErrForbidden
 	}
 	// Clone: Fiber strings alias the reusable request buffer and these
 	// values outlive the handler (Locals read by the socket goroutine).
@@ -564,3 +570,20 @@ func truncate(s string, n int) string {
 var (
 	_ = errors.New
 )
+
+// originAllowed is the WS Origin policy. Browsers always send Origin on a
+// WebSocket upgrade, so a present Origin must be on the allow-list (CSWSH
+// defense). Native clients (Apple, TUI) send none; they are admitted and
+// gated by the ticket/token like any other request. An empty list (dev,
+// loopback) or "*" allows every origin.
+func originAllowed(allowed []string, origin string) bool {
+	if origin == "" || len(allowed) == 0 {
+		return true
+	}
+	for _, a := range allowed {
+		if a == "*" || a == origin {
+			return true
+		}
+	}
+	return false
+}

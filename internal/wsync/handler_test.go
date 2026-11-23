@@ -39,6 +39,11 @@ func (s stubResolver) RoleForUser(_ context.Context, _ uuid.UUID, user uuid.UUID
 
 func startSyncServer(t *testing.T, tokens map[string]uuid.UUID, res stubResolver, notes map[string]bool) string {
 	t.Helper()
+	return startSyncServerOrigins(t, tokens, res, notes, nil)
+}
+
+func startSyncServerOrigins(t *testing.T, tokens map[string]uuid.UUID, res stubResolver, notes map[string]bool, origins []string) string {
+	t.Helper()
 	reg := crdt.NewRegistry(newMemRepo())
 	hub := NewHub(reg)
 	t.Cleanup(hub.Close)
@@ -58,7 +63,7 @@ func startSyncServer(t *testing.T, tokens map[string]uuid.UUID, res stubResolver
 		return domain.ErrNotFound
 	}
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
-	NewHandler(hub, res, nil, authn, exists).Register(app.Group("/api"))
+	NewHandler(hub, res, origins, authn, exists).Register(app.Group("/api"))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -172,5 +177,53 @@ func TestSyncRevalidationClosesRevokedSession(t *testing.T) {
 			t.Fatalf("got %v, want close %d", err, CloseForbidden)
 		}
 		return
+	}
+}
+
+// Production sets LUMI_ALLOWED_ORIGINS. Native clients send no Origin and
+// must still upgrade; a browser from a foreign origin must not.
+func TestSyncUpgradeOriginPolicy(t *testing.T) {
+	editor := uuid.New()
+	base := startSyncServerOrigins(t,
+		map[string]uuid.UUID{"ed": editor},
+		stubResolver{editor: {domain.CapNoteEdit}},
+		map[string]bool{"n1": true},
+		[]string{"https://lumi.example"})
+	url := base + "/api/vaults/" + uuid.NewString() + "/notes/n1/sync?token=ed"
+	d := fws.Dialer{HandshakeTimeout: 2 * time.Second}
+
+	for _, tc := range []struct {
+		name, origin string
+		ok           bool
+	}{
+		{"native client, no Origin", "", true},
+		{"allowed browser origin", "https://lumi.example", true},
+		{"foreign browser origin", "https://evil.example", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := http.Header{}
+			if tc.origin != "" {
+				h.Set("Origin", tc.origin)
+			}
+			conn, resp, err := d.Dial(url, h)
+			if tc.ok {
+				if err != nil {
+					code := 0
+					if resp != nil {
+						code = resp.StatusCode
+					}
+					t.Fatalf("upgrade refused (HTTP %d): %v", code, err)
+				}
+				conn.Close()
+				return
+			}
+			if err == nil {
+				conn.Close()
+				t.Fatal("foreign origin upgraded")
+			}
+			if resp == nil || resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("want HTTP 403, got %v", resp)
+			}
+		})
 	}
 }
