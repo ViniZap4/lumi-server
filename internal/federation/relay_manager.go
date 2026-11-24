@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -208,6 +209,7 @@ func relayWSURL(homeURL string, vaultID uuid.UUID, peerURL, nonce, sigHex string
 	q.Set("peer_url", peerURL)
 	q.Set("nonce", nonce)
 	q.Set("sig", sigHex)
+	q.Set("proto", strconv.Itoa(RelayProtoVersion))
 	u.RawQuery = q.Encode()
 	return u.String(), nil
 }

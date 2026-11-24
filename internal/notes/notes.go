@@ -638,6 +638,10 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 	if (moved || newTitle != n.Title) && s.fedNotify != nil {
 		s.fedNotify.NoteMoved(vaultID, id, newPath, newTitle)
 	}
+	// Tags live only in the frontmatter: replicate them (G1).
+	if in.Tags != nil {
+		s.notifyMetaChanged(vaultID, id)
+	}
 
 	switch {
 	case moved:

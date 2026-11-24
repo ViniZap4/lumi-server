@@ -31,7 +31,25 @@ const (
 	frameControlState uint64 = 5 // varBytes(stateJSON) varBytes(sig) — home → follower
 	frameControlAck   uint64 = 6 // varUint(seq) — follower → home
 	frameNoteMove     uint64 = 7 // noteMeta — note renamed/moved at the peer
+
+	// Relay protocol v2 (docs/SPEC-ESPELHO-SELADO.md §A4.2). Only sent to a
+	// peer that advertised v2 (see RelayProtoVersion), so v1 peers never
+	// see them.
+	frameMirrorAck  uint64 = 8  // varUint(home_vault_seq)            mirror → home
+	frameResumeFrom uint64 = 9  // varUint(home_vault_seq)            mirror → home (reserved, M2)
+	frameChangesEnd uint64 = 10 // varUint(home_vault_seq)            home → mirror
+	frameNoteMeta2  uint64 = 11 // noteMeta varBytes(frontmatterJSON) — frontmatter (G1)
 )
+
+// RelayProtoVersion is the relay protocol this server speaks. v2 adds the
+// frames 8–11 and the mirror mode. A follower advertises it with the
+// "proto" query parameter of the relay WebSocket; home advertises it as
+// trailing data of the manifest (v1 decoders ignore both). A side sends
+// v2 frames only to a peer that advertised v2.
+const RelayProtoVersion = 2
+
+// maxFrontmatterBytes caps the frontmatter JSON of one noteMeta2 frame.
+const maxFrontmatterBytes = 16 << 10
 
 // syncAuthMessagePrefix versions the signed WS-upgrade auth (v3 F2). The
 // follower signs prefix|nonce|vault_id|follower_url with its enrolled key.
@@ -154,7 +172,8 @@ func readNoteMeta(buf []byte) (NoteMeta, int, error) {
 }
 
 // EncodeManifest lists every note the sender has for the vault, followed
-// by the optional trailing epoch list.
+// by the optional trailing epoch list and, after it, the sender's relay
+// protocol version (v1 decoders stop reading after the epochs).
 func EncodeManifest(notes []NoteMeta) []byte {
 	out := writeVarUint(nil, frameManifest)
 	out = writeVarUint(out, uint64(len(notes)))
@@ -165,8 +184,31 @@ func EncodeManifest(notes []NoteMeta) []byte {
 	for _, m := range notes {
 		out = writeVarBytes(out, []byte(m.Epoch))
 	}
-	return out
+	return writeVarUint(out, RelayProtoVersion)
 }
+
+// EncodeNoteMeta2 carries a note's frontmatter (the keys not derived from
+// the CRDT or the row: tags, created_at, unknown keys) as a JSON object.
+func EncodeNoteMeta2(m NoteMeta, frontmatterJSON []byte) []byte {
+	out := writeVarUint(nil, frameNoteMeta2)
+	out = appendNoteMeta(out, m)
+	return writeVarBytes(out, frontmatterJSON)
+}
+
+// EncodeSeqFrame builds the seq-only frames (mirror ack, resume, changes end).
+func encodeSeqFrame(typ uint64, seq int64) []byte {
+	if seq < 0 {
+		seq = 0
+	}
+	return writeVarUint(writeVarUint(nil, typ), uint64(seq))
+}
+
+// EncodeMirrorAck reports the highest home vault seq the mirror applied.
+func EncodeMirrorAck(seq int64) []byte { return encodeSeqFrame(frameMirrorAck, seq) }
+
+// EncodeChangesEnd tells the mirror home's vault seq after everything sent
+// before it.
+func EncodeChangesEnd(seq int64) []byte { return encodeSeqFrame(frameChangesEnd, seq) }
 
 func readEpoch(buf []byte) (string, int, error) {
 	e, n, err := readVarString(buf)
@@ -233,7 +275,10 @@ type Frame struct {
 	NoteID   string     // frameNoteSync / frameNoteDelete
 	Payload  []byte     // frameNoteSync: y-protocols message; frameControlState: state JSON
 	Sig      []byte     // frameControlState
-	Seq      int64      // frameControlAck
+	Seq      int64      // frameControlAck, frameMirrorAck, frameResumeFrom, frameChangesEnd
+	// Proto is the peer's relay protocol version advertised in a
+	// manifest (1 when absent).
+	Proto int
 }
 
 func DecodeFrame(buf []byte) (Frame, error) {
@@ -288,7 +333,13 @@ func DecodeFrame(buf []byte) (Frame, error) {
 				body = body[n:]
 			}
 		}
-		return Frame{Type: typ, Manifest: notes}, nil
+		proto := 1
+		if len(body) > 0 {
+			if v, _, err := readVarUint(body); err == nil && v > 0 && v < 1<<16 {
+				proto = int(v)
+			}
+		}
+		return Frame{Type: typ, Manifest: notes, Proto: proto}, nil
 	case frameNoteSync:
 		noteID, n, err := readVarString(body)
 		if err != nil {
@@ -326,13 +377,31 @@ func DecodeFrame(buf []byte) (Frame, error) {
 			return Frame{}, err
 		}
 		return Frame{Type: typ, Payload: state, Sig: sig}, nil
-	case frameControlAck:
+	case frameControlAck, frameMirrorAck, frameResumeFrom, frameChangesEnd:
 		seq, _, err := readVarUint(body)
 		if err != nil {
 			return Frame{}, err
 		}
+		if seq > 1<<62 {
+			return Frame{}, fmt.Errorf("federation: seq out of range")
+		}
 		return Frame{Type: typ, Seq: int64(seq)}, nil
+	case frameNoteMeta2:
+		m, n, err := readNoteMeta(body)
+		if err != nil {
+			return Frame{}, err
+		}
+		fm, _, err := readVarBytes(body[n:])
+		if err != nil {
+			return Frame{}, err
+		}
+		if len(fm) > maxFrontmatterBytes {
+			return Frame{}, fmt.Errorf("%w: frontmatter larger than %d bytes", errFrameTooLarge, maxFrontmatterBytes)
+		}
+		return Frame{Type: typ, Note: m, Payload: fm}, nil
 	default:
-		return Frame{}, fmt.Errorf("federation: unknown frame type %d", typ)
+		// Forward compatibility: a frame type from a newer peer is
+		// skipped, never a reason to drop the link.
+		return Frame{Type: typ}, nil
 	}
 }

@@ -81,6 +81,7 @@ func (h *RelayHandlers) challenge(c *fiber.Ctx) error {
 const (
 	relayVaultKey = "federation.vault"
 	relayPeerKey  = "federation.peer"
+	relayProtoKey = "federation.proto"
 )
 
 // upgradeGuard authenticates the WS upgrade: single-use nonce bound to
@@ -114,6 +115,13 @@ func (h *RelayHandlers) upgradeGuard(c *fiber.Ctx) error {
 	}
 	c.Locals(relayVaultKey, vaultID)
 	c.Locals(relayPeerKey, peerURL)
+	// The follower's relay protocol (absent from v1 followers). Not
+	// signed: lying about it only changes which frames the follower gets.
+	proto := c.QueryInt("proto", 1)
+	if proto < 1 || proto > 1<<15 {
+		proto = 1
+	}
+	c.Locals(relayProtoKey, proto)
 	return c.Next()
 }
 
@@ -126,7 +134,8 @@ func (h *RelayHandlers) handleConn(conn *websocket.Conn) {
 	}
 	conn.SetReadLimit(maxRelayMessageBytes)
 	h.log.Info().Str("peer", peerURL).Str("vault", vaultID.String()).Msg("federation: follower connected")
-	sess := h.links.NewSession(nil, conn, vaultID, peerURL, "home")
+	proto, _ := conn.Locals(relayProtoKey).(int)
+	sess := h.links.NewSessionWith(nil, conn, vaultID, peerURL, "home", SessionOptions{PeerProto: proto})
 	if err := sess.Run(); err != nil {
 		h.log.Warn().Err(err).Str("peer", peerURL).Msg("federation: relay session ended")
 	}

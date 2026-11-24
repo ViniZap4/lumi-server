@@ -39,8 +39,10 @@ func TestFrameCodec_RoundTrips(t *testing.T) {
 		t.Fatalf("announce round-trip: %+v %v", f, err)
 	}
 
-	if _, err := DecodeFrame([]byte{99}); err == nil {
-		t.Fatalf("unknown frame type must error")
+	// Unknown frame types (a newer peer) decode to a frame the session
+	// ignores instead of dropping the link.
+	if f, err := DecodeFrame([]byte{99, 1, 2}); err != nil || f.Type != 99 {
+		t.Fatalf("unknown frame type: %+v %v", f, err)
 	}
 	if _, err := DecodeFrame(EncodeNoteSync("alpha", payload)[:3]); err == nil {
 		t.Fatalf("truncated frame must error")

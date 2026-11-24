@@ -550,7 +550,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	// seq; tell the account feed (protocol §12).
 	crdtRegistry.SetOnEpochChange(notesSvc.EpochRotated)
 
-	fsWatcher.SetHandler(buildFSHandler(zlog, vaultStore, noteStore, fsMgr, wsHub))
+	fsWatcher.SetHandler(buildFSHandler(zlog, vaultStore, noteStore, fsMgr, wsHub, notesSvc))
 	vaultsSvc.SetWatcher(fsWatcher)
 	vaultsSvc.SetOwnershipDeps(memberStore, userStore, notesSvc)
 	if err := fsWatcher.WatchExistingVaults(); err != nil {
@@ -592,6 +592,9 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		Audit:    federationSvc.RecordRelayAudit,
 		// G2: tombstone-aware manifest reconciliation.
 		Tombstone: noteStore.LastTombstone,
+		// G1: frontmatter (tags, created_at, …) over frameNoteMeta2.
+		Frontmatter:      notesSvc.FrontmatterForFederation,
+		ApplyFrontmatter: notesSvc.ApplyFrontmatterFromFederation,
 	})
 	crdtRegistry.SetOnPersist(relayLinks.OnPersist)
 	notesSvc.SetFederationNotifier(relayLinks)
@@ -825,6 +828,7 @@ func buildFSHandler(
 	noteStore *pg.NoteStore,
 	fsMgr *fs.Manager,
 	hub *wsync.Hub,
+	notesSvc *notes.Service,
 ) fswatch.Handler {
 	log := zlog.With().Str("component", "fswatch.handler").Logger()
 	return fswatch.HandlerFunc(func(ctx context.Context, ev fswatch.Event) {
@@ -858,6 +862,10 @@ func buildFSHandler(
 			Origin: wsync.OriginFSWatcher, Mirror: wsync.MirrorNone,
 		}); err != nil {
 			log.Warn().Err(err).Str("path", n.Path).Msg("apply external edit failed")
+		}
+		// The edit may have touched the frontmatter (tags…): replicate it.
+		if notesSvc != nil {
+			notesSvc.NotifyMetaChanged(v.ID, n.ID)
 		}
 	})
 }

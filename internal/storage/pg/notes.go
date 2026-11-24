@@ -172,6 +172,19 @@ func (s *NoteStore) Delete(ctx context.Context, vaultID uuid.UUID, id string) (i
 	return seq, nil
 }
 
+// SetCreatedAt rewrites a note's created_at (replicated frontmatter, G1).
+// The caller's following metadata write bumps the seq.
+func (s *NoteStore) SetCreatedAt(ctx context.Context, vaultID uuid.UUID, id string, at time.Time) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE notes SET created_at = $3 WHERE vault_id = $1 AND id = $2`, vaultID, id, at)
+	if err != nil {
+		return fmt.Errorf("note store: set created_at: %w", errMap(err))
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("note store: set created_at: %w", domain.ErrNotFound)
+	}
+	return nil
+}
+
 // LastTombstone reports the most recent tombstone of a note id: the epoch
 // of the CRDT history it ended ("" for tombstones older than migration
 // 0010) and whether one exists at all (pruned ones are gone).

@@ -113,7 +113,20 @@ type RelayDeps struct {
 	// of the history it ended (G2). nil disables tombstone-aware
 	// reconciliation.
 	Tombstone TombstoneFunc
+	// Frontmatter / ApplyFrontmatter replicate frontmatter (G1) over
+	// frameNoteMeta2 to v2 peers. nil disables (sending resp. applying).
+	Frontmatter      FrontmatterFunc
+	ApplyFrontmatter ApplyFrontmatterFunc
 }
+
+// FrontmatterFunc returns a note's frontmatter as a JSON object of the keys
+// not derived from the CRDT or the note row (tags, created_at, unknown
+// keys), or nil when the note has none to replicate (canvas, no file yet).
+type FrontmatterFunc func(ctx context.Context, vaultID uuid.UUID, noteID string) ([]byte, error)
+
+// ApplyFrontmatterFunc writes replicated frontmatter keys into the local
+// note (replacing every non-derived key), without notifying the relay.
+type ApplyFrontmatterFunc func(ctx context.Context, vaultID uuid.UUID, noteID string, frontmatterJSON []byte) error
 
 // TombstoneFunc returns the epoch of the latest tombstone of noteID ("" when
 // it predates epoch tracking) and whether one exists.
@@ -224,10 +237,58 @@ func (l *Links) NoteCreated(vaultID uuid.UUID, noteID, path, title string) {
 	}
 	announce := EncodeNoteAnnounce(meta)
 	update := EncodeNoteSync(noteID, wsync.EncodeSyncUpdate(state))
+	meta2 := l.meta2Frame(vaultID, meta)
 	for _, s := range sessions {
 		s.send(announce)
+		if meta2 != nil && s.speaksV2() {
+			s.send(meta2)
+		}
 		s.send(update)
 	}
+}
+
+// NoteMetaChanged is the notes.Service notifier for frontmatter changes
+// (tags, created_at, unknown keys): push the note's frontmatter to every
+// v2 link on the vault (G1).
+func (l *Links) NoteMetaChanged(vaultID uuid.UUID, noteID string) {
+	l.fanMeta2(vaultID, noteID, nil)
+}
+
+func (l *Links) fanMeta2(vaultID uuid.UUID, noteID string, except *Session) {
+	sessions := l.sessionsFor(vaultID)
+	if len(sessions) == 0 {
+		return
+	}
+	n, err := l.deps.Notes.Get(l.rootCtx, vaultID, noteID)
+	if err != nil {
+		return
+	}
+	frame := l.meta2Frame(vaultID, NoteMeta{ID: n.ID, Path: n.Path, Title: n.Title})
+	if frame == nil {
+		return
+	}
+	for _, s := range sessions {
+		if s != except && s.speaksV2() {
+			s.send(frame)
+		}
+	}
+}
+
+// meta2Frame builds the noteMeta2 frame for a note, nil when there is
+// nothing to replicate.
+func (l *Links) meta2Frame(vaultID uuid.UUID, m NoteMeta) []byte {
+	if l.deps.Frontmatter == nil {
+		return nil
+	}
+	fm, err := l.deps.Frontmatter(l.rootCtx, vaultID, m.ID)
+	if err != nil {
+		l.deps.Log.Debug().Err(err).Str("note", m.ID).Msg("federation: read frontmatter")
+		return nil
+	}
+	if fm == nil || len(fm) > maxFrontmatterBytes {
+		return nil
+	}
+	return EncodeNoteMeta2(NoteMeta{ID: m.ID, Path: m.Path, Title: m.Title}, fm)
 }
 
 // NoteDeleted is the notes.Service notifier for local deletions: propagate
@@ -294,6 +355,11 @@ type Session struct {
 	vaultID uuid.UUID
 	peerURL string
 	role    string // "home" | "follower"
+	mode    string // "replica" | "mirror"
+	// peerProto is the peer's relay protocol version: from the WS query
+	// (home side) or the manifest (follower side). v2 frames go only to
+	// v2 peers.
+	peerProto atomic.Int32
 
 	links  *Links
 	deps   RelayDeps
@@ -318,8 +384,28 @@ type Session struct {
 	createdHere map[string]bool
 }
 
-// NewSession builds a relay session; call Run to drive it.
+// SessionOptions carries what the link row and handshake say about a link.
+type SessionOptions struct {
+	// Mode is the link mode: ModeReplica (default) or ModeMirror.
+	Mode string
+	// PeerProto is the peer's advertised relay protocol (home side, from
+	// the WS query); a follower learns home's from the manifest.
+	PeerProto int
+}
+
+// Link modes (vault_federations.mode).
+const (
+	ModeReplica = "replica"
+	ModeMirror  = "mirror"
+)
+
+// NewSession builds a replica relay session; call Run to drive it.
 func (l *Links) NewSession(ctx context.Context, conn wsConn, vaultID uuid.UUID, peerURL, role string) *Session {
+	return l.NewSessionWith(ctx, conn, vaultID, peerURL, role, SessionOptions{})
+}
+
+// NewSessionWith builds a relay session with explicit link options.
+func (l *Links) NewSessionWith(ctx context.Context, conn wsConn, vaultID uuid.UUID, peerURL, role string, o SessionOptions) *Session {
 	if ctx == nil {
 		ctx = l.rootCtx
 	}
@@ -328,11 +414,15 @@ func (l *Links) NewSession(ctx context.Context, conn wsConn, vaultID uuid.UUID, 
 	if rl, ok := conn.(interface{ SetReadLimit(int64) }); ok {
 		rl.SetReadLimit(maxRelayMessageBytes)
 	}
-	return &Session{
+	if o.Mode == "" {
+		o.Mode = ModeReplica
+	}
+	sess := &Session{
 		conn:        conn,
 		vaultID:     vaultID,
 		peerURL:     peerURL,
 		role:        role,
+		mode:        o.Mode,
 		links:       l,
 		deps:        l.deps,
 		ctx:         ctx,
@@ -342,7 +432,12 @@ func (l *Links) NewSession(ctx context.Context, conn wsConn, vaultID uuid.UUID, 
 		denied:      map[string]bool{},
 		createdHere: map[string]bool{},
 	}
+	sess.peerProto.Store(int32(o.PeerProto))
+	return sess
 }
+
+// speaksV2 reports whether the peer advertised relay protocol v2.
+func (s *Session) speaksV2() bool { return s.peerProto.Load() >= 2 }
 
 func (s *Session) originKind() string { return OriginFederationPrefix + s.peerURL }
 
@@ -412,6 +507,13 @@ func (s *Session) sendOpening() error {
 		return err
 	}
 	s.send(EncodeManifest(metas))
+	if s.speaksV2() {
+		for _, m := range metas {
+			if frame := s.links.meta2Frame(s.vaultID, m); frame != nil {
+				s.send(frame)
+			}
+		}
+	}
 	for _, m := range metas {
 		s.sendStep1(m.ID)
 	}
@@ -473,6 +575,7 @@ func (s *Session) handleFrame(f Frame) error {
 		// Follower side: make sure every home note exists locally, then
 		// Step1 each so home sends us what we lack. Then advertise the
 		// notes home doesn't know about.
+		s.peerProto.Store(int32(f.Proto))
 		known := map[string]bool{}
 		for _, m := range f.Manifest {
 			known[m.ID] = true
@@ -497,9 +600,17 @@ func (s *Session) handleFrame(f Frame) error {
 				continue
 			}
 			s.send(EncodeNoteAnnounce(m))
+			if s.speaksV2() {
+				if frame := s.links.meta2Frame(s.vaultID, m); frame != nil {
+					s.send(frame)
+				}
+			}
 			s.sendStep1(m.ID)
 		}
 		return nil
+
+	case frameNoteMeta2:
+		return s.handleMeta2(f)
 
 	case frameNoteAnnounce:
 		if s.role == "home" {
@@ -633,6 +744,27 @@ func (s *Session) handleFrame(f Frame) error {
 	default:
 		return nil
 	}
+}
+
+// handleMeta2 applies replicated frontmatter (G1) and relays it onward.
+func (s *Session) handleMeta2(f Frame) error {
+	if err := validateNoteID(f.Note.ID); err != nil {
+		return err
+	}
+	if s.role == "home" && !s.authorize(domain.CapNoteEdit, f, f.Note.ID) {
+		return nil
+	}
+	if s.deps.ApplyFrontmatter == nil {
+		return nil
+	}
+	if err := s.deps.ApplyFrontmatter(s.ctx, s.vaultID, f.Note.ID, f.Payload); err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	s.links.fanMeta2(s.vaultID, f.Note.ID, s)
+	return nil
 }
 
 // ---- tombstone-aware reconciliation (G2) ------------------------------------------
@@ -791,6 +923,8 @@ func frameKind(t uint64) string {
 		return "delete"
 	case frameNoteMove:
 		return "move"
+	case frameNoteMeta2:
+		return "note_meta2"
 	default:
 		return fmt.Sprintf("frame_%d", t)
 	}

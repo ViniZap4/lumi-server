@@ -56,6 +56,18 @@ func (f *fakeNoteRepo) Upsert(_ context.Context, n domain.Note) (int64, error) {
 	return seq, nil
 }
 
+func (f *fakeNoteRepo) SetCreatedAt(_ context.Context, vaultID uuid.UUID, id string, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, n := range f.byVault[vaultID] {
+		if n.ID == id {
+			f.byVault[vaultID][i].CreatedAt = at
+			return nil
+		}
+	}
+	return domain.ErrNotFound
+}
+
 // setEpoch mirrors pg.NoteYjsStore.SeedSnapshot's notes-row half: stamp
 // epoch, bumping the seq only when it changes.
 func (f *fakeNoteRepo) setEpoch(vaultID uuid.UUID, id, epoch string) (int64, error) {
