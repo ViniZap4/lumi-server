@@ -626,24 +626,43 @@ UPDATE invites i SET revoked_at = COALESCE(i.revoked_at, $2) WHERE `+inviteIDExp
 
 // ---- federations ----------------------------------------------------------------------------
 
+// adminFederationSelect also computes the mirror details (§A13): pending
+// deletes are the vault's tombstones above what a mirror acknowledged
+// (home side of mirror links only), violations the audited mirror
+// violations of the last 24 h.
 const adminFederationSelect = `
 SELECT f.id, f.vault_id, v.slug, v.name, f.role, f.peer_url, f.jurisdiction, f.status, f.last_acked_seq,
-       cs.seq, f.created_at, f.revoked_at
+       cs.seq, f.created_at, f.revoked_at,
+       f.mode, f.sever_policy, f.mirror_acked_seq, f.home_seq, COALESCE(h.seq, 0),
+       f.last_contact_at, f.paused_at, f.promoted_at,
+       CASE WHEN f.role = 'home' AND f.mode = 'mirror' THEN
+         (SELECT count(*) FROM note_tombstones t WHERE t.vault_id = f.vault_id AND t.seq > f.mirror_acked_seq)
+       ELSE 0 END,
+       CASE WHEN f.role = 'home' AND f.mode = 'mirror' THEN
+         (SELECT min(t.deleted_at) FROM note_tombstones t WHERE t.vault_id = f.vault_id AND t.seq > f.mirror_acked_seq)
+       END,
+       (SELECT count(*) FROM audit_log a
+         WHERE a.vault_id = f.vault_id AND a.action = 'federation.mirror_violation'
+           AND a.payload->>'peer_url' = f.peer_url AND a.created_at > NOW() - interval '24 hours')
   FROM vault_federations f
   JOIN vaults v ON v.id = f.vault_id
-  LEFT JOIN federation_control_state cs ON cs.vault_id = f.vault_id AND f.role = 'home'`
+  LEFT JOIN federation_control_state cs ON cs.vault_id = f.vault_id AND f.role = 'home'
+  LEFT JOIN vault_heads h ON h.vault_id = f.vault_id`
 
 func scanAdminFederation(row pgx.Row) (admin.Federation, error) {
 	var f admin.Federation
 	err := row.Scan(&f.ID, &f.VaultID, &f.VaultSlug, &f.VaultName, &f.Role, &f.PeerURL, &f.Jurisdiction,
-		&f.Status, &f.LastAckedSeq, &f.ControlSeq, &f.CreatedAt, &f.RevokedAt)
+		&f.Status, &f.LastAckedSeq, &f.ControlSeq, &f.CreatedAt, &f.RevokedAt,
+		&f.Mode, &f.SeverPolicy, &f.MirrorAckedSeq, &f.HomeSeq, &f.HeadSeq,
+		&f.LastContactAt, &f.PausedAt, &f.PromotedAt,
+		&f.PendingDeletes, &f.OldestPendingDeleteAt, &f.Violations24h)
 	if err != nil {
 		return admin.Federation{}, fmt.Errorf("admin store: federation: %w", errMap(err))
 	}
 	return f, nil
 }
 
-func (s *AdminStore) ListFederations(ctx context.Context, vaultID *uuid.UUID, after *admin.Cursor, limit int) ([]admin.Federation, bool, error) {
+func (s *AdminStore) ListFederations(ctx context.Context, filter admin.FederationFilter, after *admin.Cursor, limit int) ([]admin.Federation, bool, error) {
 	at, key, err := uuidCursor(after)
 	if err != nil {
 		return nil, false, err
@@ -651,8 +670,9 @@ func (s *AdminStore) ListFederations(ctx context.Context, vaultID *uuid.UUID, af
 	rows, err := s.pool.Query(ctx, adminFederationSelect+`
  WHERE ($1::uuid IS NULL OR f.vault_id = $1)
    AND ($2::timestamptz IS NULL OR (f.created_at, f.id) > ($2, $3::uuid))
+   AND ($5 = '' OR f.mode = $5)
  ORDER BY f.created_at, f.id
- LIMIT $4`, vaultID, at, key, limitArg(limit))
+ LIMIT $4`, filter.VaultID, at, key, limitArg(limit), filter.Mode)
 	if err != nil {
 		return nil, false, fmt.Errorf("admin store: list federations: %w", errMap(err))
 	}
@@ -661,6 +681,123 @@ func (s *AdminStore) ListFederations(ctx context.Context, vaultID *uuid.UUID, af
 
 func (s *AdminStore) GetFederation(ctx context.Context, id uuid.UUID) (admin.Federation, error) {
 	return scanAdminFederation(s.pool.QueryRow(ctx, adminFederationSelect+` WHERE f.id = $1`, id))
+}
+
+// PromoteMirror turns a mirror vault into an independent home in one
+// transaction: the follower row (locked, still unpromoted) is marked
+// promoted and severed, plan(state of home's last replicated control
+// document) gives the roles and members to carry over, and entry the
+// audit row written with them.
+func (s *AdminStore) PromoteMirror(ctx context.Context, vaultID uuid.UUID, now time.Time,
+	plan func(state []byte) (admin.Promotion, error), entry func(admin.PromoteResult) domain.AuditEntry) (admin.PromoteResult, error) {
+	var res admin.PromoteResult
+	err := runTx(ctx, s.pool, func(tx pgx.Tx) error {
+		err := tx.QueryRow(ctx, `
+SELECT id, peer_url FROM vault_federations
+ WHERE vault_id = $1 AND role = 'follower' AND mode = 'mirror' AND promoted_at IS NULL
+ ORDER BY created_at DESC LIMIT 1
+ FOR UPDATE`, vaultID).Scan(&res.FederationID, &res.PeerURL)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: vault is not a mirror on this server", domain.ErrNotFound)
+		}
+		if err != nil {
+			return err
+		}
+		var state []byte
+		err = tx.QueryRow(ctx, `SELECT state::text FROM replicated_control_state WHERE vault_id = $1`, vaultID).Scan(&state)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		p, err := plan(state)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+UPDATE vault_federations
+   SET promoted_at = $2,
+       status = CASE WHEN status = 'active' THEN 'severed' ELSE status END,
+       revoked_at = COALESCE(revoked_at, $2)
+ WHERE id = $1`, res.FederationID, now); err != nil {
+			return err
+		}
+		roleIDs := map[string]uuid.UUID{}
+		rows, err := tx.Query(ctx, `SELECT id, name, is_seed FROM vault_roles WHERE vault_id = $1`, vaultID)
+		if err != nil {
+			return err
+		}
+		seed := map[string]bool{}
+		for rows.Next() {
+			var id uuid.UUID
+			var name string
+			var isSeed bool
+			if err := rows.Scan(&id, &name, &isSeed); err != nil {
+				rows.Close()
+				return err
+			}
+			roleIDs[name], seed[name] = id, isSeed
+		}
+		rows.Close()
+		for _, r := range p.Roles {
+			caps, err := marshalCaps(r.Capabilities)
+			if err != nil {
+				return err
+			}
+			if id, ok := roleIDs[r.Name]; ok {
+				if seed[r.Name] {
+					continue // seed roles are identical everywhere
+				}
+				if _, err := tx.Exec(ctx, `UPDATE vault_roles SET capabilities = $2::jsonb WHERE id = $1`, id, caps); err != nil {
+					return err
+				}
+				res.RolesUpdated = append(res.RolesUpdated, r.Name)
+				continue
+			}
+			id := uuid.New()
+			if _, err := tx.Exec(ctx, `INSERT INTO vault_roles (id, vault_id, name, capabilities, is_seed) VALUES ($1, $2, $3, $4::jsonb, false)`,
+				id, vaultID, r.Name, caps); err != nil {
+				return err
+			}
+			roleIDs[r.Name] = id
+			res.RolesCreated = append(res.RolesCreated, r.Name)
+		}
+		var owner uuid.UUID
+		if err := tx.QueryRow(ctx, `SELECT owner_user_id FROM vaults WHERE id = $1`, vaultID).Scan(&owner); err != nil {
+			return err
+		}
+		for _, m := range p.Members {
+			roleID, ok := roleIDs[m.Role]
+			if !ok {
+				res.Missing = append(res.Missing, m.Username)
+				continue
+			}
+			var userID uuid.UUID
+			err := tx.QueryRow(ctx, `SELECT id FROM users WHERE username = $1`, m.Username).Scan(&userID)
+			if errors.Is(err, pgx.ErrNoRows) {
+				res.Missing = append(res.Missing, m.Username)
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if userID == owner {
+				// The owner keeps Admin (owner invariant).
+				res.Members = append(res.Members, m.Username+":owner")
+				continue
+			}
+			if _, err := tx.Exec(ctx, `
+INSERT INTO vault_members (vault_id, user_id, role_id, joined_at) VALUES ($1, $2, $3, $4)
+ON CONFLICT (vault_id, user_id) DO UPDATE SET role_id = EXCLUDED.role_id`, vaultID, userID, roleID, now); err != nil {
+				return err
+			}
+			res.Members = append(res.Members, m.Username+":"+m.Role)
+		}
+		res.Dropped = p.Dropped
+		return insertAudit(ctx, tx, entry(res))
+	})
+	if err != nil {
+		return admin.PromoteResult{}, fmt.Errorf("admin store: promote mirror: %w", errMap(err))
+	}
+	return res, nil
 }
 
 // ---- audit ------------------------------------------------------------------------------------

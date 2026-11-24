@@ -16,20 +16,21 @@ import (
 // fakeStore is an in-memory Store. Tx methods append their audit entry
 // only when the change succeeds, like the real store's transaction.
 type fakeStore struct {
-	mu        sync.Mutex
-	tokens    map[uuid.UUID]*Token
-	digests   map[uuid.UUID][]byte
-	touches   int
-	users     map[uuid.UUID]*User
-	owned     map[uuid.UUID][]uuid.UUID
-	sessions  map[string]*Session
-	vaults    map[uuid.UUID]*Vault
-	feds      map[uuid.UUID]*Federation
-	members   map[uuid.UUID][]Member
-	roles     map[uuid.UUID][]Role
-	invites   map[string]*Invite
-	audit     []domain.AuditEntry
-	failAudit bool
+	mu           sync.Mutex
+	tokens       map[uuid.UUID]*Token
+	digests      map[uuid.UUID][]byte
+	touches      int
+	users        map[uuid.UUID]*User
+	owned        map[uuid.UUID][]uuid.UUID
+	sessions     map[string]*Session
+	vaults       map[uuid.UUID]*Vault
+	feds         map[uuid.UUID]*Federation
+	members      map[uuid.UUID][]Member
+	roles        map[uuid.UUID][]Role
+	invites      map[string]*Invite
+	audit        []domain.AuditEntry
+	failAudit    bool
+	promoteState []byte
 }
 
 func newFakeStore() *fakeStore {
@@ -450,14 +451,39 @@ func (f *fakeStore) GetVaultBySlug(_ context.Context, slug string) (Vault, error
 	return Vault{}, domain.ErrNotFound
 }
 
-func (f *fakeStore) ListFederations(context.Context, *uuid.UUID, *Cursor, int) ([]Federation, bool, error) {
+func (f *fakeStore) ListFederations(_ context.Context, filter FederationFilter, _ *Cursor, _ int) ([]Federation, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []Federation
 	for _, x := range f.feds {
+		if filter.Mode != "" && x.Mode != filter.Mode {
+			continue
+		}
 		out = append(out, *x)
 	}
 	return out, false, nil
+}
+
+func (f *fakeStore) PromoteMirror(_ context.Context, vaultID uuid.UUID, now time.Time, plan func([]byte) (Promotion, error), entry func(PromoteResult) domain.AuditEntry) (PromoteResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, x := range f.feds {
+		if x.VaultID == vaultID && x.Role == "follower" && x.Mode == "mirror" && x.PromotedAt == nil {
+			p, err := plan(f.promoteState)
+			if err != nil {
+				return PromoteResult{}, err
+			}
+			t := now
+			x.PromotedAt = &t
+			res := PromoteResult{FederationID: x.ID, PeerURL: x.PeerURL, Dropped: p.Dropped}
+			for _, m := range p.Members {
+				res.Members = append(res.Members, m.Username+":"+m.Role)
+			}
+			f.audit = append(f.audit, entry(res))
+			return res, nil
+		}
+	}
+	return PromoteResult{}, domain.ErrNotFound
 }
 
 func (f *fakeStore) GetFederation(_ context.Context, id uuid.UUID) (Federation, error) {

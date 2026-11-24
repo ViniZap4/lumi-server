@@ -297,6 +297,8 @@ func TestEveryRouteRequiresToken(t *testing.T) {
 		{"GET", "/admin/v1/sessions"}, {"DELETE", "/admin/v1/sessions/" + strings.Repeat("a", 64)},
 		{"GET", "/admin/v1/vaults"}, {"GET", "/admin/v1/vaults/" + id}, {"DELETE", "/admin/v1/vaults/" + id},
 		{"GET", "/admin/v1/federations"}, {"DELETE", "/admin/v1/federations/" + id},
+		{"GET", "/admin/v1/federations/" + id}, {"POST", "/admin/v1/federations/" + id + "/pause"},
+		{"POST", "/admin/v1/federations/" + id + "/resume"}, {"POST", "/admin/v1/federations/" + id + "/resync"},
 		{"GET", "/admin/v1/tokens"}, {"DELETE", "/admin/v1/tokens/" + id},
 		{"GET", "/admin/v1/audit"},
 		{"DELETE", "/admin/v1/users/" + id + "/sessions"}, {"GET", "/admin/v1/vaults/" + id + "/members"},

@@ -72,8 +72,35 @@ type adminLive struct {
 	users      *users.Service
 	vaults     *vaults.Service
 	federation *federation.Service
+	links      *federation.Links
 	broker     *feed.Broker
 	hub        *wsync.Hub
+}
+
+// mirrorPlanner adapts federation.PlanPromotion to the admin service.
+func mirrorPlanner(baseURL string) func(state []byte) (admin.Promotion, error) {
+	return func(state []byte) (admin.Promotion, error) {
+		p, err := federation.PlanPromotion(state, baseURL)
+		if err != nil {
+			return admin.Promotion{}, err
+		}
+		out := admin.Promotion{Roles: p.Roles, Dropped: p.Dropped}
+		for _, m := range p.Members {
+			out.Members = append(out.Members, admin.PromotedMember{Username: m.Username, Role: m.Role})
+		}
+		return out, nil
+	}
+}
+
+// mirrorProgress adapts the relay's live backfill state.
+func mirrorProgress(links *federation.Links) func(uuid.UUID) (admin.BackfillProgress, bool) {
+	return func(vaultID uuid.UUID) (admin.BackfillProgress, bool) {
+		if links == nil {
+			return admin.BackfillProgress{}, false
+		}
+		p, ok := links.MirrorProgress(vaultID)
+		return admin.BackfillProgress{Active: p.Active, Synced: p.Synced, Total: p.Total}, ok
+	}
 }
 
 type adminConns struct {
@@ -103,6 +130,9 @@ func startAdmin(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxp
 		Log:           log,
 		Version:       Version,
 		MigrationsDir: migrationsDir(),
+		Mirrors:       live.federation,
+		Progress:      mirrorProgress(live.links),
+		// No Planner: promotion is CLI-only (and not routed).
 	}
 	limiter := admin.NewFailureLimiter(10, 6*time.Second, 10_000)
 	api := &admin.HTTP{
@@ -189,6 +219,9 @@ func buildCLIAdmin(ctx context.Context, cfg config, zlog zerolog.Logger, pool *p
 		Acks:       fedStore,
 	})
 	fedResolver.Bind(fedSvc)
+	// Mirror operations from the CLI change rows only; the running
+	// server converges on them (relay manager reconcile loop).
+	fedSvc.SetMirrorStore(fedStore)
 
 	usersSvc := users.NewService(userStore, consentStore, auditStore, auditStore, vaultStore)
 	usersSvc.SetVaultDirRemover(fsMgr)
@@ -204,6 +237,8 @@ func buildCLIAdmin(ctx context.Context, cfg config, zlog zerolog.Logger, pool *p
 		Log:           zlog,
 		Version:       Version,
 		MigrationsDir: migrationsDir(),
+		Mirrors:       fedSvc,
+		Planner:       mirrorPlanner(cfg.publicBaseURL),
 	}, nil
 }
 

@@ -120,7 +120,13 @@ func (h *HTTP) App() *fiber.App {
 	v1.Get("/vaults/:id/members", h.vaultMembers)
 	v1.Delete("/vaults/:id", h.deleteVault)
 	v1.Get("/federations", h.listFederations)
+	v1.Get("/federations/:id", h.getFederation)
 	v1.Delete("/federations/:id", h.revokeFederation)
+	// One-way mirrors (§A13). Promotion is CLI-only on purpose: an admin
+	// token alone must not be able to fork a book.
+	v1.Post("/federations/:id/pause", h.federationOp((*Service).PauseFederation))
+	v1.Post("/federations/:id/resume", h.federationOp((*Service).ResumeFederation))
+	v1.Post("/federations/:id/resync", h.resyncFederation)
 	v1.Get("/invites", h.listInvites)
 	v1.Delete("/invites/:id", h.revokeInvite)
 	v1.Delete("/session", h.endSession)
@@ -620,12 +626,46 @@ type FederationJSON struct {
 	ControlSeq   *int64       `json:"control_seq"`
 	CreatedAt    string       `json:"created_at"`
 	RevokedAt    *string      `json:"revoked_at"`
+
+	Mode                  string        `json:"mode"`
+	SeverPolicy           string        `json:"sever_policy"`
+	HeadSeq               int64         `json:"head_seq"`
+	MirrorAckedSeq        int64         `json:"mirror_acked_seq"`
+	HomeSeq               int64         `json:"home_seq"`
+	LagSeq                int64         `json:"lag_seq"`
+	PendingDeletes        int64         `json:"pending_deletes"`
+	OldestPendingDeleteAt *string       `json:"oldest_pending_delete_at"`
+	LastContactAt         *string       `json:"last_contact_at"`
+	PausedAt              *string       `json:"paused_at"`
+	PromotedAt            *string       `json:"promoted_at"`
+	Violations24h         int64         `json:"violations_24h"`
+	Backfill              *BackfillJSON `json:"backfill"`
+}
+
+type BackfillJSON struct {
+	Active bool `json:"active"`
+	Synced int  `json:"synced"`
+	Total  int  `json:"total"`
 }
 
 func ToFederationJSON(f Federation) FederationJSON {
-	return FederationJSON{ID: f.ID, Vault: VaultRefJSON{ID: f.VaultID, Slug: f.VaultSlug, Name: f.VaultName},
+	out := FederationJSON{ID: f.ID, Vault: VaultRefJSON{ID: f.VaultID, Slug: f.VaultSlug, Name: f.VaultName},
 		Role: f.Role, PeerURL: f.PeerURL, Jurisdiction: f.Jurisdiction, Status: f.Status,
-		LastAckedSeq: f.LastAckedSeq, ControlSeq: f.ControlSeq, CreatedAt: ts(f.CreatedAt), RevokedAt: tsPtr(f.RevokedAt)}
+		LastAckedSeq: f.LastAckedSeq, ControlSeq: f.ControlSeq, CreatedAt: ts(f.CreatedAt), RevokedAt: tsPtr(f.RevokedAt),
+		Mode: f.Mode, SeverPolicy: f.SeverPolicy, HeadSeq: f.HeadSeq, MirrorAckedSeq: f.MirrorAckedSeq,
+		HomeSeq: f.HomeSeq, LagSeq: f.LagSeq(), PendingDeletes: f.PendingDeletes,
+		OldestPendingDeleteAt: tsPtr(f.OldestPendingDeleteAt), LastContactAt: tsPtr(f.LastContactAt),
+		PausedAt: tsPtr(f.PausedAt), PromotedAt: tsPtr(f.PromotedAt), Violations24h: f.Violations24h}
+	if out.Mode == "" {
+		out.Mode = "replica"
+	}
+	if out.SeverPolicy == "" {
+		out.SeverPolicy = "keep"
+	}
+	if f.Backfill != nil {
+		out.Backfill = &BackfillJSON{Active: f.Backfill.Active, Synced: f.Backfill.Synced, Total: f.Backfill.Total}
+	}
+	return out
 }
 
 type TokenJSON struct {
@@ -1018,11 +1058,53 @@ func (h *HTTP) listFederations(c *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	list, more, err := h.Service.ListFederations(c.UserContext(), vault, after, limit)
+	filter := FederationFilter{VaultID: vault, Mode: c.Query("mode")}
+	list, more, err := h.Service.ListFederations(c.UserContext(), filter, after, limit)
 	if err != nil {
 		return h.fail(c, err)
 	}
 	return c.JSON(newPage(list, more, ToFederationJSON, func(f Federation) string { return encodeCursor(f.CreatedAt, f.ID.String()) }))
+}
+
+func (h *HTTP) getFederation(c *fiber.Ctx) error {
+	id, ok := pathUUID(c)
+	if !ok {
+		return errorJSON(c, fiber.StatusNotFound, "not_found", "")
+	}
+	f, err := h.Service.GetFederation(c.UserContext(), id)
+	if err != nil {
+		return h.fail(c, err)
+	}
+	return c.JSON(ToFederationJSON(f))
+}
+
+func (h *HTTP) federationOp(op func(*Service, context.Context, Actor, uuid.UUID) (Federation, error)) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		id, ok := pathUUID(c)
+		if !ok {
+			return errorJSON(c, fiber.StatusNotFound, "not_found", "")
+		}
+		f, err := op(h.Service, c.UserContext(), actorOf(c), id)
+		if err != nil {
+			return h.fail(c, err)
+		}
+		return c.JSON(ToFederationJSON(f))
+	}
+}
+
+func (h *HTTP) resyncFederation(c *fiber.Ctx) error {
+	var body struct {
+		NoteID string `json:"note_id"`
+	}
+	if len(c.Body()) > 0 {
+		if err := c.BodyParser(&body); err != nil {
+			return errorJSON(c, fiber.StatusBadRequest, "invalid_body", "")
+		}
+	}
+	if body.NoteID != "" {
+		return errorJSON(c, fiber.StatusBadRequest, "validation", "note_id: single-note rebuild is not supported yet (full resync only)")
+	}
+	return h.federationOp((*Service).ResyncMirror)(c)
 }
 
 func (h *HTTP) revokeFederation(c *fiber.Ctx) error {

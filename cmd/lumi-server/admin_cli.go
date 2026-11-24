@@ -32,7 +32,7 @@ import (
 // isAdminCommand reports whether args[0] is an admin CLI subcommand.
 func isAdminCommand(cmd string) bool {
 	switch cmd {
-	case "token", "status", "user", "session", "vault", "federation", "audit", "admin":
+	case "token", "status", "user", "session", "vault", "federation", "audit", "admin", "mirror":
 		return true
 	}
 	return false
@@ -56,8 +56,15 @@ const adminUsage = `Administration (docs/ADMIN.md; same rules as the admin API):
   lumi-server vault list [--user u] [--json]
   lumi-server vault show <vault> [--json]
   lumi-server vault delete <vault> [--yes]
-  lumi-server federation list [--vault v] [--json]
+  lumi-server federation list [--vault v] [--mode replica|mirror] [--json]
+  lumi-server federation status <id> [--json]
   lumi-server federation revoke <id>
+  lumi-server federation pause|resume <id>        stop/restart a link without revoking it
+  lumi-server mirror list [--vault v] [--json]    one-way mirror links (both sides)
+  lumi-server mirror status <id> [--json]         lag, pending deletes, last contact
+  lumi-server mirror resync <id>                  mirror side: forget progress, full pass
+  lumi-server mirror pause|resume <id>
+  lumi-server mirror promote <vault> --confirm    mirror becomes an independent home (CLI only)
   lumi-server audit [--limit 50] [--before id] [--scope all|admin] [--user u] [--vault v] [--json]
 <user> is a username or id; <vault> a slug or id.`
 
@@ -158,12 +165,15 @@ func (e *cliEnv) dispatch(ctx context.Context, args []string) error {
 		return errUsage
 	}
 	cmds := map[string]map[string]func(context.Context, *admin.Service, []string) error{
-		"token":      {"create": e.tokenCreate, "list": e.tokenList, "revoke": e.tokenRevoke},
-		"user":       {"list": e.userList, "show": e.userShow, "create": e.userCreate, "password": e.userPassword, "disable": e.userState("disable"), "enable": e.userState("enable"), "unlock": e.userState("unlock"), "delete": e.userDelete},
-		"session":    {"list": e.sessionList, "revoke": e.sessionRevoke},
-		"vault":      {"list": e.vaultList, "show": e.vaultShow, "delete": e.vaultDelete},
-		"federation": {"list": e.federationList, "revoke": e.federationRevoke},
-		"admin":      {"list": e.adminList, "grant": e.adminFlag(true), "revoke": e.adminFlag(false)},
+		"token":   {"create": e.tokenCreate, "list": e.tokenList, "revoke": e.tokenRevoke},
+		"user":    {"list": e.userList, "show": e.userShow, "create": e.userCreate, "password": e.userPassword, "disable": e.userState("disable"), "enable": e.userState("enable"), "unlock": e.userState("unlock"), "delete": e.userDelete},
+		"session": {"list": e.sessionList, "revoke": e.sessionRevoke},
+		"vault":   {"list": e.vaultList, "show": e.vaultShow, "delete": e.vaultDelete},
+		"federation": {"list": e.federationList, "revoke": e.federationRevoke, "status": e.federationStatus,
+			"pause": e.federationOp("pause"), "resume": e.federationOp("resume")},
+		"mirror": {"list": e.mirrorList, "status": e.federationStatus, "resync": e.federationOp("resync"),
+			"pause": e.federationOp("pause"), "resume": e.federationOp("resume"), "promote": e.mirrorPromote},
+		"admin": {"list": e.adminList, "grant": e.adminFlag(true), "revoke": e.adminFlag(false)},
 	}
 	var fn func(context.Context, *admin.Service, []string) error
 	rest := args[1:]
@@ -753,9 +763,18 @@ func (e *cliEnv) vaultDelete(ctx context.Context, svc *admin.Service, args []str
 // ---- federations -----------------------------------------------------------------------------
 
 func (e *cliEnv) federationList(ctx context.Context, svc *admin.Service, args []string) error {
-	fs := flag.NewFlagSet("federation list", flag.ContinueOnError)
+	return e.listLinks(ctx, svc, "federation list", "", args)
+}
+
+func (e *cliEnv) mirrorList(ctx context.Context, svc *admin.Service, args []string) error {
+	return e.listLinks(ctx, svc, "mirror list", "mirror", args)
+}
+
+func (e *cliEnv) listLinks(ctx context.Context, svc *admin.Service, name, mode string, args []string) error {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	asJSON := fs.Bool("json", false, "")
 	vaultRef := fs.String("vault", "", "")
+	modeFlag := fs.String("mode", mode, "")
 	if _, err := parse(fs, args, 0); err != nil {
 		return err
 	}
@@ -767,7 +786,7 @@ func (e *cliEnv) federationList(ctx context.Context, svc *admin.Service, args []
 		}
 		vid = &v.ID
 	}
-	list, _, err := svc.ListFederations(ctx, vid, nil, 0)
+	list, _, err := svc.ListFederations(ctx, admin.FederationFilter{VaultID: vid, Mode: *modeFlag}, nil, 0)
 	if err != nil {
 		return err
 	}
@@ -780,9 +799,150 @@ func (e *cliEnv) federationList(ctx context.Context, svc *admin.Service, args []
 	}
 	rows := make([][]string, 0, len(list))
 	for _, f := range list {
-		rows = append(rows, []string{f.ID.String(), f.VaultSlug, f.Role, f.PeerURL, f.Status, stamp(f.CreatedAt)})
+		status := f.Status
+		if f.PausedAt != nil {
+			status += " (paused)"
+		}
+		if f.PromotedAt != nil {
+			status += " (promoted)"
+		}
+		rows = append(rows, []string{f.ID.String(), f.VaultSlug, f.Role, orDash(f.Mode), f.PeerURL, status, linkLag(f), stamp(f.CreatedAt)})
 	}
-	return table(e.out, []string{"ID", "VAULT", "ROLE", "PEER", "STATUS", "CREATED"}, rows)
+	return table(e.out, []string{"ID", "VAULT", "ROLE", "MODE", "PEER", "STATUS", "LAG", "CREATED"}, rows)
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// linkLag is the LAG column: home side of a mirror = seqs behind and
+// pending deletes; mirror side = applied home seq.
+func linkLag(f admin.Federation) string {
+	switch {
+	case f.Mode == "mirror" && f.Role == "home":
+		return fmt.Sprintf("%d (%d deletes)", f.LagSeq(), f.PendingDeletes)
+	case f.Mode == "mirror":
+		return fmt.Sprintf("@%d", f.HomeSeq)
+	}
+	return "-"
+}
+
+func (e *cliEnv) federationStatus(ctx context.Context, svc *admin.Service, args []string) error {
+	fs := flag.NewFlagSet("federation status", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "")
+	pos, err := parse(fs, args, 1)
+	if err != nil {
+		return err
+	}
+	id, err := uuid.Parse(pos[0])
+	if err != nil {
+		return fmt.Errorf("federation %q: %w", pos[0], domain.ErrNotFound)
+	}
+	f, err := svc.GetFederation(ctx, id)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(e.out, admin.ToFederationJSON(f))
+	}
+	j := admin.ToFederationJSON(f)
+	opt := func(p *string) string {
+		if p == nil {
+			return "-"
+		}
+		return *p
+	}
+	w := tabwriter.NewWriter(e.out, 0, 2, 2, ' ', 0)
+	fmt.Fprintf(w, "id\t%s\n", j.ID)
+	fmt.Fprintf(w, "vault\t%s (%s)\n", j.Vault.Slug, j.Vault.ID)
+	fmt.Fprintf(w, "role / mode\t%s / %s\n", j.Role, j.Mode)
+	fmt.Fprintf(w, "peer\t%s\n", j.PeerURL)
+	fmt.Fprintf(w, "status\t%s\n", j.Status)
+	fmt.Fprintf(w, "sever policy\t%s\n", j.SeverPolicy)
+	fmt.Fprintf(w, "paused at\t%s\n", opt(j.PausedAt))
+	fmt.Fprintf(w, "last contact\t%s\n", opt(j.LastContactAt))
+	if j.Mode == "mirror" && j.Role == "home" {
+		fmt.Fprintf(w, "head / acked\t%d / %d (lag %d)\n", j.HeadSeq, j.MirrorAckedSeq, j.LagSeq)
+		fmt.Fprintf(w, "pending deletes\t%d (oldest %s)\n", j.PendingDeletes, opt(j.OldestPendingDeleteAt))
+		fmt.Fprintf(w, "violations 24h\t%d\n", j.Violations24h)
+	}
+	if j.Mode == "mirror" && j.Role == "follower" {
+		fmt.Fprintf(w, "home seq applied\t%d\n", j.HomeSeq)
+		fmt.Fprintf(w, "promoted at\t%s\n", opt(j.PromotedAt))
+		if j.Backfill != nil {
+			fmt.Fprintf(w, "backfill\t%d/%d (active %v)\n", j.Backfill.Synced, j.Backfill.Total, j.Backfill.Active)
+		}
+	}
+	return w.Flush()
+}
+
+// federationOp runs pause/resume/resync on a link by id.
+func (e *cliEnv) federationOp(op string) func(context.Context, *admin.Service, []string) error {
+	return func(ctx context.Context, svc *admin.Service, args []string) error {
+		pos, err := parse(flag.NewFlagSet("federation "+op, flag.ContinueOnError), args, 1)
+		if err != nil {
+			return err
+		}
+		id, err := uuid.Parse(pos[0])
+		if err != nil {
+			return fmt.Errorf("federation %q: %w", pos[0], domain.ErrNotFound)
+		}
+		switch op {
+		case "pause":
+			_, err = svc.PauseFederation(ctx, admin.CLI, id)
+		case "resume":
+			_, err = svc.ResumeFederation(ctx, admin.CLI, id)
+		case "resync":
+			_, err = svc.ResyncMirror(ctx, admin.CLI, id)
+		}
+		if err != nil {
+			return err
+		}
+		done := map[string]string{"pause": "paused", "resume": "resumed", "resync": "resync requested for"}[op]
+		fmt.Fprintf(e.out, "%s federation %s (a running server applies it within 15 s)\n", done, id)
+		return nil
+	}
+}
+
+// mirrorPromote is CLI-only on purpose: an admin token alone must not be
+// able to fork a book (docs/SPEC-ESPELHO-SELADO.md §A12).
+func (e *cliEnv) mirrorPromote(ctx context.Context, svc *admin.Service, args []string) error {
+	fs := flag.NewFlagSet("mirror promote", flag.ContinueOnError)
+	confirm := fs.Bool("confirm", false, "")
+	pos, err := parse(fs, args, 1)
+	if err != nil {
+		return err
+	}
+	if !*confirm {
+		return fmt.Errorf("%w: promotion turns this mirror into an independent, writable home and cannot be undone: pass --confirm", domain.ErrValidation)
+	}
+	v, res, err := svc.PromoteMirror(ctx, admin.CLI, pos[0])
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(e.out, "promoted mirror %s (%s); link to %s severed\n", v.Slug, v.ID, res.PeerURL)
+	if len(res.RolesCreated)+len(res.RolesUpdated) > 0 {
+		fmt.Fprintf(e.out, "roles created: %s; updated: %s\n", strings.Join(res.RolesCreated, ", "), strings.Join(res.RolesUpdated, ", "))
+	}
+	fmt.Fprintf(e.out, "members carried over: %s\n", joinOrNone(res.Members))
+	if len(res.Missing) > 0 {
+		fmt.Fprintf(e.out, "not carried over (no such user here): %s\n", strings.Join(res.Missing, ", "))
+	}
+	if len(res.Dropped) > 0 {
+		fmt.Fprintf(e.out, "not carried over (other servers): %s\n", strings.Join(res.Dropped, ", "))
+	}
+	fmt.Fprintln(e.out, "restart lumi-server so the running process drops the old link and lifts the read-only mode at once")
+	return nil
+}
+
+func joinOrNone(list []string) string {
+	if len(list) == 0 {
+		return "none"
+	}
+	return strings.Join(list, ", ")
 }
 
 func (e *cliEnv) federationRevoke(ctx context.Context, svc *admin.Service, args []string) error {

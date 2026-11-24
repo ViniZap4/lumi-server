@@ -239,6 +239,45 @@ type Federation struct {
 	ControlSeq   *int64
 	CreatedAt    time.Time
 	RevokedAt    *time.Time
+
+	// One-way mirrors (docs/SPEC-ESPELHO-SELADO.md §A13).
+	Mode           string // "replica" | "mirror"
+	SeverPolicy    string // "keep" | "purge"
+	MirrorAckedSeq int64  // home side
+	HomeSeq        int64  // mirror side
+	HeadSeq        int64  // this server's vault seq
+	LastContactAt  *time.Time
+	PausedAt       *time.Time
+	PromotedAt     *time.Time
+	// Home side of a mirror link: tombstones the mirror has not
+	// acknowledged, and the oldest one's time.
+	PendingDeletes        int64
+	OldestPendingDeleteAt *time.Time
+	Violations24h         int64
+	// Backfill is the live catch-up of a mirror link on this (mirror)
+	// server; nil when unknown (CLI, no session up).
+	Backfill *BackfillProgress
+}
+
+// BackfillProgress is a mirror link's catch-up state.
+type BackfillProgress struct {
+	Active bool
+	Synced int
+	Total  int
+}
+
+// LagSeq is how many home seqs a mirror is behind (home side).
+func (f Federation) LagSeq() int64 {
+	if f.Role != "home" || f.Mode != "mirror" || f.HeadSeq <= f.MirrorAckedSeq {
+		return 0
+	}
+	return f.HeadSeq - f.MirrorAckedSeq
+}
+
+// FederationFilter narrows a federation listing.
+type FederationFilter struct {
+	VaultID *uuid.UUID
+	Mode    string // "" = any
 }
 
 type Counts struct {
@@ -326,8 +365,11 @@ type Store interface {
 	GetInvite(ctx context.Context, id string) (Invite, error)
 	RevokeInvite(ctx context.Context, id string, at time.Time, e domain.AuditEntry) error
 
-	ListFederations(ctx context.Context, vaultID *uuid.UUID, after *Cursor, limit int) ([]Federation, bool, error)
+	ListFederations(ctx context.Context, f FederationFilter, after *Cursor, limit int) ([]Federation, bool, error)
 	GetFederation(ctx context.Context, id uuid.UUID) (Federation, error)
+	// PromoteMirror turns a mirror into an independent home in one
+	// transaction (see Service.PromoteMirror).
+	PromoteMirror(ctx context.Context, vaultID uuid.UUID, now time.Time, plan func(state []byte) (Promotion, error), entry func(PromoteResult) domain.AuditEntry) (PromoteResult, error)
 
 	RecordAudit(ctx context.Context, e domain.AuditEntry) error
 	ListAudit(ctx context.Context, q AuditQuery) ([]domain.AuditEntry, bool, error)
@@ -380,6 +422,13 @@ type Service struct {
 	Login       PasswordLogin // nil: POST /admin/v1/session is refused
 	Live        Live
 	Log         zerolog.Logger
+
+	// One-way mirrors (mirror.go); nil refuses the operations.
+	Mirrors MirrorOps
+	// Progress reports a mirror link's live backfill (running server).
+	Progress func(vaultID uuid.UUID) (BackfillProgress, bool)
+	// Planner turns home's replicated control state into a promotion.
+	Planner func(state []byte) (Promotion, error)
 
 	Version       string
 	MigrationsDir string
@@ -974,8 +1023,18 @@ func (s *Service) DeleteVault(ctx context.Context, a Actor, id uuid.UUID) error 
 
 // ---- federations ------------------------------------------------------------------------
 
-func (s *Service) ListFederations(ctx context.Context, vaultID *uuid.UUID, after *Cursor, limit int) ([]Federation, bool, error) {
-	return s.Store.ListFederations(ctx, vaultID, after, limit)
+func (s *Service) ListFederations(ctx context.Context, f FederationFilter, after *Cursor, limit int) ([]Federation, bool, error) {
+	if f.Mode != "" && f.Mode != "replica" && f.Mode != "mirror" {
+		return nil, false, invalid("mode", "replica or mirror")
+	}
+	list, more, err := s.Store.ListFederations(ctx, f, after, limit)
+	if err != nil {
+		return nil, false, err
+	}
+	for i := range list {
+		s.fillProgress(&list[i])
+	}
+	return list, more, nil
 }
 
 // RevokeFederation revokes an active link through the federation service,

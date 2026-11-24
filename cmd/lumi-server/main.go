@@ -759,7 +759,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	// ---- admin listener (docs/ADMIN.md; off unless LUMI_ADMIN_ADDR) ----
 	adminShutdown, err := startAdmin(ctx, cfg, zlog, pool, adminLive{
 		auth: authSvc, users: usersSvc, vaults: vaultsSvc, federation: federationSvc,
-		broker: broker, hub: wsHub,
+		links: relayLinks, broker: broker, hub: wsHub,
 	})
 	if err != nil {
 		return nil, nil, nil, err
