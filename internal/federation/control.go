@@ -248,16 +248,20 @@ func (s *Service) ControlChanged(vaultID uuid.UUID) {
 }
 
 // CurrentControlState returns the persisted signed document, lazily
-// building it the first time a link comes up.
+// building it the first time a link comes up. A stored document whose
+// signature does not verify against this server's key (rows written while
+// the column was JSONB, which reorders the signed bytes) is re-signed
+// under the next seq instead of being handed to a follower that would
+// reject it.
 func (s *Service) CurrentControlState(ctx context.Context, vaultID uuid.UUID) (state, sig []byte, ok bool) {
 	if s.control == nil {
 		return nil, nil, false
 	}
 	_, st, sg, err := s.control.States.Get(ctx, vaultID)
-	if err == nil {
+	if err == nil && ed25519.Verify(s.pub, controlSigMessage(vaultID, st), sg) {
 		return st, sg, true
 	}
-	if !errors.Is(err, domain.ErrNotFound) {
+	if err != nil && !errors.Is(err, domain.ErrNotFound) {
 		return nil, nil, false
 	}
 	st, sg, seq, err := s.RebuildControlState(ctx, vaultID)

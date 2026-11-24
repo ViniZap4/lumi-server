@@ -16,4 +16,6 @@ ALTER TABLE federation_invites
   DROP COLUMN IF EXISTS sever_policy,
   DROP COLUMN IF EXISTS publish,
   DROP COLUMN IF EXISTS mode;
+ALTER TABLE federation_control_state
+  ALTER COLUMN state TYPE JSONB USING convert_from(state, 'UTF8')::jsonb;
 ALTER TABLE note_tombstones DROP COLUMN IF EXISTS crdt_epoch;

@@ -2,6 +2,7 @@ package federation
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -475,4 +476,45 @@ func TestRelay_ControlStateFlowsAndAcks(t *testing.T) {
 		defer cf.acks.mu.Unlock()
 		return cf.acks.last[cf.home.vault.ID.String()+"|https://follower.example"] == 1
 	})
+}
+
+// Regression: the control document used to be stored as JSONB, which
+// rewrites the signed bytes; every reconnect then pushed a document the
+// follower rejected. A stored document that no longer verifies is
+// re-signed under the next seq before it is handed out.
+func TestCurrentControlState_ResignsDocumentsThatNoLongerVerify(t *testing.T) {
+	cf := newControlFixture(t)
+	vaultID := cf.federate(t)
+	ctx := context.Background()
+	state, sig, seq, err := cf.home.svc.RebuildControlState(ctx, cf.home.vault.ID)
+	if err != nil || seq != 1 {
+		t.Fatal(err)
+	}
+	// What a JSONB round trip does: same document, other bytes.
+	var doc map[string]any
+	if err := json.Unmarshal(state, &doc); err != nil {
+		t.Fatal(err)
+	}
+	normalised, _ := json.MarshalIndent(doc, "", " ")
+	states := cf.home.svc.control.States.(*memControlStates)
+	states.mu.Lock()
+	states.rows[cf.home.vault.ID] = struct {
+		seq        int64
+		state, sig []byte
+	}{1, normalised, sig}
+	states.mu.Unlock()
+
+	st, sg, ok := cf.home.svc.CurrentControlState(ctx, cf.home.vault.ID)
+	if !ok {
+		t.Fatal("no control state")
+	}
+	got, err := cf.follower.svc.ApplyControlState(ctx, vaultID, "https://home.example", st, sg)
+	if err != nil || got != 2 {
+		t.Fatalf("follower apply of the served document: seq=%d err=%v", got, err)
+	}
+	// A valid stored document is served as is.
+	st2, sg2, _ := cf.home.svc.CurrentControlState(ctx, cf.home.vault.ID)
+	if string(st2) != string(st) || string(sg2) != string(sg) {
+		t.Fatal("valid document was rebuilt")
+	}
 }

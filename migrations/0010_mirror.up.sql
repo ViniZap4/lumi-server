@@ -7,6 +7,15 @@
 -- epoch). NULL on tombstones written before this migration.
 ALTER TABLE note_tombstones ADD COLUMN crdt_epoch TEXT;
 
+-- Home's signed control document must be stored byte for byte: the
+-- signature covers the exact JSON, and JSONB normalises it (key order,
+-- whitespace), so a document read back from the table no longer verified
+-- on the follower (every reconnect pushed an invalid state). Existing
+-- rows keep their (normalised) bytes; the server re-signs a row whose
+-- signature no longer verifies the next time it reads it.
+ALTER TABLE federation_control_state
+  ALTER COLUMN state TYPE BYTEA USING convert_to(state::text, 'UTF8');
+
 -- One-way mirrors (§A2). The invite fixes the mode; home reads it from its
 -- own invite row, never from the joiner. publish is reserved for publish
 -- mirrors (M3) and stays NULL until then.
