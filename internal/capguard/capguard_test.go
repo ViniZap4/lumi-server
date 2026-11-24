@@ -3,7 +3,12 @@ package capguard
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/gofiber/fiber/v2"
 
 	"github.com/google/uuid"
 
@@ -63,5 +68,27 @@ func TestAuthorizeGrant(t *testing.T) {
 				t.Fatalf("got %v, want %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// A role clamped on a mirror vault answers mirror_read_only, not the
+// generic capability_missing.
+func TestRequire_MirrorReadOnlyBody(t *testing.T) {
+	vaultID, uid := uuid.New(), uuid.New()
+	admin := domain.Role{Name: "Admin", Capabilities: domain.CapabilitySet{domain.CapAll}}
+	res := mapResolver{uid: admin.ClampToMirror()}
+	app := fiber.New()
+	app.Use(func(c *fiber.Ctx) error { SetUserID(c, uid); return c.Next() })
+	app.Post("/vaults/:vault/x", RequireCapability(res, domain.CapNoteEdit), func(c *fiber.Ctx) error { return c.SendStatus(204) })
+	app.Get("/vaults/:vault/x", RequireCapability(res, domain.CapNoteRead), func(c *fiber.Ctx) error { return c.SendStatus(204) })
+
+	resp, _ := app.Test(httptest.NewRequest("POST", "/vaults/"+vaultID.String()+"/x", nil))
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 403 || !strings.Contains(string(body), `"error":"mirror_read_only"`) || !strings.Contains(string(body), `"capability":"note.edit"`) {
+		t.Fatalf("write: %d %s", resp.StatusCode, body)
+	}
+	resp, _ = app.Test(httptest.NewRequest("GET", "/vaults/"+vaultID.String()+"/x", nil))
+	if resp.StatusCode != 204 {
+		t.Fatalf("read on a mirror: %d", resp.StatusCode)
 	}
 }
