@@ -65,6 +65,11 @@ func (h *RelayHandlers) challenge(c *fiber.Ctx) error {
 	}
 	peerURL := normalizeServerURL(req.PeerURL)
 	fed, err := h.svc.federations.GetActiveByVaultAndPeer(c.UserContext(), vaultID, peerURL)
+	if err == nil && fed.Role == "home" && fed.PausedAt != nil {
+		// Paused by an operator: same answer as an unknown link, the
+		// follower keeps backing off.
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
+	}
 	if err != nil || fed.Role != "home" {
 		// A follower proving it holds the enrolled key learns that the
 		// link was revoked (signed notice) so it can sever its side.
@@ -82,6 +87,7 @@ const (
 	relayVaultKey = "federation.vault"
 	relayPeerKey  = "federation.peer"
 	relayProtoKey = "federation.proto"
+	relayModeKey  = "federation.mode"
 )
 
 // upgradeGuard authenticates the WS upgrade: single-use nonce bound to
@@ -105,7 +111,7 @@ func (h *RelayHandlers) upgradeGuard(c *fiber.Ctx) error {
 		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 	fed, err := h.svc.federations.GetActiveByVaultAndPeer(c.UserContext(), vaultID, peerURL)
-	if err != nil || fed.Role != "home" {
+	if err != nil || fed.Role != "home" || fed.PausedAt != nil {
 		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	}
 	sig, err := hex.DecodeString(sigHex)
@@ -115,6 +121,12 @@ func (h *RelayHandlers) upgradeGuard(c *fiber.Ctx) error {
 	}
 	c.Locals(relayVaultKey, vaultID)
 	c.Locals(relayPeerKey, peerURL)
+	// The link mode comes from home's own row, never from the follower.
+	mode := fed.Mode
+	if mode == "" {
+		mode = ModeReplica
+	}
+	c.Locals(relayModeKey, mode)
 	// The follower's relay protocol (absent from v1 followers). Not
 	// signed: lying about it only changes which frames the follower gets.
 	proto := c.QueryInt("proto", 1)
@@ -135,7 +147,8 @@ func (h *RelayHandlers) handleConn(conn *websocket.Conn) {
 	conn.SetReadLimit(maxRelayMessageBytes)
 	h.log.Info().Str("peer", peerURL).Str("vault", vaultID.String()).Msg("federation: follower connected")
 	proto, _ := conn.Locals(relayProtoKey).(int)
-	sess := h.links.NewSessionWith(nil, conn, vaultID, peerURL, "home", SessionOptions{PeerProto: proto})
+	mode, _ := conn.Locals(relayModeKey).(string)
+	sess := h.links.NewSessionWith(nil, conn, vaultID, peerURL, "home", SessionOptions{PeerProto: proto, Mode: mode})
 	if err := sess.Run(); err != nil {
 		h.log.Warn().Err(err).Str("peer", peerURL).Msg("federation: relay session ended")
 	}

@@ -96,6 +96,8 @@ type joinReq struct {
 	HomeURL      string `json:"home_url"`
 	Token        string `json:"token"`
 	Jurisdiction string `json:"jurisdiction,omitempty"`
+	// Mode the operator expects: "replica" (default) or "mirror".
+	Mode string `json:"mode,omitempty"`
 }
 
 func (h *Handlers) join(c *fiber.Ctx) error {
@@ -111,6 +113,7 @@ func (h *Handlers) join(c *fiber.Ctx) error {
 		HomeURL:      req.HomeURL,
 		Token:        req.Token,
 		Jurisdiction: req.Jurisdiction,
+		Mode:         req.Mode,
 		Actor:        actor,
 		IP:           c.IP(),
 		UserAgent:    string(c.Request().Header.UserAgent()),
@@ -120,13 +123,19 @@ func (h *Handlers) join(c *fiber.Ctx) error {
 	}
 	return c.Status(http.StatusCreated).JSON(fiber.Map{
 		"vault":      fiber.Map{"id": replica.ID, "slug": replica.Slug, "name": replica.Name},
-		"federation": toFederationDTO(fed),
+		"federation": toFederationDTO(fed, LinkStats{}),
 	})
 }
 
 type createInviteReq struct {
 	ServerURLHint string     `json:"server_url_hint,omitempty"`
 	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	// Mode: "replica" (default) or "mirror" (one-way read-only copy).
+	Mode string `json:"mode,omitempty"`
+	// SeverPolicy (mirrors): "keep" (default) or "purge".
+	SeverPolicy string `json:"sever_policy,omitempty"`
+	// Publish is reserved for publish mirrors (M3) and refused for now.
+	Publish any `json:"publish,omitempty"`
 }
 
 func (h *Handlers) createInvite(c *fiber.Ctx) error {
@@ -142,10 +151,15 @@ func (h *Handlers) createInvite(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid_body"})
 	}
+	if req.Publish != nil {
+		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "validation", "message": "publish mirrors are not supported yet"})
+	}
 	in := CreateInviteInput{
 		VaultID:       vid,
 		Actor:         actor,
 		ServerURLHint: req.ServerURLHint,
+		Mode:          req.Mode,
+		SeverPolicy:   req.SeverPolicy,
 		IP:            c.IP(),
 		UserAgent:     string(c.Request().Header.UserAgent()),
 	}
@@ -203,7 +217,7 @@ func (h *Handlers) listFederations(c *fiber.Ctx) error {
 	}
 	out := make([]fiber.Map, 0, len(feds))
 	for _, f := range feds {
-		out = append(out, toFederationDTO(f))
+		out = append(out, toFederationDTO(f, h.svc.MirrorLinkStats(c.UserContext(), f)))
 	}
 	return c.JSON(fiber.Map{"federations": out})
 }
@@ -320,10 +334,20 @@ func toInviteDTO(inv domain.FederationInvite) fiber.Map {
 		"created_at":      inv.CreatedAt.UTC().Format(time.RFC3339),
 		"used":            inv.UsedAt != nil,
 		"revoked":         inv.RevokedAt != nil,
+		"mode":            orDefault(inv.Mode, ModeReplica),
+		"sever_policy":    orDefault(inv.SeverPolicy, SeverKeep),
+		"publish":         nil,
 	}
 }
 
-func toFederationDTO(f domain.Federation) fiber.Map {
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+func toFederationDTO(f domain.Federation, st LinkStats) fiber.Map {
 	out := fiber.Map{
 		"id":             f.ID,
 		"vault_id":       f.VaultID,
@@ -332,6 +356,28 @@ func toFederationDTO(f domain.Federation) fiber.Map {
 		"status":         f.Status,
 		"last_acked_seq": f.LastAckedSeq,
 		"created_at":     f.CreatedAt.UTC().Format(time.RFC3339),
+		"mode":           orDefault(f.Mode, ModeReplica),
+		"sever_policy":   orDefault(f.SeverPolicy, SeverKeep),
+		"publish":        nil,
+		"paused":         f.PausedAt != nil,
+	}
+	if f.Mode == ModeMirror {
+		if f.Role == "home" {
+			out["mirror_acked_seq"] = f.MirrorAckedSeq
+			out["lag_seq"] = st.LagSeq
+			out["pending_deletes"] = st.PendingDeletes
+			out["oldest_pending_delete_at"] = nil
+			if st.OldestPendingDeleteAt != nil {
+				out["oldest_pending_delete_at"] = st.OldestPendingDeleteAt.UTC().Format(time.RFC3339)
+			}
+		} else {
+			out["home_seq"] = f.HomeSeq
+			out["promoted"] = f.PromotedAt != nil
+		}
+	}
+	out["last_contact_at"] = nil
+	if f.LastContactAt != nil {
+		out["last_contact_at"] = f.LastContactAt.UTC().Format(time.RFC3339)
 	}
 	if f.Jurisdiction != nil {
 		out["jurisdiction"] = *f.Jurisdiction
@@ -344,6 +390,10 @@ func toFederationDTO(f domain.Federation) fiber.Map {
 
 func mapErr(c *fiber.Ctx, err error) error {
 	switch {
+	case errors.Is(err, domain.ErrMirrorUnsupported):
+		return c.Status(http.StatusConflict).JSON(fiber.Map{"error": "mirror_unsupported"})
+	case errors.Is(err, domain.ErrMirrorReadOnly):
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "mirror_read_only"})
 	case errors.Is(err, domain.ErrNotFound):
 		return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "not_found"})
 	case errors.Is(err, domain.ErrValidation):

@@ -98,6 +98,18 @@ type Service struct {
 	fedNotify FederationNotifier
 	heads     HeadPublisher
 	now       func() time.Time
+
+	mirrorCheck func(ctx context.Context, vaultID uuid.UUID) bool
+}
+
+// SetMirrorCheck wires "is this vault a read-only mirror here" (lazy init
+// off, /content 409 mirror_syncing). nil = never a mirror.
+func (s *Service) SetMirrorCheck(fn func(ctx context.Context, vaultID uuid.UUID) bool) {
+	s.mirrorCheck = fn
+}
+
+func (s *Service) isMirror(ctx context.Context, vaultID uuid.UUID) bool {
+	return s.mirrorCheck != nil && s.mirrorCheck(ctx, vaultID)
 }
 
 // SetHeadPublisher wires the account feed; nil disables.
@@ -226,6 +238,12 @@ func (s *Service) SetLiveDocs(d LiveDocs) { s.docs = d }
 // (crdt.InitSource). Unknown notes and notes without a file yet (e.g. a
 // federation replica awaiting its first mirrored update) yield "".
 func (s *Service) CRDTInitBody(ctx context.Context, vaultID uuid.UUID, noteID string) (string, error) {
+	// A mirror never seeds (CRDT §10 S5): its notes get home's state over
+	// the relay, and a file edited behind its back must not become a
+	// second history.
+	if s.isMirror(ctx, vaultID) {
+		return "", nil
+	}
 	n, err := s.notes.Get(ctx, vaultID, noteID)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
@@ -499,7 +517,8 @@ func (s *Service) GetContent(ctx context.Context, vaultID uuid.UUID, id string) 
 	}
 	front, body, err := s.fs.ReadNote(v.Slug, n.Path)
 	if err != nil {
-		return domain.Note{}, nil, nil, err
+		// The row exists; callers can tell "no file yet" from "no note".
+		return n, nil, nil, err
 	}
 	return n, front, body, nil
 }
@@ -1369,6 +1388,11 @@ func (h *Handlers) getContent(c *fiber.Ctx) error {
 	}
 	n, front, body, err := h.svc.GetContent(c.UserContext(), vaultID, id)
 	if err != nil {
+		// A mirror lists notes before their content arrived over the
+		// relay: say so instead of a bare 404 (§A6.4).
+		if errors.Is(err, domain.ErrNotFound) && n.ID != "" && h.svc.isMirror(c.UserContext(), vaultID) {
+			return c.Status(http.StatusConflict).JSON(fiber.Map{"error": "mirror_syncing"})
+		}
 		return mapErr(c, err)
 	}
 	return c.JSON(fiber.Map{

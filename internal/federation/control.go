@@ -427,9 +427,12 @@ type UserGetter interface {
 // resolverCacheEntry memoizes per-vault federation status + parsed state.
 type resolverCacheEntry struct {
 	isFollower bool
-	seq        int64
-	doc        *ControlState
-	expires    time.Time
+	// isMirror: this server holds the vault as a read-only mirror (any
+	// link status, until promoted). Every role is clamped (§A6).
+	isMirror bool
+	seq      int64
+	doc      *ControlState
+	expires  time.Time
 }
 
 type resolverCache struct {
@@ -518,6 +521,20 @@ func (r *ControlResolver) RoleForUser(ctx context.Context, vaultID, userID uuid.
 		entry = r.load(ctx, svc, vaultID)
 		r.cache.put(vaultID, entry)
 	}
+	role, err := r.resolve(ctx, entry, baseURL, vaultID, userID)
+	if err != nil {
+		return domain.Role{}, err
+	}
+	// The single choke point of the mirror read-only rule: whatever the
+	// role says (home's grant, or the joining operator's local Admin),
+	// a mirror only reads.
+	if entry.isMirror {
+		role = role.ClampToMirror()
+	}
+	return role, nil
+}
+
+func (r *ControlResolver) resolve(ctx context.Context, entry resolverCacheEntry, baseURL string, vaultID, userID uuid.UUID) (domain.Role, error) {
 	if !entry.isFollower || entry.doc == nil {
 		// Not federated, or bootstrap window: local membership rules.
 		return r.base.RoleForUser(ctx, vaultID, userID)
@@ -554,9 +571,11 @@ func (r *ControlResolver) load(ctx context.Context, svc *Service, vaultID uuid.U
 		return entry
 	}
 	for _, row := range rows {
+		if row.IsMirrorFollower() {
+			entry.isMirror = true
+		}
 		if row.Role == "follower" && row.Status == "active" {
 			entry.isFollower = true
-			break
 		}
 	}
 	if !entry.isFollower || svc.control == nil {

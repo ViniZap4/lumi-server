@@ -117,6 +117,21 @@ type RelayDeps struct {
 	// frameNoteMeta2 to v2 peers. nil disables (sending resp. applying).
 	Frontmatter      FrontmatterFunc
 	ApplyFrontmatter ApplyFrontmatterFunc
+
+	// One-way mirrors (mirror.go); all nil-safe.
+	// MirrorViolation (home) records a content frame from a mirror; the
+	// session closes the link itself.
+	MirrorViolation func(ctx context.Context, vaultID uuid.UUID, peerURL, frame, noteID string)
+	// MirrorAcked (home) stores a mirror's acknowledged home seq.
+	MirrorAcked func(vaultID uuid.UUID, peerURL string, seq int64)
+	// HomeSeqApplied (mirror) stores the home seq the copy applied.
+	HomeSeqApplied func(vaultID uuid.UUID, peerURL string, seq int64)
+	// Head (home) returns the vault seq announced to mirrors.
+	Head func(ctx context.Context, vaultID uuid.UUID) (int64, error)
+	// LocalWriteBlocked (mirror) is told about a persisted update whose
+	// origin is not the home link (should never happen: the hub guard
+	// refuses local writes first).
+	LocalWriteBlocked func(vaultID uuid.UUID, noteID, origin string)
 }
 
 // FrontmatterFunc returns a note's frontmatter as a JSON object of the keys
@@ -197,8 +212,29 @@ func (l *Links) OnPersist(vaultID uuid.UUID, noteID string, update []byte, origi
 		if s.originKind() == originKind {
 			continue // don't echo an update back to its source link
 		}
+		if !s.sendsContent() {
+			// A mirror never authors content: anything persisted here
+			// that did not come from home is a bug or tampering.
+			if l.deps.LocalWriteBlocked != nil {
+				l.deps.LocalWriteBlocked(vaultID, noteID, originKind)
+			}
+			continue
+		}
 		s.send(EncodeNoteSync(noteID, wsync.EncodeSyncUpdate(update)))
 	}
+}
+
+// contentSessionsFor lists the vault's sessions that may carry content
+// outward (all but the mirror side of a mirror link).
+func (l *Links) contentSessionsFor(vaultID uuid.UUID) []*Session {
+	all := l.sessionsFor(vaultID)
+	out := all[:0]
+	for _, s := range all {
+		if s.sendsContent() {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // NoteCreated is the notes.Service notifier: announce a brand-new note and
@@ -206,7 +242,7 @@ func (l *Links) OnPersist(vaultID uuid.UUID, noteID string, update []byte, origi
 // seeds the CRDT via InitFromText, which bypasses PersistChange — hence a
 // dedicated hook.)
 func (l *Links) NoteCreated(vaultID uuid.UUID, noteID, path, title string) {
-	sessions := l.sessionsFor(vaultID)
+	sessions := l.contentSessionsFor(vaultID)
 	if len(sessions) == 0 {
 		return
 	}
@@ -255,7 +291,7 @@ func (l *Links) NoteMetaChanged(vaultID uuid.UUID, noteID string) {
 }
 
 func (l *Links) fanMeta2(vaultID uuid.UUID, noteID string, except *Session) {
-	sessions := l.sessionsFor(vaultID)
+	sessions := l.contentSessionsFor(vaultID)
 	if len(sessions) == 0 {
 		return
 	}
@@ -304,7 +340,7 @@ func (l *Links) NoteMoved(vaultID uuid.UUID, noteID, newPath, newTitle string) {
 
 func (l *Links) fanMove(vaultID uuid.UUID, m NoteMeta, except *Session) {
 	frame := EncodeNoteMove(m)
-	for _, s := range l.sessionsFor(vaultID) {
+	for _, s := range l.contentSessionsFor(vaultID) {
 		if s == except {
 			continue
 		}
@@ -329,7 +365,7 @@ func (l *Links) PushControl(vaultID uuid.UUID, state, sig []byte) {
 
 func (l *Links) fanDelete(vaultID uuid.UUID, noteID string, except *Session) {
 	frame := EncodeNoteDelete(noteID)
-	for _, s := range l.sessionsFor(vaultID) {
+	for _, s := range l.contentSessionsFor(vaultID) {
 		if s == except {
 			continue
 		}
@@ -382,6 +418,15 @@ type Session struct {
 	// createdHere lists notes this link created (announce with
 	// note.create): their first content may land without note.edit.
 	createdHere map[string]bool
+
+	// Mirror side: windowed backfill state (mirror_backfill.go).
+	bf backfill
+}
+
+// sendsContent reports whether this side may send content frames on the
+// link: everything but the mirror side of a mirror link.
+func (s *Session) sendsContent() bool {
+	return !(s.mode == ModeMirror && s.role == "follower")
 }
 
 // SessionOptions carries what the link row and handshake say about a link.
@@ -480,6 +525,9 @@ func (s *Session) Run() error {
 		if err := s.sendOpening(); err != nil {
 			return err
 		}
+		if s.mode == ModeMirror {
+			go s.headLoop()
+		}
 	}
 	return s.readLoop()
 }
@@ -514,13 +562,19 @@ func (s *Session) sendOpening() error {
 			}
 		}
 	}
-	for _, m := range metas {
-		s.sendStep1(m.ID)
+	// A mirror never authors content: nothing to ask it for (§A4.3).
+	if s.mode != ModeMirror {
+		for _, m := range metas {
+			s.sendStep1(m.ID)
+		}
 	}
 	if s.deps.ControlCurrent != nil {
 		if state, sig, ok := s.deps.ControlCurrent(s.ctx, s.vaultID); ok {
 			s.send(EncodeControlState(state, sig))
 		}
+	}
+	if s.mode == ModeMirror {
+		s.sendHead(true)
 	}
 	return nil
 }
@@ -564,6 +618,18 @@ func (s *Session) readLoop() error {
 }
 
 func (s *Session) handleFrame(f Frame) error {
+	if s.mode == ModeMirror {
+		var handled bool
+		var err error
+		if s.role == "home" {
+			handled, err = s.homeMirrorFrame(f)
+		} else {
+			handled, err = s.mirrorFrame(f)
+		}
+		if handled {
+			return err
+		}
+	}
 	switch f.Type {
 	case frameManifest:
 		// Only home sends a manifest. A follower that sends one would

@@ -473,6 +473,10 @@ type vaultViewDTO struct {
 	Role       string         `json:"role"`
 	CanEdit    bool           `json:"can_edit"`
 	Federation FederationInfo `json:"federation"`
+	// Mirror: this server only holds a read-only mirror of the vault
+	// (badge "Espelho de <home> · somente leitura"); federation.home_url
+	// names the home.
+	Mirror bool `json:"mirror"`
 }
 
 func toViewDTO(v View) vaultViewDTO {
@@ -482,6 +486,7 @@ func toViewDTO(v View) vaultViewDTO {
 		Role:       v.Role.Name,
 		CanEdit:    v.CanEdit(),
 		Federation: v.Federation,
+		Mirror:     v.Federation.IsMirror() || v.Role.MirrorReadOnly,
 	}
 }
 
@@ -610,6 +615,8 @@ func mapErr(c *fiber.Ctx, err error) error {
 		return c.Status(http.StatusConflict).JSON(fiber.Map{"error": "conflict"})
 	case errors.Is(err, domain.ErrUnauthorized):
 		return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	case errors.Is(err, domain.ErrMirrorReadOnly):
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "mirror_read_only"})
 	case errors.Is(err, domain.ErrForbidden), errors.Is(err, domain.ErrCapabilityMissing):
 		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 	default:

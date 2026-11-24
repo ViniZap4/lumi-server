@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -535,7 +536,14 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 
 	notesSvc := notes.NewService(noteStore, vaultStore, fsMgr, auditStore, fedResolver, crdtRegistry, fsWatcher)
 	notesSvc.SetHeadPublisher(broker)
+	// Mirror vaults (docs/SPEC-ESPELHO-SELADO.md part A) accept CRDT
+	// writes only from their home link. Bound to the federation service
+	// once it exists.
+	var isMirror func(ctx context.Context, vaultID uuid.UUID) bool
 	wsHub := wsync.NewHub(crdtRegistry,
+		wsync.WithWriteGuard(mirrorWriteGuard(zlog, auditStore, func(ctx context.Context, v uuid.UUID) bool {
+			return isMirror != nil && isMirror(ctx, v)
+		})),
 		wsync.WithFSMirror(notesSvc.WriteBodyFromCRDT),
 		// Feed seq: committed content changes bump the vault head at most
 		// once per second per note (SPEC-LIVROS §3.4).
@@ -550,7 +558,9 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	// seq; tell the account feed (protocol §12).
 	crdtRegistry.SetOnEpochChange(notesSvc.EpochRotated)
 
-	fsWatcher.SetHandler(buildFSHandler(zlog, vaultStore, noteStore, fsMgr, wsHub, notesSvc))
+	fsWatcher.SetHandler(buildFSHandler(zlog, vaultStore, noteStore, fsMgr, wsHub, notesSvc, func(ctx context.Context, v uuid.UUID) bool {
+		return isMirror != nil && isMirror(ctx, v)
+	}))
 	vaultsSvc.SetWatcher(fsWatcher)
 	vaultsSvc.SetOwnershipDeps(memberStore, userStore, notesSvc)
 	if err := fsWatcher.WatchExistingVaults(); err != nil {
@@ -595,6 +605,15 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		// G1: frontmatter (tags, created_at, …) over frameNoteMeta2.
 		Frontmatter:      notesSvc.FrontmatterForFederation,
 		ApplyFrontmatter: notesSvc.ApplyFrontmatterFromFederation,
+		// One-way mirrors.
+		MirrorViolation: federationSvc.MirrorViolation,
+		MirrorAcked:     federationSvc.RecordMirrorAck,
+		HomeSeqApplied:  federationSvc.RecordHomeSeq,
+		Head:            federationSvc.VaultHead,
+		LocalWriteBlocked: func(vaultID uuid.UUID, noteID, origin string) {
+			zlog.Error().Str("vault", vaultID.String()).Str("note", noteID).Str("origin", origin).
+				Msg("mirror.local_write_blocked: persisted update on a mirror did not come from home")
+		},
 	})
 	crdtRegistry.SetOnPersist(relayLinks.OnPersist)
 	notesSvc.SetFederationNotifier(relayLinks)
@@ -603,6 +622,12 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 
 	// F3 control plane.
 	fedStore := pg.NewFederationStore(pool)
+	// One-way mirrors: acks/lag, pause/resume/resync, purge on revoke,
+	// read-only clamp (resolver), no lazy init, no fswatch, hub guard.
+	federationSvc.SetMirrorStore(fedStore)
+	federationSvc.SetVaultDeleter(vaultsSvc)
+	notesSvc.SetMirrorCheck(federationSvc.IsMirrorVault)
+	isMirror = federationSvc.IsMirrorVault
 	federationSvc.SetControlPlane(federation.ControlPlaneDeps{
 		States:     pg.NewControlStateStore(pool),
 		Replicated: pg.NewReplicatedControlStore(pool),
@@ -829,12 +854,19 @@ func buildFSHandler(
 	fsMgr *fs.Manager,
 	hub *wsync.Hub,
 	notesSvc *notes.Service,
+	isMirror func(ctx context.Context, vaultID uuid.UUID) bool,
 ) fswatch.Handler {
 	log := zlog.With().Str("component", "fswatch.handler").Logger()
 	return fswatch.HandlerFunc(func(ctx context.Context, ev fswatch.Event) {
 		v, err := vaultStore.GetBySlug(ctx, ev.VaultSlug)
 		if err != nil {
 			log.Debug().Err(err).Str("slug", ev.VaultSlug).Msg("vault lookup failed")
+			return
+		}
+		// A mirror's files are a projection of home's CRDT: external
+		// edits are never merged (the next mirror write overwrites them).
+		if isMirror != nil && isMirror(ctx, v.ID) {
+			log.Debug().Str("slug", ev.VaultSlug).Msg("external edit on a mirror ignored")
 			return
 		}
 		n, err := noteStore.GetByPath(ctx, v.ID, ev.RelativePath)
@@ -868,6 +900,26 @@ func buildFSHandler(
 			notesSvc.NotifyMetaChanged(v.ID, n.ID)
 		}
 	})
+}
+
+// mirrorWriteGuard refuses any CRDT write to a mirror vault that did not
+// come over the home link (defence in depth behind the resolver clamp).
+func mirrorWriteGuard(zlog zerolog.Logger, rec audit.Recorder, isMirror func(context.Context, uuid.UUID) bool) wsync.WriteGuard {
+	return func(vaultID uuid.UUID, origin string) error {
+		if strings.HasPrefix(origin, federation.OriginFederationPrefix) {
+			return nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if !isMirror(ctx, vaultID) {
+			return nil
+		}
+		zlog.Warn().Str("vault", vaultID.String()).Str("origin", origin).Msg("mirror.local_write_blocked")
+		payload, _ := json.Marshal(map[string]any{"origin": origin})
+		vid := vaultID
+		_ = rec.Record(ctx, domain.AuditEntry{Action: domain.ActionMirrorLocalWriteBlocked, VaultID: &vid, Payload: payload, CreatedAt: time.Now()})
+		return domain.ErrMirrorReadOnly
+	}
 }
 
 // registerRoutes mounts the public /api routes and then the authenticated

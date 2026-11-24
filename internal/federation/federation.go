@@ -29,12 +29,22 @@ import (
 // token (high-entropy, single-use, out-of-band) is what proves authorisation.
 const acceptMessagePrefix = "lumi-federation-accept-v1"
 
+// acceptMessagePrefixV2 also signs the link mode, so a replica invite
+// cannot be replayed as a mirror one or the other way round (§A3). Home
+// accepts v1 signatures only for replica invites.
+const acceptMessagePrefixV2 = "lumi-federation-accept-v2"
+
 // InviteTTLDefault bounds how long a federation invite stays usable.
 const InviteTTLDefault = 7 * 24 * time.Hour
 
 // AcceptMessage builds the canonical byte string both sides sign/verify.
 func AcceptMessage(token, followerURL string) []byte {
 	return []byte(acceptMessagePrefix + "|" + token + "|" + followerURL)
+}
+
+// AcceptMessageV2 is the v2 accept payload: v1 plus the link mode.
+func AcceptMessageV2(token, followerURL, mode string) []byte {
+	return []byte(acceptMessagePrefixV2 + "|" + token + "|" + followerURL + "|" + mode)
 }
 
 // ---- storage boundaries ------------------------------------------------------
@@ -107,14 +117,20 @@ type AcceptRequest struct {
 	Token           string `json:"token"`
 	FollowerURL     string `json:"follower_url"`
 	FollowerPubKey  string `json:"follower_pubkey"` // hex
-	Signature       string `json:"signature"`       // hex, over AcceptMessage
+	Signature       string `json:"signature"`       // hex, over AcceptMessage (v1) or AcceptMessageV2
 	JurisdictionOpt string `json:"jurisdiction,omitempty"`
+	// Mode, when set, means the signature is over AcceptMessageV2 with
+	// this mode. v1 followers leave it empty.
+	Mode string `json:"mode,omitempty"`
 }
 
 // AcceptResponse is home's answer: the vault being federated + home identity.
 type AcceptResponse struct {
 	Vault VaultInfo `json:"vault"`
 	Home  Identity  `json:"home"`
+	// Mode and SeverPolicy come from home's invite row (v2 homes).
+	Mode        string `json:"mode,omitempty"`
+	SeverPolicy string `json:"sever_policy,omitempty"`
 }
 
 type VaultInfo struct {
@@ -148,6 +164,13 @@ type Service struct {
 	controlLocks  sync.Map // vaultID -> *sync.Mutex (RebuildControlState)
 
 	feed Feed
+
+	// One-way mirrors (mirror.go).
+	mirrors      MirrorStore
+	deleter      VaultDeleter
+	mirrorCache  *mirrorCache
+	violationsMu sync.Mutex
+	violations   map[string][]time.Time
 }
 
 // Feed is the account-feed surface the federation layer publishes to
@@ -220,6 +243,8 @@ func NewService(ctx context.Context, d Deps) (*Service, error) {
 		now:         time.Now,
 		net:         d.Net,
 		operators:   d.Operators,
+		mirrorCache: newMirrorCache(),
+		violations:  map[string][]time.Time{},
 	}
 	if svc.client == nil {
 		svc.client = newHTTPClient(d.Net)
@@ -269,6 +294,10 @@ type CreateInviteInput struct {
 	Actor         uuid.UUID
 	ServerURLHint string
 	ExpiresAt     time.Time
+	// Mode is ModeReplica (default) or ModeMirror. SeverPolicy is
+	// SeverKeep (default) or SeverPurge.
+	Mode          string
+	SeverPolicy   string
 	IP, UserAgent string
 }
 
@@ -291,7 +320,26 @@ func (s *Service) CreateInvite(ctx context.Context, in CreateInviteInput) (domai
 	if !expires.After(s.now()) {
 		return domain.FederationInvite{}, fmt.Errorf("%w: expires_at must be in the future", domain.ErrValidation)
 	}
+	mode := in.Mode
+	if mode == "" {
+		mode = ModeReplica
+	}
+	if mode != ModeReplica && mode != ModeMirror {
+		return domain.FederationInvite{}, fmt.Errorf("%w: mode must be replica or mirror", domain.ErrValidation)
+	}
+	policy := in.SeverPolicy
+	if policy == "" {
+		policy = SeverKeep
+	}
+	if policy != SeverKeep && policy != SeverPurge {
+		return domain.FederationInvite{}, fmt.Errorf("%w: sever_policy must be keep or purge", domain.ErrValidation)
+	}
+	if mode == ModeReplica && policy != SeverKeep {
+		return domain.FederationInvite{}, fmt.Errorf("%w: sever_policy applies to mirrors only", domain.ErrValidation)
+	}
 	inv := domain.FederationInvite{
+		Mode:          mode,
+		SeverPolicy:   policy,
 		Token:         newToken(),
 		VaultID:       in.VaultID,
 		InviterUserID: in.Actor,
@@ -306,6 +354,8 @@ func (s *Service) CreateInvite(ctx context.Context, in CreateInviteInput) (domai
 		"vault_id":        in.VaultID,
 		"server_url_hint": inv.ServerURLHint,
 		"expires_at":      inv.ExpiresAt,
+		"mode":            inv.Mode,
+		"sever_policy":    inv.SeverPolicy,
 	})
 	return inv, nil
 }
@@ -357,8 +407,21 @@ func (s *Service) Accept(ctx context.Context, req AcceptRequest) (AcceptResponse
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return AcceptResponse{}, fmt.Errorf("%w: signature must be a hex Ed25519 signature", domain.ErrValidation)
 	}
-	if !ed25519.Verify(ed25519.PublicKey(pubKey), AcceptMessage(req.Token, followerURL), sig) {
-		return AcceptResponse{}, fmt.Errorf("%w: signature verification failed", domain.ErrForbidden)
+	// v1 followers sign without a mode; v2 followers sign the mode they
+	// were asked to join as.
+	signedMode := ""
+	switch req.Mode {
+	case "":
+		if !ed25519.Verify(ed25519.PublicKey(pubKey), AcceptMessage(req.Token, followerURL), sig) {
+			return AcceptResponse{}, fmt.Errorf("%w: signature verification failed", domain.ErrForbidden)
+		}
+	case ModeReplica, ModeMirror:
+		if !ed25519.Verify(ed25519.PublicKey(pubKey), AcceptMessageV2(req.Token, followerURL, req.Mode), sig) {
+			return AcceptResponse{}, fmt.Errorf("%w: signature verification failed", domain.ErrForbidden)
+		}
+		signedMode = req.Mode
+	default:
+		return AcceptResponse{}, fmt.Errorf("%w: mode must be replica or mirror", domain.ErrValidation)
 	}
 
 	inv, err := s.invites.Get(ctx, req.Token)
@@ -372,6 +435,27 @@ func (s *Service) Accept(ctx context.Context, req AcceptRequest) (AcceptResponse
 		return AcceptResponse{}, fmt.Errorf("%w: invite not usable", domain.ErrForbidden)
 	case inv.ServerURLHint != "" && inv.ServerURLHint != followerURL:
 		return AcceptResponse{}, fmt.Errorf("%w: invite not usable", domain.ErrForbidden)
+	}
+	// The mode comes from home's own invite row, never from the joiner.
+	// Checked before MarkUsed so a refused follower does not burn it.
+	mode := inv.Mode
+	if mode == "" {
+		mode = ModeReplica
+	}
+	if mode == ModeMirror && signedMode != ModeMirror {
+		if signedMode == "" {
+			// A v1 follower must not join a mirror invite as a
+			// writable replica.
+			return AcceptResponse{}, domain.ErrMirrorUnsupported
+		}
+		return AcceptResponse{}, fmt.Errorf("%w: invite mode is %s", domain.ErrConflict, mode)
+	}
+	if mode == ModeReplica && signedMode == ModeMirror {
+		return AcceptResponse{}, fmt.Errorf("%w: invite mode is %s", domain.ErrConflict, mode)
+	}
+	policy := inv.SeverPolicy
+	if policy == "" {
+		policy = SeverKeep
 	}
 	// MarkUsed is atomic (used_at IS NULL guard): concurrent accepts race
 	// safely, exactly one wins.
@@ -395,6 +479,8 @@ func (s *Service) Accept(ctx context.Context, req AcceptRequest) (AcceptResponse
 		Jurisdiction: jurisdiction,
 		Status:       "active",
 		CreatedAt:    now.UTC(),
+		Mode:         mode,
+		SeverPolicy:  policy,
 	}); err != nil {
 		return AcceptResponse{}, err
 	}
@@ -404,19 +490,27 @@ func (s *Service) Accept(ctx context.Context, req AcceptRequest) (AcceptResponse
 		"role":         "home",
 		"peer_url":     followerURL,
 		"jurisdiction": req.JurisdictionOpt,
+		"mode":         mode,
+		"sever_policy": policy,
 	})
 	return AcceptResponse{
-		Vault: VaultInfo{ID: v.ID, Slug: v.Slug, Name: v.Name},
-		Home:  ident,
+		Vault:       VaultInfo{ID: v.ID, Slug: v.Slug, Name: v.Name},
+		Home:        ident,
+		Mode:        mode,
+		SeverPolicy: policy,
 	}, nil
 }
 
 // ---- join (follower side) -------------------------------------------------------
 
 type JoinInput struct {
-	HomeURL       string
-	Token         string
-	Jurisdiction  string
+	HomeURL      string
+	Token        string
+	Jurisdiction string
+	// Mode is what the operator expects the invite to be: ModeReplica
+	// (default) or ModeMirror. A mirror join signs the v2 accept; a
+	// replica join keeps signing v1 so old homes still accept it.
+	Mode          string
 	Actor         uuid.UUID
 	IP, UserAgent string
 }
@@ -465,26 +559,44 @@ func (s *Service) Join(ctx context.Context, in JoinInput) (domain.Vault, domain.
 		return domain.Vault{}, domain.Federation{}, fmt.Errorf("%w: home returned an invalid public key", domain.ErrValidation)
 	}
 
-	sig := ed25519.Sign(s.priv, AcceptMessage(in.Token, s.baseURL))
-	resp, err := s.client.Accept(ctx, homeURL, AcceptRequest{
+	mode := in.Mode
+	if mode == "" {
+		mode = ModeReplica
+	}
+	if mode != ModeReplica && mode != ModeMirror {
+		return domain.Vault{}, domain.Federation{}, fmt.Errorf("%w: mode must be replica or mirror", domain.ErrValidation)
+	}
+	req := AcceptRequest{
 		Token:           in.Token,
 		FollowerURL:     s.baseURL,
 		FollowerPubKey:  hex.EncodeToString(s.pub),
-		Signature:       hex.EncodeToString(sig),
 		JurisdictionOpt: strings.TrimSpace(in.Jurisdiction),
-	})
+	}
+	if mode == ModeMirror {
+		req.Mode = ModeMirror
+		req.Signature = hex.EncodeToString(ed25519.Sign(s.priv, AcceptMessageV2(in.Token, s.baseURL, ModeMirror)))
+	} else {
+		req.Signature = hex.EncodeToString(ed25519.Sign(s.priv, AcceptMessage(in.Token, s.baseURL)))
+	}
+	resp, err := s.client.Accept(ctx, homeURL, req)
 	if err != nil {
 		return domain.Vault{}, domain.Federation{}, fmt.Errorf("federation: accept at home: %w", err)
 	}
+	respMode := resp.Mode
+	if respMode == "" {
+		respMode = ModeReplica // v1 home
+	}
+	if respMode != mode {
+		// Home and the operator disagree about what this link is: never
+		// provision a writable replica for a mirror or the reverse.
+		return domain.Vault{}, domain.Federation{}, fmt.Errorf("%w: home answered mode %q, expected %q", domain.ErrConflict, respMode, mode)
+	}
+	policy := resp.SeverPolicy
+	if policy != SeverPurge {
+		policy = SeverKeep
+	}
 
-	replica, err := s.creator.Create(ctx, vaults.CreateInput{
-		ID:        resp.Vault.ID,
-		Name:      resp.Vault.Name,
-		Slug:      resp.Vault.Slug,
-		CreatedBy: in.Actor,
-		IP:        in.IP,
-		UserAgent: in.UserAgent,
-	})
+	replica, err := s.provisionLocal(ctx, resp.Vault, mode, in)
 	if err != nil {
 		return domain.Vault{}, domain.Federation{}, fmt.Errorf("federation: provision replica vault: %w", err)
 	}
@@ -501,10 +613,13 @@ func (s *Service) Join(ctx context.Context, in JoinInput) (domain.Vault, domain.
 		Jurisdiction: jurisdiction,
 		Status:       "active",
 		CreatedAt:    s.now().UTC(),
+		Mode:         mode,
+		SeverPolicy:  policy,
 	})
 	if err != nil {
 		return domain.Vault{}, domain.Federation{}, err
 	}
+	s.invalidateVault(replica.ID)
 	s.feedFederationChanged(replica.ID)
 
 	// Kick the F2 relay so content starts flowing without a restart.
@@ -513,10 +628,41 @@ func (s *Service) Join(ctx context.Context, in JoinInput) (domain.Vault, domain.
 	}
 
 	s.recordAudit(ctx, &in.Actor, replica.ID, domain.ActionFederationAccept, in.IP, in.UserAgent, map[string]any{
-		"role":     "follower",
-		"peer_url": homeURL,
+		"role":         "follower",
+		"peer_url":     homeURL,
+		"mode":         mode,
+		"sever_policy": policy,
 	})
 	return replica, fed, nil
+}
+
+// provisionLocal creates the local vault for a link (same UUID, home's
+// slug). A mirror whose slug clashes takes "-m", "-m2", … (a local slug is
+// not part of the identity, §A3).
+func (s *Service) provisionLocal(ctx context.Context, v VaultInfo, mode string, in JoinInput) (domain.Vault, error) {
+	in2 := vaults.CreateInput{
+		ID: v.ID, Name: v.Name, Slug: v.Slug, CreatedBy: in.Actor, IP: in.IP, UserAgent: in.UserAgent,
+	}
+	created, err := s.creator.Create(ctx, in2)
+	if err == nil || mode != ModeMirror {
+		return created, err
+	}
+	var taken *vaults.SlugTakenError
+	for i := 1; i <= 20 && errors.As(err, &taken); i++ {
+		suffix := "-m"
+		if i > 1 {
+			suffix = fmt.Sprintf("-m%d", i)
+		}
+		base := v.Slug
+		if len(base)+len(suffix) > 63 {
+			base = strings.TrimRight(base[:63-len(suffix)], "-")
+		}
+		in2.Slug = base + suffix
+		if created, err = s.creator.Create(ctx, in2); err == nil {
+			return created, nil
+		}
+	}
+	return domain.Vault{}, err
 }
 
 // ---- federation links -----------------------------------------------------------
@@ -568,10 +714,9 @@ func (s *Service) RevokeFederation(ctx context.Context, vaultID, fedID, actor uu
 	s.feedFederationChanged(vaultID)
 	if f.Role == "follower" {
 		// Authorization falls back from home's control state to local
-		// membership once the follower link is gone.
-		if s.resolverCache != nil {
-			s.resolverCache.invalidate(vaultID)
-		}
+		// membership once the follower link is gone (a mirror stays
+		// clamped read-only).
+		s.invalidateVault(vaultID)
 		if s.feed != nil {
 			s.feed.VaultAccessChanged(vaultID)
 		}

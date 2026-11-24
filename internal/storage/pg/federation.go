@@ -52,19 +52,26 @@ func NewFederationStore(pool *pgxpool.Pool) *FederationStore {
 	return &FederationStore{pool: pool}
 }
 
-const federationCols = `id, vault_id, role, peer_url, peer_pubkey, jurisdiction, status, last_acked_seq, created_at, revoked_at`
+const federationCols = `id, vault_id, role, peer_url, peer_pubkey, jurisdiction, status, last_acked_seq, created_at, revoked_at,
+  mode, sever_policy, mirror_acked_seq, home_seq, last_contact_at, paused_at, resync_requested_at, promoted_at`
 
 func (s *FederationStore) Insert(ctx context.Context, f domain.Federation) (domain.Federation, error) {
 	const q = `
-INSERT INTO vault_federations (id, vault_id, role, peer_url, peer_pubkey, jurisdiction, status, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+INSERT INTO vault_federations (id, vault_id, role, peer_url, peer_pubkey, jurisdiction, status, created_at, mode, sever_policy)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 	if f.ID == uuid.Nil {
 		f.ID = uuid.New()
 	}
 	if f.CreatedAt.IsZero() {
 		f.CreatedAt = time.Now().UTC()
 	}
-	_, err := s.pool.Exec(ctx, q, f.ID, f.VaultID, f.Role, f.PeerURL, f.PeerPubKey, f.Jurisdiction, f.Status, f.CreatedAt)
+	if f.Mode == "" {
+		f.Mode = "replica"
+	}
+	if f.SeverPolicy == "" {
+		f.SeverPolicy = "keep"
+	}
+	_, err := s.pool.Exec(ctx, q, f.ID, f.VaultID, f.Role, f.PeerURL, f.PeerPubKey, f.Jurisdiction, f.Status, f.CreatedAt, f.Mode, f.SeverPolicy)
 	if err != nil {
 		return domain.Federation{}, fmt.Errorf("federation store: insert: %w", errMap(err))
 	}
@@ -143,10 +150,121 @@ func (s *FederationStore) UpdateStatus(ctx context.Context, id uuid.UUID, status
 
 func scanFederation(scan func(dest ...any) error) (domain.Federation, error) {
 	var f domain.Federation
-	if err := scan(&f.ID, &f.VaultID, &f.Role, &f.PeerURL, &f.PeerPubKey, &f.Jurisdiction, &f.Status, &f.LastAckedSeq, &f.CreatedAt, &f.RevokedAt); err != nil {
+	if err := scan(&f.ID, &f.VaultID, &f.Role, &f.PeerURL, &f.PeerPubKey, &f.Jurisdiction, &f.Status, &f.LastAckedSeq, &f.CreatedAt, &f.RevokedAt,
+		&f.Mode, &f.SeverPolicy, &f.MirrorAckedSeq, &f.HomeSeq, &f.LastContactAt, &f.PausedAt, &f.ResyncRequestedAt, &f.PromotedAt); err != nil {
 		return domain.Federation{}, err
 	}
 	return f, nil
+}
+
+// ---- mirrors (docs/SPEC-ESPELHO-SELADO.md part A) ------------------------------
+
+// RecordMirrorAck stores a mirror's acknowledged home seq (monotonic) and
+// stamps last contact (home side).
+func (s *FederationStore) RecordMirrorAck(ctx context.Context, vaultID uuid.UUID, peerURL string, seq int64) error {
+	_, err := s.pool.Exec(ctx, `
+UPDATE vault_federations
+   SET mirror_acked_seq = GREATEST(mirror_acked_seq, $3), last_contact_at = NOW()
+ WHERE vault_id = $1 AND peer_url = $2 AND role = 'home'`, vaultID, peerURL, seq)
+	if err != nil {
+		return fmt.Errorf("federation store: mirror ack: %w", errMap(err))
+	}
+	return nil
+}
+
+// RecordHomeSeq stores the home seq a mirror fully applied (mirror side).
+func (s *FederationStore) RecordHomeSeq(ctx context.Context, vaultID uuid.UUID, peerURL string, seq int64) error {
+	_, err := s.pool.Exec(ctx, `
+UPDATE vault_federations
+   SET home_seq = $3, last_contact_at = NOW()
+ WHERE vault_id = $1 AND peer_url = $2 AND role = 'follower'`, vaultID, peerURL, seq)
+	if err != nil {
+		return fmt.Errorf("federation store: home seq: %w", errMap(err))
+	}
+	return nil
+}
+
+// TouchContact stamps last_contact_at of a link.
+func (s *FederationStore) TouchContact(ctx context.Context, vaultID uuid.UUID, peerURL string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE vault_federations SET last_contact_at = NOW() WHERE vault_id = $1 AND peer_url = $2`, vaultID, peerURL)
+	if err != nil {
+		return fmt.Errorf("federation store: touch contact: %w", errMap(err))
+	}
+	return nil
+}
+
+// PendingDeletes counts the vault's tombstones a mirror has not
+// acknowledged (seq > afterSeq) and returns the oldest one's time.
+func (s *FederationStore) PendingDeletes(ctx context.Context, vaultID uuid.UUID, afterSeq int64) (int64, *time.Time, error) {
+	var n int64
+	var oldest *time.Time
+	err := s.pool.QueryRow(ctx, `
+SELECT count(*), min(deleted_at) FROM note_tombstones WHERE vault_id = $1 AND seq > $2`, vaultID, afterSeq).Scan(&n, &oldest)
+	if err != nil {
+		return 0, nil, fmt.Errorf("federation store: pending deletes: %w", errMap(err))
+	}
+	return n, oldest, nil
+}
+
+// VaultHead returns this server's seq for the vault (0 without a head row).
+func (s *FederationStore) VaultHead(ctx context.Context, vaultID uuid.UUID) (int64, error) {
+	var seq int64
+	err := s.pool.QueryRow(ctx, `SELECT COALESCE((SELECT seq FROM vault_heads WHERE vault_id = $1), 0)`, vaultID).Scan(&seq)
+	if err != nil {
+		return 0, fmt.Errorf("federation store: head: %w", errMap(err))
+	}
+	return seq, nil
+}
+
+// SetPaused pauses (or resumes) a link without revoking it.
+func (s *FederationStore) SetPaused(ctx context.Context, id uuid.UUID, paused bool) error {
+	tag, err := s.pool.Exec(ctx, `
+UPDATE vault_federations SET paused_at = CASE WHEN $2 THEN COALESCE(paused_at, NOW()) ELSE NULL END
+ WHERE id = $1`, id, paused)
+	if err != nil {
+		return fmt.Errorf("federation store: set paused: %w", errMap(err))
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("federation store: set paused: %w", domain.ErrNotFound)
+	}
+	return nil
+}
+
+// RequestResync forgets a mirror's progress and asks the running server
+// to redo a full pass.
+func (s *FederationStore) RequestResync(ctx context.Context, id uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx, `
+UPDATE vault_federations SET home_seq = 0, backfill_cursor = NULL, resync_requested_at = NOW()
+ WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("federation store: request resync: %w", errMap(err))
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("federation store: request resync: %w", domain.ErrNotFound)
+	}
+	return nil
+}
+
+// MarkPromoted severs a mirror's follower row and records the promotion.
+func (s *FederationStore) MarkPromoted(ctx context.Context, id uuid.UUID, at time.Time) error {
+	tag, err := s.pool.Exec(ctx, `
+UPDATE vault_federations
+   SET promoted_at = $2,
+       status = CASE WHEN status = 'active' THEN 'severed' ELSE status END,
+       revoked_at = COALESCE(revoked_at, $2)
+ WHERE id = $1 AND role = 'follower' AND mode = 'mirror' AND promoted_at IS NULL`, id, at)
+	if err != nil {
+		return fmt.Errorf("federation store: mark promoted: %w", errMap(err))
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("federation store: mark promoted: %w", domain.ErrNotFound)
+	}
+	return nil
+}
+
+// ListAll lists every link (the manager's reconcile sweep).
+func (s *FederationStore) ListAll(ctx context.Context) ([]domain.Federation, error) {
+	return s.list(ctx, `SELECT `+federationCols+` FROM vault_federations ORDER BY created_at ASC`)
 }
 
 // FederationInviteStore persists federation_invites rows.
@@ -158,13 +276,19 @@ func NewFederationInviteStore(pool *pgxpool.Pool) *FederationInviteStore {
 	return &FederationInviteStore{pool: pool}
 }
 
-const fedInviteCols = `token, vault_id, inviter_user_id, server_url_hint, expires_at, created_at, used_at, revoked_at`
+const fedInviteCols = `token, vault_id, inviter_user_id, server_url_hint, expires_at, created_at, used_at, revoked_at, mode, sever_policy`
 
 func (s *FederationInviteStore) Create(ctx context.Context, inv domain.FederationInvite) error {
 	const q = `
-INSERT INTO federation_invites (token, vault_id, inviter_user_id, server_url_hint, expires_at, created_at)
-VALUES ($1, $2, $3, $4, $5, $6)`
-	_, err := s.pool.Exec(ctx, q, inv.Token, inv.VaultID, inv.InviterUserID, inv.ServerURLHint, inv.ExpiresAt, inv.CreatedAt)
+INSERT INTO federation_invites (token, vault_id, inviter_user_id, server_url_hint, expires_at, created_at, mode, sever_policy)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+	if inv.Mode == "" {
+		inv.Mode = "replica"
+	}
+	if inv.SeverPolicy == "" {
+		inv.SeverPolicy = "keep"
+	}
+	_, err := s.pool.Exec(ctx, q, inv.Token, inv.VaultID, inv.InviterUserID, inv.ServerURLHint, inv.ExpiresAt, inv.CreatedAt, inv.Mode, inv.SeverPolicy)
 	if err != nil {
 		return fmt.Errorf("federation invite store: create: %w", errMap(err))
 	}
@@ -176,7 +300,7 @@ func (s *FederationInviteStore) Get(ctx context.Context, token string) (domain.F
 	var inv domain.FederationInvite
 	err := s.pool.QueryRow(ctx, q, token).Scan(
 		&inv.Token, &inv.VaultID, &inv.InviterUserID, &inv.ServerURLHint,
-		&inv.ExpiresAt, &inv.CreatedAt, &inv.UsedAt, &inv.RevokedAt,
+		&inv.ExpiresAt, &inv.CreatedAt, &inv.UsedAt, &inv.RevokedAt, &inv.Mode, &inv.SeverPolicy,
 	)
 	if err != nil {
 		if errors.Is(errMap(err), domain.ErrNotFound) {
@@ -225,7 +349,7 @@ func (s *FederationInviteStore) ListForVault(ctx context.Context, vaultID uuid.U
 		var inv domain.FederationInvite
 		if err := rows.Scan(
 			&inv.Token, &inv.VaultID, &inv.InviterUserID, &inv.ServerURLHint,
-			&inv.ExpiresAt, &inv.CreatedAt, &inv.UsedAt, &inv.RevokedAt,
+			&inv.ExpiresAt, &inv.CreatedAt, &inv.UsedAt, &inv.RevokedAt, &inv.Mode, &inv.SeverPolicy,
 		); err != nil {
 			return nil, fmt.Errorf("federation invite store: list scan: %w", err)
 		}

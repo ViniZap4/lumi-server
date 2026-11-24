@@ -65,6 +65,25 @@ type Role struct {
 	Name         string
 	Capabilities CapabilitySet
 	IsSeed       bool
+	// MirrorReadOnly marks a role clamped to read-only because the vault
+	// is a mirror on this server: denials answer "mirror_read_only".
+	MirrorReadOnly bool
+}
+
+// MirrorCapabilities is everything a role may keep on a mirror vault.
+var MirrorCapabilities = CapabilitySet{CapNoteRead, CapVaultExport}
+
+// ClampToMirror intersects the role with MirrorCapabilities.
+func (r Role) ClampToMirror() Role {
+	clamped := CapabilitySet{}
+	for _, c := range MirrorCapabilities {
+		if r.Capabilities.Has(c) {
+			clamped = append(clamped, c)
+		}
+	}
+	r.Capabilities = clamped
+	r.MirrorReadOnly = true
+	return r
 }
 
 // Member is a (user, vault, role) triple.
@@ -194,6 +213,11 @@ const (
 	// ActionFederationPeerDenied: home refused a write a follower relayed
 	// (the link's users lack the capability in home's control state).
 	ActionFederationPeerDenied = "federation.peer_denied"
+	// One-way mirrors (docs/SPEC-ESPELHO-SELADO.md part A).
+	ActionFederationMirrorViolation = "federation.mirror_violation" // home: a mirror sent content
+	ActionMirrorLocalWriteBlocked   = "mirror.local_write_blocked"  // mirror: a local write was refused
+	ActionMirrorPromote             = "mirror.promote"
+	ActionMirrorPurged              = "mirror.purged"
 )
 
 // Federation binds a vault to a peer server (v3 F1). On the home server the
@@ -210,6 +234,26 @@ type Federation struct {
 	LastAckedSeq int64  // home side: follower's confirmed control-state cursor
 	CreatedAt    time.Time
 	RevokedAt    *time.Time
+
+	// Mode is "replica" (bidirectional) or "mirror" (one-way, read-only
+	// copy). SeverPolicy is what a mirror does when home revokes it.
+	Mode        string
+	SeverPolicy string // "keep" | "purge"
+	// MirrorAckedSeq (home side): highest home vault seq the mirror
+	// acknowledged. HomeSeq (mirror side): highest home seq applied.
+	MirrorAckedSeq    int64
+	HomeSeq           int64
+	LastContactAt     *time.Time
+	PausedAt          *time.Time
+	ResyncRequestedAt *time.Time
+	PromotedAt        *time.Time
+}
+
+// IsMirrorFollower reports whether this row makes the local vault a
+// read-only mirror: a follower-side mirror link not promoted, whatever its
+// status (a revoked mirror stays a frozen read-only copy).
+func (f Federation) IsMirrorFollower() bool {
+	return f.Role == "follower" && f.Mode == "mirror" && f.PromotedAt == nil
 }
 
 // FederationInvite is a single-use token a vault admin hands to another
@@ -223,4 +267,8 @@ type FederationInvite struct {
 	CreatedAt     time.Time
 	UsedAt        *time.Time
 	RevokedAt     *time.Time
+	// Mode ("replica" | "mirror") and SeverPolicy ("keep" | "purge") are
+	// fixed by home at invite time.
+	Mode        string
+	SeverPolicy string
 }

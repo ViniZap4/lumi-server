@@ -48,9 +48,24 @@ func Require(c *fiber.Ctx, r Resolver, vaultID uuid.UUID, cap domain.Capability)
 		return err
 	}
 	if !role.Capabilities.Has(cap) {
+		if role.MirrorReadOnly {
+			return respondMirrorReadOnly(c, cap)
+		}
 		return respondForbidden(c, cap)
 	}
 	return nil
+}
+
+// respondMirrorReadOnly is the denial for a write to a vault this server
+// only mirrors (docs/SPEC-ESPELHO-SELADO.md §A6): clients show "somente
+// leitura" instead of a missing-permission message.
+func respondMirrorReadOnly(c *fiber.Ctx, cap domain.Capability) error {
+	body := fiber.Map{"error": "mirror_read_only"}
+	if cap != "" {
+		body["capability"] = string(cap)
+	}
+	_ = c.Status(fiber.StatusForbidden).JSON(body)
+	return domain.ErrForbidden
 }
 
 // RequireMembership checks only that the caller is a member. Used for

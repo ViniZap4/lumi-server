@@ -44,10 +44,17 @@ func (s *Service) SetFeedDeps(heads HeadReader, feds FederationLister, baseURL s
 // FederationInfo is the federation summary of one vault on this server.
 // Role is nil when the vault is not federated.
 type FederationInfo struct {
-	Role    *string `json:"role"`     // "home" | "follower" | null
+	// Role is "home", "follower" (a replica), "mirror" (a read-only
+	// mirror on this server, docs/SPEC-ESPELHO-SELADO.md §A2) or null.
+	Role    *string `json:"role"`
 	HomeURL *string `json:"home_url"` // origin server URL, null when unknown/not federated
 	Status  *string `json:"status"`   // "active" | "revoked" | "severed" | null
+	// Mode of this server's follower link: "replica" | "mirror" | null.
+	Mode *string `json:"mode"`
 }
+
+// IsMirror reports whether the vault is a read-only mirror here.
+func (f FederationInfo) IsMirror() bool { return f.Role != nil && *f.Role == "mirror" }
 
 // View is a vault as seen by one user.
 type View struct {
@@ -161,7 +168,15 @@ func deriveFederationInfo(rows []domain.Federation, baseURL string) FederationIn
 	}
 	switch {
 	case follower != nil:
-		return FederationInfo{Role: str("follower"), HomeURL: str(follower.PeerURL), Status: str(follower.Status)}
+		role, mode := "follower", "replica"
+		if follower.Mode == "mirror" {
+			mode = "mirror"
+			// A promoted mirror is an independent home now.
+			if follower.PromotedAt == nil {
+				role = "mirror"
+			}
+		}
+		return FederationInfo{Role: str(role), HomeURL: str(follower.PeerURL), Status: str(follower.Status), Mode: str(mode)}
 	case homeStatus != "":
 		info := FederationInfo{Role: str("home"), Status: str(homeStatus)}
 		if baseURL != "" {

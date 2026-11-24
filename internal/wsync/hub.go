@@ -235,6 +235,27 @@ type Hub struct {
 
 	// bumps coalesces content-change notifications per note (feed seq).
 	bumps *coalescer
+
+	// writeGuard vetoes a mutation before it touches the doc (mirror
+	// vaults accept only federation origins). nil allows everything.
+	writeGuard WriteGuard
+}
+
+// WriteGuard decides whether a mutation with the given origin may change a
+// note of vaultID. A non-nil error refuses it; nothing is applied.
+type WriteGuard func(vaultID uuid.UUID, origin string) error
+
+// WithWriteGuard installs a WriteGuard at construction.
+func WithWriteGuard(g WriteGuard) HubOption {
+	return func(h *Hub) { h.writeGuard = g }
+}
+
+// guard runs the write guard (nil-safe).
+func (h *Hub) guard(vaultID uuid.UUID, origin string) error {
+	if h.writeGuard == nil {
+		return nil
+	}
+	return h.writeGuard(vaultID, origin)
 }
 
 // HubOption configures Hub at construction.
@@ -643,6 +664,9 @@ func (r *Room) ApplyAndBroadcastFederation(update []byte, originKind string) err
 }
 
 func (r *Room) applyUpdate(update []byte, origin *Subscriber, opts ApplyOptions) (ApplyResult, error) {
+	if err := r.hub.guard(r.vaultID, opts.Origin); err != nil {
+		return ApplyResult{}, err
+	}
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
 	if r.evicted.Load() {
@@ -659,6 +683,9 @@ func (r *Room) applyUpdate(update []byte, origin *Subscriber, opts ApplyOptions)
 }
 
 func (r *Room) applyText(newText string, expectSV []byte, opts ApplyOptions) (ApplyResult, error) {
+	if err := r.hub.guard(r.vaultID, opts.Origin); err != nil {
+		return ApplyResult{}, err
+	}
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
 	if r.evicted.Load() {

@@ -195,6 +195,9 @@ func (h *Handler) authorizeUser(ctx context.Context, uid, vaultID uuid.UUID, not
 		return &rejection{websocket.CloseInternalServerErr, "authz_unavailable"}
 	}
 	if !role.Capabilities.Has(domain.CapNoteEdit) {
+		if role.MirrorReadOnly {
+			return &rejection{CloseForbidden, "mirror_read_only"}
+		}
 		return &rejection{CloseForbidden, "capability_missing"}
 	}
 	if h.noteExists != nil {
@@ -370,6 +373,9 @@ func (h *Handler) issueTicket(c *fiber.Ctx) error {
 	if rej := h.authorizeUser(c.UserContext(), user.ID, vaultID, noteID); rej != nil {
 		switch rej.code {
 		case CloseForbidden:
+			if rej.reason == "mirror_read_only" {
+				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "mirror_read_only"})
+			}
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
 		case CloseNotFound:
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not_found"})

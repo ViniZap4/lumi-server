@@ -364,7 +364,15 @@ func newRelaySide(t *testing.T) *relaySide {
 		Notes:    side.notes,
 		Mirror:   side.mirror.fn,
 		Delete: func(_ context.Context, vaultID uuid.UUID, noteID string) error {
-			return side.notes.delete(vaultID, noteID)
+			if err := side.notes.delete(vaultID, noteID); err != nil {
+				return err
+			}
+			// Like the pg cascade: the CRDT history ends with the row.
+			side.repo.mu.Lock()
+			delete(side.repo.snaps, snKey(vaultID, noteID))
+			delete(side.repo.updates, snKey(vaultID, noteID))
+			side.repo.mu.Unlock()
+			return nil
 		},
 		Move: func(ctx context.Context, vaultID uuid.UUID, noteID, newPath, newTitle string) error {
 			n, err := side.notes.Get(ctx, vaultID, noteID)

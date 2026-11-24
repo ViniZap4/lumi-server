@@ -61,6 +61,11 @@ func (s *Service) TransferOwnership(ctx context.Context, vaultID, newOwner, acto
 	if v.OwnerUserID != actor {
 		return domain.Vault{}, fmt.Errorf("%w: only the owner can transfer ownership", domain.ErrForbidden)
 	}
+	// On a mirror the local owner is only the operator who joined it;
+	// ownership belongs to home (§A6.5).
+	if role, err := s.resolver.RoleForUser(ctx, vaultID, actor); err == nil && role.MirrorReadOnly {
+		return domain.Vault{}, domain.ErrMirrorReadOnly
+	}
 	if newOwner == v.OwnerUserID {
 		return v, nil
 	}

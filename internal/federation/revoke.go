@@ -202,9 +202,7 @@ func (s *Service) ApplyRevokeNotice(ctx context.Context, n RevokeNotice) error {
 	if s.relay != nil {
 		s.relay.StopLink(n.VaultID, homeURL)
 	}
-	if s.resolverCache != nil {
-		s.resolverCache.invalidate(n.VaultID)
-	}
+	s.invalidateVault(n.VaultID)
 	s.feedFederationChanged(n.VaultID)
 	if s.feed != nil {
 		s.feed.VaultAccessChanged(n.VaultID)
@@ -214,5 +212,8 @@ func (s *Service) ApplyRevokeNotice(ctx context.Context, n RevokeNotice) error {
 		"peer_url":   homeURL,
 		"revoked_at": n.RevokedAt,
 	})
+	// A mirror keeps a frozen read-only copy or deletes it, as agreed at
+	// invite time (§A11).
+	s.applySeverPolicy(*target)
 	return nil
 }

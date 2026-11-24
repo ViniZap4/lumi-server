@@ -16,6 +16,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
+
+	"github.com/ViniZap4/lumi-server/internal/domain"
 )
 
 // Reconnect policy for follower dial loops: exponential backoff with ±20%
@@ -62,9 +64,66 @@ func (m *Manager) Start(ctx context.Context) error {
 		return err
 	}
 	for _, row := range rows {
+		if row.PausedAt != nil {
+			continue
+		}
 		m.StartLink(ctx, row.VaultID, row.PeerURL)
 	}
+	if lister, ok := m.svc.federations.(allLinkLister); ok {
+		go m.reconcileLoop(ctx, lister)
+	}
 	return nil
+}
+
+// allLinkLister lists every link (pg.FederationStore.ListAll).
+type allLinkLister interface {
+	ListAll(ctx context.Context) ([]domain.Federation, error)
+}
+
+// reconcileInterval is how often the manager converges on link rows
+// changed by another process (the CLI's pause/resume/resync/promote).
+const reconcileInterval = 15 * time.Second
+
+// reconcileLoop applies operator changes made outside this process: a
+// paused link stops (follower loop or home session), a resumed follower
+// link restarts, a newer resync request bounces the link, a promoted or
+// inactive mirror stops.
+func (m *Manager) reconcileLoop(ctx context.Context, lister allLinkLister) {
+	t := time.NewTicker(reconcileInterval)
+	defer t.Stop()
+	seenResync := map[uuid.UUID]time.Time{}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		rows, err := lister.ListAll(ctx)
+		if err != nil {
+			continue
+		}
+		for _, r := range rows {
+			if r.ResyncRequestedAt != nil {
+				prev, seen := seenResync[r.ID]
+				seenResync[r.ID] = *r.ResyncRequestedAt
+				if seen && r.ResyncRequestedAt.After(prev) && r.Role == "follower" && r.Status == "active" && r.PausedAt == nil {
+					m.StopLink(r.VaultID, r.PeerURL)
+					m.StartLink(ctx, r.VaultID, r.PeerURL)
+					continue
+				}
+			}
+			switch {
+			case r.Status != "active" || r.PausedAt != nil || r.PromotedAt != nil:
+				if r.Role == "follower" {
+					m.StopLink(r.VaultID, r.PeerURL)
+				} else if r.PausedAt != nil || r.Status != "active" {
+					m.links.ClosePeer(r.VaultID, r.PeerURL)
+				}
+			case r.Role == "follower":
+				m.StartLink(ctx, r.VaultID, r.PeerURL) // idempotent
+			}
+		}
+	}
 }
 
 // StartLink launches (or restarts) the dial loop for one follower link.
@@ -140,14 +199,15 @@ func (m *Manager) connectOnce(ctx context.Context, vaultID uuid.UUID, homeURL st
 	if err != nil {
 		return err
 	}
-	active := false
-	for _, r := range rows {
-		if r.Role == "follower" && r.PeerURL == homeURL && r.Status == "active" {
-			active = true
+	var link *domain.Federation
+	for i := range rows {
+		r := &rows[i]
+		if r.Role == "follower" && r.PeerURL == homeURL && r.Status == "active" && r.PausedAt == nil && r.PromotedAt == nil {
+			link = r
 			break
 		}
 	}
-	if !active {
+	if link == nil {
 		return errLinkInactive
 	}
 
@@ -178,7 +238,7 @@ func (m *Manager) connectOnce(ctx context.Context, vaultID uuid.UUID, homeURL st
 		return fmt.Errorf("dial: %w", err)
 	}
 	m.log.Info().Str("home", homeURL).Str("vault", vaultID.String()).Msg("federation: relay link up")
-	sess := m.links.NewSession(ctx, conn, vaultID, homeURL, "follower")
+	sess := m.links.NewSessionWith(ctx, conn, vaultID, homeURL, "follower", SessionOptions{Mode: link.Mode})
 	return sess.Run()
 }
 
