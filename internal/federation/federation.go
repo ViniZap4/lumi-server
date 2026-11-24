@@ -583,6 +583,13 @@ func (s *Service) RevokeFederation(ctx context.Context, vaultID, fedID, actor uu
 	return nil
 }
 
+// RecordRelayAudit is the relay's audit sink (RelayDeps.Audit).
+func (s *Service) RecordRelayAudit(ctx context.Context, vaultID uuid.UUID, action string, payload map[string]any) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	s.recordAudit(ctx, nil, vaultID, action, "", "", payload)
+}
+
 // ---- helpers ---------------------------------------------------------------------
 
 func newToken() string {

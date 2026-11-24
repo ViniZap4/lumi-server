@@ -573,3 +573,51 @@ func (r *ControlResolver) load(ctx context.Context, svc *Service, vaultID uuid.U
 	}
 	return entry
 }
+
+// ---- home side: per-link capability ceiling (G3) ---------------------------------------------
+
+// PeerCeiling returns the capabilities home's control document grants to
+// the users of one peer server: the union of the roles of every member
+// whose key is "<username>@<peerURL>". A follower relays its users' writes
+// without per-user attribution, so this union is the most any frame from
+// that link may do. A peer with no member in the document gets nothing.
+func PeerCeiling(stateJSON []byte, peerURL string) domain.CapabilitySet {
+	var doc ControlState
+	if err := json.Unmarshal(stateJSON, &doc); err != nil {
+		return nil
+	}
+	return doc.peerCeiling(peerURL)
+}
+
+func (doc *ControlState) peerCeiling(peerURL string) domain.CapabilitySet {
+	peer := normalizeServerURL(peerURL)
+	if peer == "" {
+		return nil
+	}
+	roles := make(map[string][]string, len(doc.Roles))
+	for _, r := range doc.Roles {
+		roles[r.Name] = r.Capabilities
+	}
+	var out domain.CapabilitySet
+	for _, m := range doc.Members {
+		at := strings.Index(m.Key, "@")
+		if at <= 0 || normalizeServerURL(m.Key[at+1:]) != peer {
+			continue
+		}
+		for _, c := range roles[m.Role] {
+			out = append(out, domain.Capability(c))
+		}
+	}
+	return out
+}
+
+// PeerCapabilities is the home-side ceiling for a link, read from the
+// current signed control document. No document (control plane off, or not
+// built yet) means no capability: fail closed.
+func (s *Service) PeerCapabilities(ctx context.Context, vaultID uuid.UUID, peerURL string) domain.CapabilitySet {
+	state, _, ok := s.CurrentControlState(ctx, vaultID)
+	if !ok {
+		return nil
+	}
+	return PeerCeiling(state, peerURL)
+}

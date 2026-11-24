@@ -313,6 +313,27 @@ type relaySide struct {
 	notes    *memNoteRepo
 	mirror   *mirrorCapture
 	links    *Links
+
+	capsMu sync.Mutex
+	caps   domain.CapabilitySet // nil = everything (home-side ceiling)
+	audits []auditRec
+}
+
+type auditRec struct {
+	action  string
+	payload map[string]any
+}
+
+func (rs *relaySide) setCaps(c domain.CapabilitySet) {
+	rs.capsMu.Lock()
+	rs.caps = c
+	rs.capsMu.Unlock()
+}
+
+func (rs *relaySide) auditActions() []auditRec {
+	rs.capsMu.Lock()
+	defer rs.capsMu.Unlock()
+	return append([]auditRec(nil), rs.audits...)
 }
 
 func newRelaySide(t *testing.T) *relaySide {
@@ -340,6 +361,21 @@ func newRelaySide(t *testing.T) *relaySide {
 			return side.notes.Upsert(ctx, n)
 		},
 		Log: zerolog.Nop(),
+		// Tests of the sync machinery grant follower links everything;
+		// G3 tests narrow it through side.caps.
+		PeerCaps: func(context.Context, uuid.UUID, string) domain.CapabilitySet {
+			side.capsMu.Lock()
+			defer side.capsMu.Unlock()
+			if side.caps == nil {
+				return domain.CapabilitySet{domain.CapAll}
+			}
+			return side.caps
+		},
+		Audit: func(_ context.Context, _ uuid.UUID, action string, payload map[string]any) {
+			side.capsMu.Lock()
+			defer side.capsMu.Unlock()
+			side.audits = append(side.audits, auditRec{action, payload})
+		},
 	})
 	side.registry.SetOnPersist(side.links.OnPersist)
 	return side

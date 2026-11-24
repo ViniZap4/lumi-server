@@ -191,6 +191,9 @@ const (
 	ActionFederationInvite   = "federation.invite"
 	ActionFederationAccept   = "federation.accept"
 	ActionFederationRevoke   = "federation.revoke"
+	// ActionFederationPeerDenied: home refused a write a follower relayed
+	// (the link's users lack the capability in home's control state).
+	ActionFederationPeerDenied = "federation.peer_denied"
 )
 
 // Federation binds a vault to a peer server (v3 F1). On the home server the

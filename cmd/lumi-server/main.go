@@ -586,6 +586,10 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		ControlCurrent: federationSvc.CurrentControlState,
 		ControlApply:   federationSvc.ApplyControlState,
 		ControlAcked:   federationSvc.RecordControlAck,
+		// G3: home authorizes every write a follower relays against
+		// what its control state grants that server's users.
+		PeerCaps: federationSvc.PeerCapabilities,
+		Audit:    federationSvc.RecordRelayAudit,
 	})
 	crdtRegistry.SetOnPersist(relayLinks.OnPersist)
 	notesSvc.SetFederationNotifier(relayLinks)

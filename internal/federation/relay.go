@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -99,7 +100,22 @@ type RelayDeps struct {
 	ControlCurrent ControlCurrentFunc
 	ControlApply   ControlApplyFunc
 	ControlAcked   ControlAckedFunc
+
+	// PeerCaps is the home-side capability ceiling of a follower link
+	// (G3): what home's control state grants that server's users.
+	// Implemented by Service.PeerCapabilities. nil denies every write a
+	// follower relays (fail closed).
+	PeerCaps PeerCapsFunc
+	// Audit records relay security events (denied follower writes,
+	// mirror violations). nil-safe.
+	Audit RelayAuditFunc
 }
+
+// PeerCapsFunc returns the capability ceiling of the link to peerURL.
+type PeerCapsFunc func(ctx context.Context, vaultID uuid.UUID, peerURL string) domain.CapabilitySet
+
+// RelayAuditFunc records a relay audit event. Must not block for long.
+type RelayAuditFunc func(ctx context.Context, vaultID uuid.UUID, action string, payload map[string]any)
 
 // ---- Links: the live-session registry -------------------------------------------
 
@@ -233,6 +249,10 @@ func (l *Links) PushControl(vaultID uuid.UUID, state, sig []byte) {
 	frame := EncodeControlState(state, sig)
 	for _, s := range l.sessionsFor(vaultID) {
 		if s.role == "home" {
+			// The new document may grant or take away capabilities of
+			// the link's users: refresh the ceiling before anything else
+			// arrives on it.
+			s.setCaps(PeerCeiling(state, s.peerURL))
 			s.send(frame)
 		}
 	}
@@ -277,6 +297,17 @@ type Session struct {
 	// step1Sent dedupes proactive Step1s per note per connection.
 	step1Mu   sync.Mutex
 	step1Sent map[string]bool
+
+	// Home side (G3): the link's capability ceiling, refreshed on every
+	// control-state push. nil until loaded = no capability.
+	caps atomic.Pointer[domain.CapabilitySet]
+	// guardMu guards the per-connection authorization bookkeeping.
+	guardMu sync.Mutex
+	// denied dedupes "peer_denied" audit entries per (frame kind, note).
+	denied map[string]bool
+	// createdHere lists notes this link created (announce with
+	// note.create): their first content may land without note.edit.
+	createdHere map[string]bool
 }
 
 // NewSession builds a relay session; call Run to drive it.
@@ -290,16 +321,18 @@ func (l *Links) NewSession(ctx context.Context, conn wsConn, vaultID uuid.UUID, 
 		rl.SetReadLimit(maxRelayMessageBytes)
 	}
 	return &Session{
-		conn:      conn,
-		vaultID:   vaultID,
-		peerURL:   peerURL,
-		role:      role,
-		links:     l,
-		deps:      l.deps,
-		ctx:       ctx,
-		sendCh:    make(chan []byte, sendBuffer),
-		done:      make(chan struct{}),
-		step1Sent: map[string]bool{},
+		conn:        conn,
+		vaultID:     vaultID,
+		peerURL:     peerURL,
+		role:        role,
+		links:       l,
+		deps:        l.deps,
+		ctx:         ctx,
+		sendCh:      make(chan []byte, sendBuffer),
+		done:        make(chan struct{}),
+		step1Sent:   map[string]bool{},
+		denied:      map[string]bool{},
+		createdHere: map[string]bool{},
 	}
 }
 
@@ -340,6 +373,7 @@ func (s *Session) Run() error {
 	}()
 
 	if s.role == "home" {
+		s.loadCaps()
 		if err := s.sendOpening(); err != nil {
 			return err
 		}
@@ -422,6 +456,12 @@ func (s *Session) readLoop() error {
 func (s *Session) handleFrame(f Frame) error {
 	switch f.Type {
 	case frameManifest:
+		// Only home sends a manifest. A follower that sends one would
+		// otherwise make home create every listed note (G3).
+		if s.role != "follower" {
+			s.deny(f, "", "manifest_from_follower")
+			return nil
+		}
 		// Follower side: make sure every home note exists locally, then
 		// Step1 each so home sends us what we lack. Then advertise the
 		// notes home doesn't know about.
@@ -448,6 +488,17 @@ func (s *Session) handleFrame(f Frame) error {
 		return nil
 
 	case frameNoteAnnounce:
+		if s.role == "home" {
+			if _, err := s.deps.Notes.Get(s.ctx, s.vaultID, f.Note.ID); err != nil {
+				if !errors.Is(err, domain.ErrNotFound) {
+					return err
+				}
+				if !s.authorize(domain.CapNoteCreate, f, f.Note.ID) {
+					return nil
+				}
+				s.markCreatedHere(f.Note.ID)
+			}
+		}
 		if err := s.ensureNote(f.Note); err != nil {
 			return err
 		}
@@ -457,6 +508,9 @@ func (s *Session) handleFrame(f Frame) error {
 	case frameNoteDelete:
 		if err := validateNoteID(f.NoteID); err != nil {
 			return err
+		}
+		if s.role == "home" && !s.authorize(domain.CapNoteDelete, f, f.NoteID) {
+			return nil
 		}
 		if s.deps.Delete == nil {
 			return nil
@@ -477,6 +531,24 @@ func (s *Session) handleFrame(f Frame) error {
 		}
 		if err := validateRelPath(f.Note.Path); err != nil {
 			return err
+		}
+		if s.role == "home" {
+			cur, err := s.deps.Notes.Get(s.ctx, s.vaultID, f.Note.ID)
+			if err != nil {
+				if errors.Is(err, domain.ErrNotFound) {
+					return nil
+				}
+				return err
+			}
+			// A path change is a move; a title-only change is an edit
+			// (the REST surface draws the same line).
+			need := domain.CapNoteEdit
+			if cur.Path != f.Note.Path {
+				need = domain.CapNoteMove
+			}
+			if !s.authorize(need, f, f.Note.ID) {
+				return nil
+			}
 		}
 		if s.deps.Move == nil {
 			return nil
@@ -525,12 +597,142 @@ func (s *Session) handleFrame(f Frame) error {
 		case wsync.SyncStep1:
 			return s.handleStep1(f.NoteID, msg.Body)
 		case wsync.SyncStep2, wsync.SyncUpdate:
+			if s.role == "home" && !s.authorizeContent(f, msg.Body) {
+				return nil
+			}
 			return s.applyRemote(f.NoteID, msg.Body)
 		}
 		return nil
 
 	default:
 		return nil
+	}
+}
+
+// ---- home-side authorization of follower frames (G3) ----------------------------
+
+// loadCaps reads the link's ceiling from home's control state.
+func (s *Session) loadCaps() {
+	var caps domain.CapabilitySet
+	if s.deps.PeerCaps != nil {
+		caps = s.deps.PeerCaps(s.ctx, s.vaultID, s.peerURL)
+	}
+	s.setCaps(caps)
+}
+
+func (s *Session) setCaps(caps domain.CapabilitySet) {
+	if caps == nil {
+		caps = domain.CapabilitySet{}
+	}
+	s.caps.Store(&caps)
+}
+
+func (s *Session) peerHas(c domain.Capability) bool {
+	caps := s.caps.Load()
+	return caps != nil && caps.Has(c)
+}
+
+func (s *Session) markCreatedHere(noteID string) {
+	s.guardMu.Lock()
+	s.createdHere[noteID] = true
+	s.guardMu.Unlock()
+}
+
+func (s *Session) wasCreatedHere(noteID string) bool {
+	s.guardMu.Lock()
+	defer s.guardMu.Unlock()
+	return s.createdHere[noteID]
+}
+
+// authorize reports whether the follower link may do what f asks on home.
+// A refusal drops the frame (the link stays up: an offline edit made
+// before a role change would otherwise make the link flap forever) and is
+// audited once per (frame kind, note) per connection.
+func (s *Session) authorize(c domain.Capability, f Frame, noteID string) bool {
+	if s.peerHas(c) {
+		return true
+	}
+	s.deny(f, noteID, "capability_missing:"+string(c))
+	return false
+}
+
+// authorizeContent gates a Step2/Update from a follower: note.edit, or
+// note.create for the first content of a note this link just created. A
+// no-op update (the [0,0] Step2 of an up-to-date peer, or data home
+// already holds) passes silently: it changes nothing.
+func (s *Session) authorizeContent(f Frame, update []byte) bool {
+	if s.peerHas(domain.CapNoteEdit) {
+		return true
+	}
+	if s.wasCreatedHere(f.NoteID) && s.peerHas(domain.CapNoteCreate) {
+		return true
+	}
+	if s.isNoop(f.NoteID, update) {
+		return false
+	}
+	s.deny(f, f.NoteID, "capability_missing:"+string(domain.CapNoteEdit))
+	return false
+}
+
+// isNoop reports whether update would change nothing in the note's
+// current state. Evaluated on a throwaway copy, never on the live doc.
+func (s *Session) isNoop(noteID string, update []byte) bool {
+	if len(update) == 0 || (len(update) == 2 && update[0] == 0 && update[1] == 0) {
+		return true
+	}
+	state, err := s.withDoc(noteID, func(doc *crdt.Doc) ([]byte, error) {
+		return doc.EncodeStateAsUpdate()
+	})
+	if err != nil {
+		return false
+	}
+	probe, err := crdt.LoadDoc(state)
+	if err != nil {
+		return false
+	}
+	defer probe.Close()
+	changed, err := probe.ApplyUpdateChanged(update)
+	return err == nil && !changed
+}
+
+func frameKind(t uint64) string {
+	switch t {
+	case frameManifest:
+		return "manifest"
+	case frameNoteSync:
+		return "note_sync"
+	case frameNoteAnnounce:
+		return "announce"
+	case frameNoteDelete:
+		return "delete"
+	case frameNoteMove:
+		return "move"
+	default:
+		return fmt.Sprintf("frame_%d", t)
+	}
+}
+
+// deny logs and audits (deduplicated) a refused follower frame.
+func (s *Session) deny(f Frame, noteID, reason string) {
+	kind := frameKind(f.Type)
+	key := kind + "|" + noteID + "|" + reason
+	s.guardMu.Lock()
+	first := !s.denied[key]
+	s.denied[key] = true
+	s.guardMu.Unlock()
+	if !first {
+		return
+	}
+	s.deps.Log.Warn().Str("peer", s.peerURL).Str("vault", s.vaultID.String()).
+		Str("frame", kind).Str("note", noteID).Str("reason", reason).
+		Msg("federation: follower frame denied")
+	if s.deps.Audit != nil {
+		s.deps.Audit(s.ctx, s.vaultID, domain.ActionFederationPeerDenied, map[string]any{
+			"peer_url": s.peerURL,
+			"frame":    kind,
+			"note_id":  noteID,
+			"reason":   reason,
+		})
 	}
 }
 
@@ -555,6 +757,14 @@ func (s *Session) sendStep1(noteID string) {
 
 // handleStep1 answers the peer's state vector with the diff they lack.
 func (s *Session) handleStep1(noteID string, sv []byte) error {
+	// Never answer for a note this side does not hold: loading it would
+	// hand out an empty (or lazily seeded) doc for an id the peer made up.
+	if _, err := s.deps.Notes.Get(s.ctx, s.vaultID, noteID); err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
 	diff, err := s.withDoc(noteID, func(doc *crdt.Doc) ([]byte, error) {
 		return doc.EncodeDiffSince(sv)
 	})
