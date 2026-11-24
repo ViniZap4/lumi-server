@@ -109,7 +109,15 @@ type RelayDeps struct {
 	// Audit records relay security events (denied follower writes,
 	// mirror violations). nil-safe.
 	Audit RelayAuditFunc
+	// Tombstone reports the latest tombstone of a note id and the epoch
+	// of the history it ended (G2). nil disables tombstone-aware
+	// reconciliation.
+	Tombstone TombstoneFunc
 }
+
+// TombstoneFunc returns the epoch of the latest tombstone of noteID ("" when
+// it predates epoch tracking) and whether one exists.
+type TombstoneFunc func(ctx context.Context, vaultID uuid.UUID, noteID string) (epoch string, found bool, err error)
 
 // PeerCapsFunc returns the capability ceiling of the link to peerURL.
 type PeerCapsFunc func(ctx context.Context, vaultID uuid.UUID, peerURL string) domain.CapabilitySet
@@ -468,6 +476,12 @@ func (s *Session) handleFrame(f Frame) error {
 		known := map[string]bool{}
 		for _, m := range f.Manifest {
 			known[m.ID] = true
+			if s.deletedOffline(m) {
+				// G2: deleted here while the link was down. Tell home
+				// (it authorizes, G3) instead of recreating it locally.
+				s.send(EncodeNoteDelete(m.ID))
+				continue
+			}
 			if err := s.ensureNote(m); err != nil {
 				s.deps.Log.Warn().Err(err).Str("note", m.ID).Msg("federation: manifest ensure")
 				continue
@@ -493,6 +507,15 @@ func (s *Session) handleFrame(f Frame) error {
 				if !errors.Is(err, domain.ErrNotFound) {
 					return err
 				}
+				// G2: a follower that was offline while home deleted the
+				// note re-announces it. Same history as the one home
+				// ended: answer with the delete instead of recreating it.
+				if s.deletedHere(f.Note) {
+					s.deps.Log.Info().Str("peer", s.peerURL).Str("note", f.Note.ID).
+						Msg("federation: refused to resurrect a deleted note")
+					s.send(EncodeNoteDelete(f.Note.ID))
+					return nil
+				}
 				if !s.authorize(domain.CapNoteCreate, f, f.Note.ID) {
 					return nil
 				}
@@ -510,6 +533,8 @@ func (s *Session) handleFrame(f Frame) error {
 			return err
 		}
 		if s.role == "home" && !s.authorize(domain.CapNoteDelete, f, f.NoteID) {
+			// Home is authoritative: give the peer its copy back.
+			s.reannounce(f.NoteID)
 			return nil
 		}
 		if s.deps.Delete == nil {
@@ -547,6 +572,7 @@ func (s *Session) handleFrame(f Frame) error {
 				need = domain.CapNoteMove
 			}
 			if !s.authorize(need, f, f.Note.ID) {
+				s.send(EncodeNoteMove(NoteMeta{ID: cur.ID, Path: cur.Path, Title: cur.Title}))
 				return nil
 			}
 		}
@@ -607,6 +633,64 @@ func (s *Session) handleFrame(f Frame) error {
 	default:
 		return nil
 	}
+}
+
+// ---- tombstone-aware reconciliation (G2) ------------------------------------------
+
+// lastTombstone wraps deps.Tombstone (nil-safe, errors = no tombstone).
+func (s *Session) lastTombstone(noteID string) (string, bool) {
+	if s.deps.Tombstone == nil {
+		return "", false
+	}
+	epoch, found, err := s.deps.Tombstone(s.ctx, s.vaultID, noteID)
+	if err != nil {
+		s.deps.Log.Warn().Err(err).Str("note", noteID).Msg("federation: tombstone lookup")
+		return "", false
+	}
+	return epoch, found
+}
+
+// deletedHere (home side) reports whether an announced note is one this
+// server deleted: a tombstone of the same history. A tombstone or an
+// announce without an epoch (written before epochs were tracked) counts
+// as the same history: refusing a resurrection beats losing an erasure.
+func (s *Session) deletedHere(m NoteMeta) bool {
+	epoch, found := s.lastTombstone(m.ID)
+	if !found {
+		return false
+	}
+	return epoch == "" || m.Epoch == "" || epoch == m.Epoch
+}
+
+// deletedOffline (follower side) reports whether a note home still lists
+// was deleted here, in the very history home holds. Only an exact epoch
+// match counts: home may have recreated the id since.
+func (s *Session) deletedOffline(m NoteMeta) bool {
+	if s.role != "follower" || m.Epoch == "" {
+		return false
+	}
+	if _, err := s.deps.Notes.Get(s.ctx, s.vaultID, m.ID); err == nil {
+		return false
+	}
+	epoch, found := s.lastTombstone(m.ID)
+	return found && epoch == m.Epoch
+}
+
+// reannounce sends the peer home's copy of a note (metadata + full state)
+// after refusing its delete.
+func (s *Session) reannounce(noteID string) {
+	n, err := s.deps.Notes.Get(s.ctx, s.vaultID, noteID)
+	if err != nil {
+		return
+	}
+	state, err := s.withDoc(noteID, func(doc *crdt.Doc) ([]byte, error) {
+		return doc.EncodeStateAsUpdate()
+	})
+	if err != nil {
+		return
+	}
+	s.send(EncodeNoteAnnounce(NoteMeta{ID: n.ID, Path: n.Path, Title: n.Title, Epoch: n.CRDTEpoch}))
+	s.send(EncodeNoteSync(noteID, wsync.EncodeSyncUpdate(state)))
 }
 
 // ---- home-side authorization of follower frames (G3) ----------------------------

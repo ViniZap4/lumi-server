@@ -151,22 +151,43 @@ func (s *NoteStore) Delete(ctx context.Context, vaultID uuid.UUID, id string) (i
 		if seq, err = bumpHead(ctx, tx, vaultID); err != nil {
 			return err
 		}
-		tag, err := tx.Exec(ctx, `DELETE FROM notes WHERE vault_id = $1 AND id = $2`, vaultID, id)
+		// The tombstone keeps the epoch of the history it ends (G2).
+		var epoch string
+		err = tx.QueryRow(ctx,
+			`DELETE FROM notes WHERE vault_id = $1 AND id = $2 RETURNING crdt_epoch`, vaultID, id).Scan(&epoch)
 		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrNotFound
+			}
 			return err
 		}
-		if tag.RowsAffected() == 0 {
-			return domain.ErrNotFound
-		}
 		_, err = tx.Exec(ctx,
-			`INSERT INTO note_tombstones (vault_id, note_id, seq) VALUES ($1, $2, $3)`,
-			vaultID, id, seq)
+			`INSERT INTO note_tombstones (vault_id, note_id, seq, crdt_epoch) VALUES ($1, $2, $3, $4)`,
+			vaultID, id, seq, epoch)
 		return err
 	})
 	if err != nil {
 		return 0, fmt.Errorf("note store: delete: %w", errMap(err))
 	}
 	return seq, nil
+}
+
+// LastTombstone reports the most recent tombstone of a note id: the epoch
+// of the CRDT history it ended ("" for tombstones older than migration
+// 0010) and whether one exists at all (pruned ones are gone).
+func (s *NoteStore) LastTombstone(ctx context.Context, vaultID uuid.UUID, id string) (string, bool, error) {
+	var epoch string
+	err := s.pool.QueryRow(ctx, `
+SELECT COALESCE(crdt_epoch, '') FROM note_tombstones
+ WHERE vault_id = $1 AND note_id = $2
+ ORDER BY seq DESC LIMIT 1`, vaultID, id).Scan(&epoch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("note store: last tombstone: %w", errMap(err))
+	}
+	return epoch, true, nil
 }
 
 // Heads returns the current seq for each vault (0 when a vault has no

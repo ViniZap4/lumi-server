@@ -231,11 +231,21 @@ func (m *memSnapRepo) HighestUpdateID(_ context.Context, vaultID uuid.UUID, note
 // ---- note repo + mirror fakes ---------------------------------------------------------
 
 type memNoteRepo struct {
-	mu   sync.Mutex
-	rows map[string]domain.Note
+	mu    sync.Mutex
+	rows  map[string]domain.Note
+	tombs map[string]string // key -> epoch of the latest tombstone
 }
 
-func newMemNoteRepo() *memNoteRepo { return &memNoteRepo{rows: map[string]domain.Note{}} }
+func newMemNoteRepo() *memNoteRepo {
+	return &memNoteRepo{rows: map[string]domain.Note{}, tombs: map[string]string{}}
+}
+
+func (m *memNoteRepo) lastTombstone(_ context.Context, vaultID uuid.UUID, id string) (string, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.tombs[snKey(vaultID, id)]
+	return e, ok, nil
+}
 
 func (m *memNoteRepo) Upsert(_ context.Context, n domain.Note) error {
 	m.mu.Lock()
@@ -258,10 +268,12 @@ func (m *memNoteRepo) delete(vaultID uuid.UUID, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	k := snKey(vaultID, id)
-	if _, ok := m.rows[k]; !ok {
+	n, ok := m.rows[k]
+	if !ok {
 		return domain.ErrNotFound
 	}
 	delete(m.rows, k)
+	m.tombs[k] = n.CRDTEpoch
 	return nil
 }
 
@@ -371,6 +383,7 @@ func newRelaySide(t *testing.T) *relaySide {
 			}
 			return side.caps
 		},
+		Tombstone: side.notes.lastTombstone,
 		Audit: func(_ context.Context, _ uuid.UUID, action string, payload map[string]any) {
 			side.capsMu.Lock()
 			defer side.capsMu.Unlock()

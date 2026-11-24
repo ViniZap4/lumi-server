@@ -590,6 +590,8 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 		// what its control state grants that server's users.
 		PeerCaps: federationSvc.PeerCapabilities,
 		Audit:    federationSvc.RecordRelayAudit,
+		// G2: tombstone-aware manifest reconciliation.
+		Tombstone: noteStore.LastTombstone,
 	})
 	crdtRegistry.SetOnPersist(relayLinks.OnPersist)
 	notesSvc.SetFederationNotifier(relayLinks)
