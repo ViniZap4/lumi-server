@@ -29,6 +29,11 @@ type Service struct {
 	dummyHash string
 
 	listener SessionListener
+
+	// Device links (devicelink.go); nil links disables the feature.
+	links        DeviceLinkStore
+	rlLinkIssue  *RateLimiter
+	rlLinkRedeem *RateLimiter
 }
 
 // SessionListener hears about sessions ending so long-lived streams (the
