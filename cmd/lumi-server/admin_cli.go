@@ -32,7 +32,7 @@ import (
 // isAdminCommand reports whether args[0] is an admin CLI subcommand.
 func isAdminCommand(cmd string) bool {
 	switch cmd {
-	case "token", "status", "user", "session", "vault", "federation", "audit":
+	case "token", "status", "user", "session", "vault", "federation", "audit", "admin":
 		return true
 	}
 	return false
@@ -42,7 +42,9 @@ const adminUsage = `Administration (docs/ADMIN.md; same rules as the admin API):
   lumi-server status [--json]
   lumi-server token create <name> [--ttl 30d]     print a new admin token (shown once)
   lumi-server token list [--json]
-  lumi-server token revoke <id>
+  lumi-server token revoke <id>                   also ends an admin session (lps_) by id
+  lumi-server admin list [--json]                 server admins (panel password login)
+  lumi-server admin grant|revoke <user>           set or clear the server_admin flag
   lumi-server user list [--json]
   lumi-server user show <user> [--json]
   lumi-server user create <username> [--display-name s] [--password-stdin]
@@ -161,6 +163,7 @@ func (e *cliEnv) dispatch(ctx context.Context, args []string) error {
 		"session":    {"list": e.sessionList, "revoke": e.sessionRevoke},
 		"vault":      {"list": e.vaultList, "show": e.vaultShow, "delete": e.vaultDelete},
 		"federation": {"list": e.federationList, "revoke": e.federationRevoke},
+		"admin":      {"list": e.adminList, "grant": e.adminFlag(true), "revoke": e.adminFlag(false)},
 	}
 	var fn func(context.Context, *admin.Service, []string) error
 	rest := args[1:]
@@ -302,9 +305,13 @@ func (e *cliEnv) tokenList(ctx context.Context, svc *admin.Service, args []strin
 	}
 	rows := make([][]string, 0, len(list))
 	for _, t := range list {
-		rows = append(rows, []string{t.ID.String(), t.Name, t.State(now), stamp(t.CreatedAt), stampPtr(t.LastUsedAt, "never"), stamp(t.ExpiresAt)})
+		kind, user := admin.KindToken, "-"
+		if t.IsSession() {
+			kind, user = admin.KindSession, t.Username
+		}
+		rows = append(rows, []string{t.ID.String(), kind, t.Name, user, t.State(now), stamp(t.CreatedAt), stampPtr(t.LastUsedAt, "never"), stamp(t.ExpiresAt)})
 	}
-	return table(e.out, []string{"ID", "NAME", "STATE", "CREATED", "LAST USED", "EXPIRES"}, rows)
+	return table(e.out, []string{"ID", "KIND", "NAME", "USER", "STATE", "CREATED", "LAST USED", "EXPIRES"}, rows)
 }
 
 func (e *cliEnv) tokenRevoke(ctx context.Context, svc *admin.Service, args []string) error {
@@ -350,6 +357,60 @@ func (e *cliEnv) status(ctx context.Context, svc *admin.Service, args []string) 
 	_, err = fmt.Fprintf(e.out, "users: %d\nsessions: %d\nvaults: %d\nnotes: %d\nfederations: %d active\n",
 		st.Users, st.Sessions, st.Vaults, st.Notes, st.Federations)
 	return err
+}
+
+// ---- server admins ----------------------------------------------------------------------
+
+func (e *cliEnv) adminList(ctx context.Context, svc *admin.Service, args []string) error {
+	fs := flag.NewFlagSet("admin list", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "")
+	if _, err := parse(fs, args, 0); err != nil {
+		return err
+	}
+	list, _, err := svc.SearchUsers(ctx, admin.UserFilter{ServerAdmin: true}, "", 0)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	if *asJSON {
+		out := make([]admin.UserJSON, 0, len(list))
+		for _, u := range list {
+			out = append(out, admin.ToUserJSON(now)(u))
+		}
+		return printJSON(e.out, out)
+	}
+	rows := make([][]string, 0, len(list))
+	for _, u := range list {
+		rows = append(rows, []string{u.ID.String(), u.Username, u.State(now), stamp(u.CreatedAt)})
+	}
+	return table(e.out, []string{"ID", "USERNAME", "STATE", "CREATED"}, rows)
+}
+
+// adminFlag grants or revokes server_admin. Revoking the last active
+// server admin is refused, as in the API.
+func (e *cliEnv) adminFlag(enabled bool) func(context.Context, *admin.Service, []string) error {
+	return func(ctx context.Context, svc *admin.Service, args []string) error {
+		pos, err := parse(flag.NewFlagSet("admin", flag.ContinueOnError), args, 1)
+		if err != nil {
+			return err
+		}
+		u, err := svc.ResolveUser(ctx, pos[0])
+		if err != nil {
+			return err
+		}
+		if err := svc.SetServerAdmin(ctx, admin.CLI, u.ID, enabled); err != nil {
+			if errors.Is(err, admin.ErrLastServerAdmin) {
+				return fmt.Errorf("%s is the last active server admin: grant another account first", u.Username)
+			}
+			return err
+		}
+		verb := "is now a server admin (panel password login)"
+		if !enabled {
+			verb = "is no longer a server admin; their admin sessions were ended"
+		}
+		_, err = fmt.Fprintf(e.out, "%s %s\n", u.Username, verb)
+		return err
+	}
 }
 
 // ---- users ----------------------------------------------------------------------------

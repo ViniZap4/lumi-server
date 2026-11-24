@@ -96,6 +96,10 @@ func (h *HTTP) App() *fiber.App {
 	app.Get("/admin/healthz", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"status": "ok"})
 	})
+	// The password login is the one /admin/v1 route without a bearer
+	// token. Registered before the group: Fiber runs routes in order and
+	// this handler ends the chain, so h.authed never runs for it.
+	app.Post(basePath+"/session", h.createSession)
 
 	v1 := app.Group(basePath, h.authed)
 	v1.Get("/status", h.status)
@@ -107,6 +111,7 @@ func (h *HTTP) App() *fiber.App {
 	v1.Post("/users/:id/disable", h.userOp((*Service).Disable))
 	v1.Post("/users/:id/enable", h.userOp((*Service).Enable))
 	v1.Post("/users/:id/unlock", h.userOp((*Service).Unlock))
+	v1.Post("/users/:id/server-admin", h.setServerAdmin)
 	v1.Delete("/users/:id/sessions", h.endUserSessions)
 	v1.Get("/sessions", h.listSessions)
 	v1.Delete("/sessions/:id", h.revokeSession)
@@ -118,6 +123,7 @@ func (h *HTTP) App() *fiber.App {
 	v1.Delete("/federations/:id", h.revokeFederation)
 	v1.Get("/invites", h.listInvites)
 	v1.Delete("/invites/:id", h.revokeInvite)
+	v1.Delete("/session", h.endSession)
 	v1.Get("/tokens", h.listTokens)
 	v1.Delete("/tokens/:id", h.revokeToken)
 	v1.Get("/audit", h.audit)
@@ -192,12 +198,7 @@ func (h *HTTP) authed(c *fiber.Ctx) error {
 	}
 	if errors.Is(err, domain.ErrUnauthorized) {
 		if allowed, wait := h.Limiter.Allow(limiterKey(ip)); !allowed {
-			secs := int(math.Ceil(wait.Seconds()))
-			if secs < 1 {
-				secs = 1
-			}
-			c.Set(fiber.HeaderRetryAfter, strconv.Itoa(secs))
-			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "rate_limited", "retry_after_s": secs})
+			return rateLimited(c, wait)
 		}
 		c.Set(fiber.HeaderWWWAuthenticate, `Bearer realm="lumi-admin"`)
 		return errorJSON(c, fiber.StatusUnauthorized, "unauthorized", "")
@@ -209,6 +210,15 @@ func (h *HTTP) authed(c *fiber.Ctx) error {
 	c.Locals(keyToken, t)
 	c.Locals(keyActor, Actor{TokenID: &id, TokenName: t.Name, IP: ipString(ip)})
 	return c.Next()
+}
+
+func rateLimited(c *fiber.Ctx, wait time.Duration) error {
+	secs := int(math.Ceil(wait.Seconds()))
+	if secs < 1 {
+		secs = 1
+	}
+	c.Set(fiber.HeaderRetryAfter, strconv.Itoa(secs))
+	return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{"error": "rate_limited", "retry_after_s": secs})
 }
 
 func ipString(a netip.Addr) string {
@@ -479,6 +489,7 @@ type UserJSON struct {
 	CreatedAt     string      `json:"created_at"`
 	LastLoginAt   *string     `json:"last_login_at"`
 	LastSeenAt    *string     `json:"last_seen_at"`
+	ServerAdmin   bool        `json:"server_admin"`
 	OwnedVaultIDs []uuid.UUID `json:"owned_vault_ids,omitempty"`
 }
 
@@ -488,7 +499,7 @@ func ToUserJSON(now time.Time) func(User) UserJSON {
 			ID: u.ID, Username: u.Username, DisplayName: u.DisplayName, State: u.State(now),
 			DisabledAt: tsPtr(u.DisabledAt), FailedLogins: u.FailedLogins, LockedUntil: tsPtr(u.LockedUntil),
 			Sessions: u.Sessions, OwnedVaults: u.OwnedVaults, Vaults: u.Vaults, CreatedAt: ts(u.CreatedAt),
-			LastLoginAt: tsPtr(u.LastLoginAt), LastSeenAt: tsPtr(u.LastSeenAt),
+			LastLoginAt: tsPtr(u.LastLoginAt), LastSeenAt: tsPtr(u.LastSeenAt), ServerAdmin: u.ServerAdmin,
 		}
 	}
 }
@@ -626,13 +637,25 @@ type TokenJSON struct {
 	ExpiresAt  string    `json:"expires_at"`
 	RevokedAt  *string   `json:"revoked_at"`
 	Current    bool      `json:"current"`
+	// Kind is "token" (lpa_) or "session" (lps_); User is the signed-in
+	// user of a session, null for a token.
+	Kind string   `json:"kind"`
+	User *RefJSON `json:"user"`
 }
 
 // ToTokenJSON renders tokens; current marks the caller's own.
 func ToTokenJSON(now time.Time, current uuid.UUID) func(Token) TokenJSON {
 	return func(t Token) TokenJSON {
-		return TokenJSON{ID: t.ID, Name: t.Name, State: t.State(now), CreatedAt: ts(t.CreatedAt),
-			LastUsedAt: tsPtr(t.LastUsedAt), ExpiresAt: ts(t.ExpiresAt), RevokedAt: tsPtr(t.RevokedAt), Current: t.ID == current}
+		out := TokenJSON{ID: t.ID, Name: t.Name, State: t.State(now), CreatedAt: ts(t.CreatedAt),
+			LastUsedAt: tsPtr(t.LastUsedAt), ExpiresAt: ts(t.ExpiresAt), RevokedAt: tsPtr(t.RevokedAt), Current: t.ID == current,
+			Kind: KindToken}
+		if t.IsSession() {
+			out.Kind = KindSession
+			if t.UserID != nil {
+				out.User = &RefJSON{ID: *t.UserID, Username: t.Username}
+			}
+		}
+		return out
 	}
 }
 
@@ -689,7 +712,7 @@ func (h *HTTP) status(c *fiber.Ctx) error {
 		"login_failures_24h": st.LoginFailures24h,
 		"invites_active":     st.InvitesActive,
 		"go_version":         st.GoVersion,
-		"token":              fiber.Map{"id": t.ID, "name": t.Name, "expires_at": ts(t.ExpiresAt)},
+		"token":              tokenRef(t),
 	})
 }
 
@@ -712,6 +735,13 @@ func (h *HTTP) listUsers(c *fiber.Ctx) error {
 		f.State = strings.Clone(st)
 	default:
 		return badRequest(c, "state", "must be active, disabled or locked")
+	}
+	switch c.Query("server_admin") {
+	case "", "false":
+	case "true":
+		f.ServerAdmin = true
+	default:
+		return badRequest(c, "server_admin", "must be true or false")
 	}
 	list, more, err := h.Service.SearchUsers(c.UserContext(), f, after, limit)
 	if err != nil {
@@ -761,6 +791,95 @@ func (h *HTTP) createUser(c *fiber.Ctx) error {
 
 type passwordReq struct {
 	Password string `json:"password"`
+}
+
+// tokenRef is the caller's credential in GET /status and the session
+// login response: kind, and the user for a session.
+func tokenRef(t Token) fiber.Map {
+	m := fiber.Map{"id": t.ID, "name": t.Name, "expires_at": ts(t.ExpiresAt), "kind": KindToken, "user": nil}
+	if t.IsSession() {
+		m["kind"] = KindSession
+		if t.UserID != nil {
+			m["user"] = RefJSON{ID: *t.UserID, Username: t.Username}
+		}
+	}
+	return m
+}
+
+type sessionReq struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// createSession — POST /admin/v1/session {username, password}, no token.
+//
+// 201 {"token": "lps_…", "id", "name", "kind": "session", "expires_at",
+// "user": {"id","username"}}. Every refusal (unknown user, wrong password,
+// locked or disabled account, not a server admin) is the same
+// 401 {"error":"invalid_credentials"}; the per-IP failure budget of the
+// admin listener applies on top of the login's own per-IP and per-user
+// limits (429 rate_limited with Retry-After either way).
+func (h *HTTP) createSession(c *fiber.Ctx) error {
+	ip := h.clientIP(c)
+	key := limiterKey(ip)
+	if ok, wait := h.Limiter.Peek(key); !ok {
+		return rateLimited(c, wait)
+	}
+	var req sessionReq
+	if err := decode(c, &req); err != nil {
+		return err
+	}
+	raw, t, err := h.Service.CreateSession(c.UserContext(), ipString(ip), c.Get(fiber.HeaderUserAgent), req.Username, req.Password)
+	switch {
+	case err == nil:
+		out := tokenRef(t)
+		out["token"] = raw
+		return c.Status(fiber.StatusCreated).JSON(out)
+	case errors.Is(err, domain.ErrRateLimited):
+		return rateLimited(c, time.Minute)
+	case errors.Is(err, domain.ErrInvalidCredentials):
+		if ok, wait := h.Limiter.Allow(key); !ok {
+			return rateLimited(c, wait)
+		}
+		return errorJSON(c, fiber.StatusUnauthorized, "invalid_credentials", "")
+	case errors.Is(err, errSessionLoginOff):
+		return errorJSON(c, fiber.StatusNotFound, "not_found", "")
+	}
+	return h.internal(c, err)
+}
+
+// endSession — DELETE /admin/v1/session: revokes the caller's own admin
+// session (204); 409 for an lpa_ token.
+func (h *HTTP) endSession(c *fiber.Ctx) error {
+	if err := h.Service.EndSession(c.UserContext(), actorOf(c), tokenOf(c)); err != nil {
+		return h.fail(c, err)
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+type serverAdminReq struct {
+	Enabled *bool `json:"enabled"`
+}
+
+// setServerAdmin — POST /admin/v1/users/{id}/server-admin {"enabled"}:
+// 204; 409 {"error":"conflict","detail":"last_server_admin"} when it would
+// clear the last active server admin.
+func (h *HTTP) setServerAdmin(c *fiber.Ctx) error {
+	id, ok := pathUUID(c)
+	if !ok {
+		return errorJSON(c, fiber.StatusNotFound, "not_found", "")
+	}
+	var req serverAdminReq
+	if err := decode(c, &req); err != nil {
+		return err
+	}
+	if req.Enabled == nil {
+		return badRequest(c, "enabled", "is required")
+	}
+	if err := h.Service.SetServerAdmin(c.UserContext(), actorOf(c), id, *req.Enabled); err != nil {
+		return h.fail(c, err)
+	}
+	return c.SendStatus(fiber.StatusNoContent)
 }
 
 func (h *HTTP) setPassword(c *fiber.Ctx) error {

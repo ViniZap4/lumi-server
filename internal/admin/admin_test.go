@@ -302,6 +302,7 @@ func TestEveryRouteRequiresToken(t *testing.T) {
 		{"DELETE", "/admin/v1/users/" + id + "/sessions"}, {"GET", "/admin/v1/vaults/" + id + "/members"},
 		{"GET", "/admin/v1/invites"}, {"DELETE", "/admin/v1/invites/" + strings.Repeat("a", 64)},
 		{"GET", "/admin/v1/nonexistent"}, {"PUT", "/admin/v1/users"},
+		{"POST", "/admin/v1/users/" + id + "/server-admin"}, {"DELETE", "/admin/v1/session"},
 	}
 	for _, rt := range routes {
 		if r := h.do(t, rt[0], rt[1], "", ""); r.status != 401 {

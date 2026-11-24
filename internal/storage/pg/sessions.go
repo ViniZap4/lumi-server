@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ViniZap4/lumi-server/internal/domain"
@@ -153,13 +154,23 @@ func (s *SessionStore) DeleteAllForUser(ctx context.Context, userID uuid.UUID) e
 
 // DeleteSessionsForUser is the alias matching internal/auth.SessionStore.
 // Returns count of deleted rows.
+//
+// The user's admin-panel sessions (admin_tokens kind 'session') end too:
+// a password change signs the account out of the panel as well.
 func (s *SessionStore) DeleteSessionsForUser(ctx context.Context, userID uuid.UUID) (int, error) {
-	const q = `DELETE FROM sessions WHERE user_id = $1`
-	tag, err := s.pool.Exec(ctx, q, userID)
+	var n int
+	err := runTx(ctx, s.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, userID)
+		if err != nil {
+			return err
+		}
+		n = int(tag.RowsAffected())
+		return revokeAdminSessionsTx(ctx, tx, userID)
+	})
 	if err != nil {
 		return 0, fmt.Errorf("session store: delete for user: %w", errMap(err))
 	}
-	return int(tag.RowsAffected()), nil
+	return n, nil
 }
 
 // PurgeExpired deletes sessions past their expiry.

@@ -71,35 +71,67 @@ func affected(tag pgconn.CommandTag, what string) error {
 
 // ---- tokens -----------------------------------------------------------------------
 
-const tokenCols = `id, name, created_at, last_used_at, expires_at, revoked_at`
+// tokenSelect joins the session's user: its name, and whether it may still
+// use the session (server admin and not disabled).
+const tokenSelect = `
+SELECT t.id, t.name, t.created_at, t.last_used_at, t.expires_at, t.revoked_at, t.kind, t.user_id,
+       COALESCE(u.username, ''), COALESCE(u.server_admin AND u.disabled_at IS NULL, false)
+  FROM admin_tokens t
+  LEFT JOIN users u ON u.id = t.user_id`
 
 func scanToken(row pgx.Row) (admin.Token, error) {
 	var t admin.Token
-	err := row.Scan(&t.ID, &t.Name, &t.CreatedAt, &t.LastUsedAt, &t.ExpiresAt, &t.RevokedAt)
+	err := row.Scan(&t.ID, &t.Name, &t.CreatedAt, &t.LastUsedAt, &t.ExpiresAt, &t.RevokedAt,
+		&t.Kind, &t.UserID, &t.Username, &t.UserActive)
 	if err != nil {
 		return admin.Token{}, fmt.Errorf("admin store: token: %w", errMap(err))
 	}
 	return t, nil
 }
 
+// sessionRetention: expired or revoked admin sessions older than this are
+// pruned when a new one is created, so password logins do not pile up.
+const sessionRetention = "30 days"
+
 func (s *AdminStore) CreateToken(ctx context.Context, t admin.Token, digest []byte, e domain.AuditEntry) error {
+	kind := t.Kind
+	if kind == "" {
+		kind = admin.KindToken
+	}
 	return s.withAudit(ctx, e, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
-INSERT INTO admin_tokens (id, name, token_hash, created_at, expires_at)
-VALUES ($1, $2, $3, $4, $5)`, t.ID, t.Name, digest, t.CreatedAt, t.ExpiresAt)
+INSERT INTO admin_tokens (id, name, token_hash, created_at, expires_at, kind, user_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7)`, t.ID, t.Name, digest, t.CreatedAt, t.ExpiresAt, kind, uuidArg(t.UserID))
 		if err != nil {
 			return fmt.Errorf("admin store: create token: %w", errMap(err))
+		}
+		if kind == admin.KindSession {
+			if _, err := tx.Exec(ctx, `
+DELETE FROM admin_tokens
+ WHERE kind = 'session' AND COALESCE(revoked_at, expires_at) < NOW() - interval '`+sessionRetention+`'`); err != nil {
+				return fmt.Errorf("admin store: prune sessions: %w", errMap(err))
+			}
 		}
 		return nil
 	})
 }
 
 func (s *AdminStore) TokenByDigest(ctx context.Context, digest []byte) (admin.Token, error) {
-	return scanToken(s.pool.QueryRow(ctx, `SELECT `+tokenCols+` FROM admin_tokens WHERE token_hash = $1`, digest))
+	return scanToken(s.pool.QueryRow(ctx, tokenSelect+` WHERE t.token_hash = $1`, digest))
 }
 
 func (s *AdminStore) GetToken(ctx context.Context, id uuid.UUID) (admin.Token, error) {
-	return scanToken(s.pool.QueryRow(ctx, `SELECT `+tokenCols+` FROM admin_tokens WHERE id = $1`, id))
+	return scanToken(s.pool.QueryRow(ctx, tokenSelect+` WHERE t.id = $1`, id))
+}
+
+// revokeAdminSessionsTx ends every live admin session of the user: a
+// password change, a disable, a sign-out-everywhere or losing the
+// server_admin flag also signs the account out of the panel.
+func revokeAdminSessionsTx(ctx context.Context, tx pgx.Tx, userID uuid.UUID) error {
+	_, err := tx.Exec(ctx, `
+UPDATE admin_tokens SET revoked_at = NOW()
+ WHERE user_id = $1 AND kind = 'session' AND revoked_at IS NULL AND expires_at > NOW()`, userID)
+	return err
 }
 
 func (s *AdminStore) TouchToken(ctx context.Context, id uuid.UUID, at time.Time) error {
@@ -115,10 +147,9 @@ func (s *AdminStore) ListTokens(ctx context.Context, after *admin.Cursor, limit 
 	if err != nil {
 		return nil, false, err
 	}
-	rows, err := s.pool.Query(ctx, `
-SELECT `+tokenCols+` FROM admin_tokens
- WHERE ($1::timestamptz IS NULL OR (created_at, id) > ($1, $2::uuid))
- ORDER BY created_at, id
+	rows, err := s.pool.Query(ctx, tokenSelect+`
+ WHERE ($1::timestamptz IS NULL OR (t.created_at, t.id) > ($1, $2::uuid))
+ ORDER BY t.created_at, t.id
  LIMIT $3`, at, key, limitArg(limit))
 	if err != nil {
 		return nil, false, fmt.Errorf("admin store: list tokens: %w", errMap(err))
@@ -197,13 +228,14 @@ SELECT u.id, u.username, u.display_name, u.created_at, u.disabled_at, u.failed_l
        (SELECT count(*) FROM vaults v WHERE v.owner_user_id = u.id),
        (SELECT count(*) FROM vault_members m WHERE m.user_id = u.id),
        (SELECT max(a.created_at) FROM audit_log a WHERE a.user_id = u.id AND a.action = 'auth.login'),
-       (SELECT max(s.last_used_at) FROM sessions s WHERE s.user_id = u.id)
+       (SELECT max(s.last_used_at) FROM sessions s WHERE s.user_id = u.id),
+       u.server_admin
   FROM users u`
 
 func scanAdminUser(row pgx.Row) (admin.User, error) {
 	var u admin.User
 	err := row.Scan(&u.ID, &u.Username, &u.DisplayName, &u.CreatedAt, &u.DisabledAt, &u.FailedLogins,
-		&u.LockedUntil, &u.Sessions, &u.OwnedVaults, &u.Vaults, &u.LastLoginAt, &u.LastSeenAt)
+		&u.LockedUntil, &u.Sessions, &u.OwnedVaults, &u.Vaults, &u.LastLoginAt, &u.LastSeenAt, &u.ServerAdmin)
 	if err != nil {
 		return admin.User{}, fmt.Errorf("admin store: user: %w", errMap(err))
 	}
@@ -218,8 +250,9 @@ func (s *AdminStore) ListUsers(ctx context.Context, f admin.UserFilter, after st
         OR ($4 = 'disabled' AND u.disabled_at IS NOT NULL)
         OR ($4 = 'locked' AND u.disabled_at IS NULL AND u.locked_until > NOW())
         OR ($4 = 'active' AND u.disabled_at IS NULL AND (u.locked_until IS NULL OR u.locked_until <= NOW())))
+   AND (NOT $5 OR u.server_admin)
  ORDER BY u.username
- LIMIT $2`, after, limitArg(limit), likePattern(f.Query), f.State)
+ LIMIT $2`, after, limitArg(limit), likePattern(f.Query), f.State, f.ServerAdmin)
 	if err != nil {
 		return nil, false, fmt.Errorf("admin store: list users: %w", errMap(err))
 	}
@@ -271,6 +304,9 @@ UPDATE users SET password_hash = $2, failed_logins = 0, locked_until = NULL WHER
 		if _, err := tx.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, id); err != nil {
 			return fmt.Errorf("admin store: end sessions: %w", errMap(err))
 		}
+		if err := revokeAdminSessionsTx(ctx, tx, id); err != nil {
+			return fmt.Errorf("admin store: end admin sessions: %w", errMap(err))
+		}
 		return nil
 	})
 }
@@ -291,6 +327,58 @@ func (s *AdminStore) SetDisabled(ctx context.Context, id uuid.UUID, disabled boo
 		if disabled {
 			if _, err := tx.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, id); err != nil {
 				return fmt.Errorf("admin store: end sessions: %w", errMap(err))
+			}
+			if err := revokeAdminSessionsTx(ctx, tx, id); err != nil {
+				return fmt.Errorf("admin store: end admin sessions: %w", errMap(err))
+			}
+		}
+		return nil
+	})
+}
+
+// SetServerAdmin sets users.server_admin with the audit row. Clearing it
+// locks every server-admin row first (serialising concurrent revokes) and
+// refuses when no other active server admin would remain.
+func (s *AdminStore) SetServerAdmin(ctx context.Context, id uuid.UUID, enabled bool, e domain.AuditEntry) error {
+	return s.withAudit(ctx, e, func(tx pgx.Tx) error {
+		if !enabled {
+			rows, err := tx.Query(ctx, `
+SELECT id, disabled_at IS NULL FROM users WHERE server_admin ORDER BY id FOR UPDATE`)
+			if err != nil {
+				return fmt.Errorf("admin store: server admins: %w", errMap(err))
+			}
+			target, others := false, 0
+			for rows.Next() {
+				var uid uuid.UUID
+				var active bool
+				if err := rows.Scan(&uid, &active); err != nil {
+					rows.Close()
+					return fmt.Errorf("admin store: server admins: %w", errMap(err))
+				}
+				if uid == id {
+					target = true
+				} else if active {
+					others++
+				}
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return fmt.Errorf("admin store: server admins: %w", errMap(err))
+			}
+			if target && others == 0 {
+				return admin.ErrLastServerAdmin
+			}
+		}
+		tag, err := tx.Exec(ctx, `UPDATE users SET server_admin = $2 WHERE id = $1`, id, enabled)
+		if err != nil {
+			return fmt.Errorf("admin store: set server admin: %w", errMap(err))
+		}
+		if err := affected(tag, "set server admin"); err != nil {
+			return err
+		}
+		if !enabled {
+			if err := revokeAdminSessionsTx(ctx, tx, id); err != nil {
+				return fmt.Errorf("admin store: end admin sessions: %w", errMap(err))
 			}
 		}
 		return nil
@@ -371,6 +459,9 @@ func (s *AdminStore) EndUserSessions(ctx context.Context, userID uuid.UUID, e fu
 			return fmt.Errorf("admin store: end sessions: %w", errMap(err))
 		}
 		n = int(tag.RowsAffected())
+		if err := revokeAdminSessionsTx(ctx, tx, userID); err != nil {
+			return fmt.Errorf("admin store: end admin sessions: %w", errMap(err))
+		}
 		return insertAudit(ctx, tx, e(n))
 	})
 	if err != nil {

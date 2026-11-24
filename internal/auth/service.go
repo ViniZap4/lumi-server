@@ -205,64 +205,10 @@ func (s *Service) register(ctx context.Context, in RegisterInput, requireConsent
 // Login authenticates and issues a session. Constant-time on user-not-found
 // via a precomputed dummy hash.
 func (s *Service) Login(ctx context.Context, in LoginInput) (domain.Session, error) {
-	username, err := canonicaliseUsername(in.Username)
+	user, err := s.verifyLogin(ctx, in, domain.ActionAuthLoginFailed)
 	if err != nil {
-		s.consumeFailureBudget("", in.IP)
-		_ = CheckPassword(s.dummyHash, in.Password)
-		s.recordLoginFailure(ctx, nil, in, "invalid_username")
-		return domain.Session{}, domain.ErrInvalidCredentials
+		return domain.Session{}, err
 	}
-
-	if !s.rlIP.Allow(in.IP) {
-		s.recordLoginFailure(ctx, nil, in, "rate_limited_ip")
-		return domain.Session{}, fmt.Errorf("auth: ip throttled: %w", domain.ErrRateLimited)
-	}
-	if !s.rlUser.Allow(username) {
-		s.recordLoginFailure(ctx, nil, in, "rate_limited_user")
-		return domain.Session{}, fmt.Errorf("auth: user throttled: %w", domain.ErrRateLimited)
-	}
-
-	user, lookupErr := s.users.GetByUsername(ctx, username)
-	hash := s.dummyHash
-	var realUser bool
-	if lookupErr == nil {
-		hash = user.PasswordHash
-		realUser = true
-	} else if !errors.Is(lookupErr, domain.ErrNotFound) {
-		_ = CheckPassword(s.dummyHash, in.Password)
-		s.recordLoginFailure(ctx, nil, in, "lookup_error")
-		return domain.Session{}, domain.ErrInvalidCredentials
-	}
-
-	// A disabled or locked account gets the same answer as a wrong
-	// password, after the same bcrypt cost, so the response reveals
-	// neither the state nor that the account exists.
-	if realUser {
-		if reason := blockedReason(user, time.Now()); reason != "" {
-			_ = CheckPassword(s.dummyHash, in.Password)
-			id := user.ID
-			s.recordLoginFailure(ctx, &id, in, reason)
-			return domain.Session{}, domain.ErrInvalidCredentials
-		}
-	}
-
-	cmpErr := CheckPassword(hash, in.Password)
-	if !realUser || cmpErr != nil {
-		var uid *uuid.UUID
-		if realUser {
-			id := user.ID
-			uid = &id
-			s.countLoginFailure(ctx, id)
-		}
-		s.recordLoginFailure(ctx, uid, in, "invalid_credentials")
-		return domain.Session{}, domain.ErrInvalidCredentials
-	}
-
-	s.rlUser.Reset(username)
-	if user.FailedLogins > 0 || user.LockedUntil != nil {
-		s.resetLoginFailures(ctx, user.ID)
-	}
-
 	session, err := s.issueSession(ctx, user.ID)
 	if err != nil {
 		return domain.Session{}, fmt.Errorf("auth: login issue session: %w", err)
@@ -274,6 +220,96 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (domain.Session, err
 		UserAgent: nilIfEmpty(in.UserAgent),
 	})
 	return session, nil
+}
+
+// AdminLogin verifies an admin-panel password login (SPEC-PARTE2 §10)
+// with exactly the public login's checks: the same per-IP and per-user
+// rate limiters, bcrypt against a dummy hash for unknown users, the
+// persistent lockout and failed-login accounting. The account must also
+// be a server admin. Every refusal is audited as admin.login_failed and
+// answered with domain.ErrInvalidCredentials (or domain.ErrRateLimited),
+// so the caller cannot tell an unknown user from a wrong password, a
+// locked account or a non-admin. It issues nothing: the admin service
+// mints its own session token.
+func (s *Service) AdminLogin(ctx context.Context, in LoginInput) (domain.User, error) {
+	user, err := s.verifyLogin(ctx, in, domain.ActionAdminLoginFailed)
+	if err != nil {
+		return domain.User{}, err
+	}
+	if !user.ServerAdmin {
+		// The password was right: no lockout count, but still refused
+		// with the same answer, after the same bcrypt cost.
+		id := user.ID
+		s.recordFailure(ctx, domain.ActionAdminLoginFailed, &id, in, "not_server_admin")
+		return domain.User{}, domain.ErrInvalidCredentials
+	}
+	return user, nil
+}
+
+// verifyLogin is the credential check shared by Login and AdminLogin;
+// failAction is the audit action of its refusals.
+func (s *Service) verifyLogin(ctx context.Context, in LoginInput, failAction string) (domain.User, error) {
+	fail := func(uid *uuid.UUID, reason string) {
+		s.recordFailure(ctx, failAction, uid, in, reason)
+	}
+	username, err := canonicaliseUsername(in.Username)
+	if err != nil {
+		s.consumeFailureBudget("", in.IP)
+		_ = CheckPassword(s.dummyHash, in.Password)
+		fail(nil, "invalid_username")
+		return domain.User{}, domain.ErrInvalidCredentials
+	}
+
+	if !s.rlIP.Allow(in.IP) {
+		fail(nil, "rate_limited_ip")
+		return domain.User{}, fmt.Errorf("auth: ip throttled: %w", domain.ErrRateLimited)
+	}
+	if !s.rlUser.Allow(username) {
+		fail(nil, "rate_limited_user")
+		return domain.User{}, fmt.Errorf("auth: user throttled: %w", domain.ErrRateLimited)
+	}
+
+	user, lookupErr := s.users.GetByUsername(ctx, username)
+	hash := s.dummyHash
+	var realUser bool
+	if lookupErr == nil {
+		hash = user.PasswordHash
+		realUser = true
+	} else if !errors.Is(lookupErr, domain.ErrNotFound) {
+		_ = CheckPassword(s.dummyHash, in.Password)
+		fail(nil, "lookup_error")
+		return domain.User{}, domain.ErrInvalidCredentials
+	}
+
+	// A disabled or locked account gets the same answer as a wrong
+	// password, after the same bcrypt cost, so the response reveals
+	// neither the state nor that the account exists.
+	if realUser {
+		if reason := blockedReason(user, time.Now()); reason != "" {
+			_ = CheckPassword(s.dummyHash, in.Password)
+			id := user.ID
+			fail(&id, reason)
+			return domain.User{}, domain.ErrInvalidCredentials
+		}
+	}
+
+	cmpErr := CheckPassword(hash, in.Password)
+	if !realUser || cmpErr != nil {
+		var uid *uuid.UUID
+		if realUser {
+			id := user.ID
+			uid = &id
+			s.countLoginFailure(ctx, id)
+		}
+		fail(uid, "invalid_credentials")
+		return domain.User{}, domain.ErrInvalidCredentials
+	}
+
+	s.rlUser.Reset(username)
+	if user.FailedLogins > 0 || user.LockedUntil != nil {
+		s.resetLoginFailures(ctx, user.ID)
+	}
+	return user, nil
 }
 
 func (s *Service) Logout(ctx context.Context, token string) error {
@@ -522,10 +558,10 @@ func (s *Service) consumeFailureBudget(username, ip string) {
 	}
 }
 
-func (s *Service) recordLoginFailure(ctx context.Context, uid *uuid.UUID, in LoginInput, reason string) {
+func (s *Service) recordFailure(ctx context.Context, action string, uid *uuid.UUID, in LoginInput, reason string) {
 	s.recordAudit(ctx, domain.AuditEntry{
 		UserID:    uid,
-		Action:    domain.ActionAuthLoginFailed,
+		Action:    action,
 		Payload:   mustJSON(map[string]any{"reason": reason, "username": maskUsername(in.Username)}),
 		IP:        nilIfEmpty(in.IP),
 		UserAgent: nilIfEmpty(in.UserAgent),

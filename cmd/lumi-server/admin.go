@@ -98,6 +98,7 @@ func startAdmin(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxp
 		Vaults:        live.vaults,
 		Federations:   live.federation,
 		Hasher:        live.auth,
+		Login:         live.auth,
 		Live:          live.broker,
 		Log:           log,
 		Version:       Version,

@@ -72,10 +72,61 @@ func (f *fakeStore) TokenByDigest(_ context.Context, d []byte) (Token, error) {
 	defer f.mu.Unlock()
 	for id, dg := range f.digests {
 		if bytes.Equal(dg, d) {
-			return *f.tokens[id], nil
+			return f.withUserLocked(*f.tokens[id]), nil
 		}
 	}
 	return Token{}, domain.ErrNotFound
+}
+
+// withUserLocked fills a session's user fields like the store's join.
+func (f *fakeStore) withUserLocked(t Token) Token {
+	if t.UserID == nil {
+		return t
+	}
+	u, ok := f.users[*t.UserID]
+	t.Username, t.UserActive = "", false
+	if ok {
+		t.Username, t.UserActive = u.Username, u.ServerAdmin && u.DisabledAt == nil
+	}
+	return t
+}
+
+// revokeAdminSessionsLocked mirrors revokeAdminSessionsTx.
+func (f *fakeStore) revokeAdminSessionsLocked(id uuid.UUID) {
+	now := time.Now()
+	for _, t := range f.tokens {
+		if t.UserID != nil && *t.UserID == id && t.RevokedAt == nil {
+			t.RevokedAt = &now
+		}
+	}
+}
+
+func (f *fakeStore) SetServerAdmin(_ context.Context, id uuid.UUID, enabled bool, e domain.AuditEntry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	u, ok := f.users[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if !enabled && u.ServerAdmin {
+		others := 0
+		for _, x := range f.users {
+			if x.ID != id && x.ServerAdmin && x.DisabledAt == nil {
+				others++
+			}
+		}
+		if others == 0 {
+			return ErrLastServerAdmin
+		}
+	}
+	if err := f.addAudit(e); err != nil {
+		return err
+	}
+	u.ServerAdmin = enabled
+	if !enabled {
+		f.revokeAdminSessionsLocked(id)
+	}
+	return nil
 }
 
 func (f *fakeStore) GetToken(_ context.Context, id uuid.UUID) (Token, error) {
@@ -85,7 +136,7 @@ func (f *fakeStore) GetToken(_ context.Context, id uuid.UUID) (Token, error) {
 	if !ok {
 		return Token{}, domain.ErrNotFound
 	}
-	return *t, nil
+	return f.withUserLocked(*t), nil
 }
 
 func (f *fakeStore) TouchToken(_ context.Context, id uuid.UUID, at time.Time) error {
@@ -141,6 +192,9 @@ func (f *fakeStore) ListUsers(_ context.Context, flt UserFilter, after string, l
 			continue
 		}
 		if flt.State != "" && u.State(time.Now()) != flt.State {
+			continue
+		}
+		if flt.ServerAdmin && !u.ServerAdmin {
 			continue
 		}
 		if u.Username > after {
@@ -217,6 +271,7 @@ func (f *fakeStore) SetPassword(_ context.Context, id uuid.UUID, _ string, e dom
 	}
 	u.FailedLogins, u.LockedUntil = 0, nil
 	f.endSessions(id)
+	f.revokeAdminSessionsLocked(id)
 	return nil
 }
 
@@ -234,6 +289,7 @@ func (f *fakeStore) SetDisabled(_ context.Context, id uuid.UUID, disabled bool, 
 		now := time.Now()
 		u.DisabledAt = &now
 		f.endSessions(id)
+		f.revokeAdminSessionsLocked(id)
 	} else {
 		u.DisabledAt = nil
 	}
@@ -326,6 +382,7 @@ func (f *fakeStore) EndUserSessions(_ context.Context, id uuid.UUID, e func(int)
 		return 0, err
 	}
 	f.endSessions(id)
+	f.revokeAdminSessionsLocked(id)
 	return n, nil
 }
 

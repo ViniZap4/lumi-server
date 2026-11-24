@@ -23,7 +23,7 @@ func NewUserStore(pool *pgxpool.Pool) *UserStore {
 	return &UserStore{pool: pool}
 }
 
-const userCols = `id, username, password_hash, display_name, created_at, disabled_at, failed_logins, locked_until`
+const userCols = `id, username, password_hash, display_name, created_at, disabled_at, failed_logins, locked_until, server_admin`
 
 // CreateUserInput satisfies internal/auth.CreateUserInput shape.
 type CreateUserInput struct {
@@ -210,7 +210,7 @@ func (s *UserStore) scanOne(ctx context.Context, q string, args ...any) (domain.
 	var u domain.User
 	err := s.pool.QueryRow(ctx, q, args...).Scan(
 		&u.ID, &u.Username, &u.PasswordHash, &u.DisplayName, &u.CreatedAt,
-		&u.DisabledAt, &u.FailedLogins, &u.LockedUntil,
+		&u.DisabledAt, &u.FailedLogins, &u.LockedUntil, &u.ServerAdmin,
 	)
 	if err != nil {
 		if errors.Is(errMap(err), domain.ErrNotFound) {
@@ -219,6 +219,31 @@ func (s *UserStore) scanOne(ctx context.Context, q string, args ...any) (domain.
 		return domain.User{}, fmt.Errorf("user store: get: %w", errMap(err))
 	}
 	return u, nil
+}
+
+// CountServerAdmins counts the accounts flagged server_admin (bootstrap).
+func (s *UserStore) CountServerAdmins(ctx context.Context) (int, error) {
+	var n int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE server_admin`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("user store: count server admins: %w", errMap(err))
+	}
+	return n, nil
+}
+
+// GrantServerAdmin sets the server_admin flag and writes the audit row in
+// the same transaction (bootstrap; the operator paths go through
+// AdminStore.SetServerAdmin).
+func (s *UserStore) GrantServerAdmin(ctx context.Context, id uuid.UUID, e domain.AuditEntry) error {
+	return runTx(ctx, s.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `UPDATE users SET server_admin = true WHERE id = $1`, id)
+		if err != nil {
+			return fmt.Errorf("user store: grant server admin: %w", errMap(err))
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("user store: grant server admin: %w", domain.ErrNotFound)
+		}
+		return insertAudit(ctx, tx, e)
+	})
 }
 
 // RecordLoginFailure counts one wrong password for an existing account.

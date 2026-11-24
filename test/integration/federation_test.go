@@ -5,6 +5,8 @@ package integration
 import (
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -47,6 +49,21 @@ func TestTwoServerFederation(t *testing.T) {
 	aAdmin.mustDo(http.MethodPost, "/api/vaults/"+V+"/notes",
 		map[string]string{"title": "Chapter", "body": "line one\nline two\n"}, http.StatusCreated, &note)
 	N := note.ID
+	// The first-boot bootstrap admin is a server admin (panel login).
+	if !isServerAdmin(t, a.db, a.admin) || !isServerAdmin(t, b.db, b.admin) {
+		t.Fatal("bootstrap admin lacks server_admin")
+	}
+	// A canvas (SPEC-PARTE2 §6) replicates like any note: raw JSON text.
+	const boardJSON = `{"nodes":[{"id":"a","type":"text","text":"hi","x":0,"y":0,"width":100,"height":50}],"edges":[]}`
+	var board struct {
+		ID   string `json:"id"`
+		Kind string `json:"kind"`
+	}
+	aAdmin.mustDo(http.MethodPost, "/api/vaults/"+V+"/notes",
+		map[string]string{"title": "Board", "kind": "canvas", "body": boardJSON}, http.StatusCreated, &board)
+	if board.ID != "board.canvas" || board.Kind != "canvas" {
+		t.Fatalf("canvas create: %+v", board)
+	}
 
 	var roles struct {
 		Roles []struct {
@@ -105,6 +122,23 @@ func TestTwoServerFederation(t *testing.T) {
 		}
 		if s := bAdmin.snapshot(V, N); s.Text != "line one\nline two\n" {
 			return fmt.Sprintf("B text %q", s.Text)
+		}
+		return ""
+	})
+	eventually(t, wait, "canvas on B (CRDT and mirrored file)", func() string {
+		status, raw := bAdmin.do(http.MethodGet, "/api/vaults/"+V+"/notes/"+board.ID+"/snapshot", nil, nil)
+		if status != http.StatusOK {
+			return fmt.Sprintf("status %d %s", status, raw)
+		}
+		if s := bAdmin.snapshot(V, board.ID); s.Text != boardJSON {
+			return fmt.Sprintf("B canvas text %q", s.Text)
+		}
+		files, _ := filepath.Glob(filepath.Join(b.root, "*", "board.canvas"))
+		if len(files) != 1 {
+			return fmt.Sprintf("B canvas files %v", files)
+		}
+		if got, _ := os.ReadFile(files[0]); string(got) != boardJSON {
+			return fmt.Sprintf("B canvas file %q", got)
 		}
 		return ""
 	})

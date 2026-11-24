@@ -168,6 +168,7 @@ type server struct {
 	db      string
 	admin   string // bootstrap admin username
 	pass    string
+	root    string // LUMI_ROOT
 }
 
 func startServer(t *testing.T, name, dbURL string) *server {
@@ -181,7 +182,7 @@ func startServer(t *testing.T, name, dbURL string) *server {
 	}
 	s := &server{
 		name: name, base: fmt.Sprintf("http://127.0.0.1:%d", port), logPath: logPath, db: dbURL,
-		admin: name + "admin", pass: "integration-pass-" + name,
+		admin: name + "admin", pass: "integration-pass-" + name, root: root,
 	}
 	cmd := exec.Command(serverBinary(t))
 	cmd.Env = append(os.Environ(),
@@ -466,4 +467,20 @@ func contains(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// isServerAdmin reads users.server_admin of username (migration 0009).
+func isServerAdmin(t *testing.T, dbURL, username string) bool {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	var ok bool
+	if err := conn.QueryRow(ctx, `SELECT server_admin FROM users WHERE username = $1`, username).Scan(&ok); err != nil {
+		t.Fatal(err)
+	}
+	return ok
 }

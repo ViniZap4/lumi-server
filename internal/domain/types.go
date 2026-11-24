@@ -23,6 +23,9 @@ type User struct {
 	DisabledAt   *time.Time
 	FailedLogins int
 	LockedUntil  *time.Time
+	// ServerAdmin lets the account sign in to the admin panel with its
+	// password (migration 0009, SPEC-PARTE2 §10).
+	ServerAdmin bool
 }
 
 // Session is a bearer credential issued at login. Validated via constant-time
@@ -153,8 +156,11 @@ type AuditEntry struct {
 
 // AuditAction values. Keep in sync with SPEC.md vocabulary.
 const (
-	ActionAuthLogin          = "auth.login"
-	ActionAuthLoginFailed    = "auth.login_failed"
+	ActionAuthLogin       = "auth.login"
+	ActionAuthLoginFailed = "auth.login_failed"
+	// ActionAdminLoginFailed is a refused admin-panel password login
+	// (POST /admin/v1/session); same payload as auth.login_failed.
+	ActionAdminLoginFailed   = "admin.login_failed"
 	ActionAuthLogout         = "auth.logout"
 	ActionAuthRegister       = "auth.register"
 	ActionAuthPasswordChange = "auth.password_change"

@@ -67,6 +67,24 @@ func (l *FailureLimiter) Allow(key string) (bool, time.Duration) {
 	return true, 0
 }
 
+// Peek reports whether key may fail once more, without spending: the
+// password login checks it before the bcrypt work and spends (Allow)
+// only on a failure.
+func (l *FailureLimiter) Peek(key string) (bool, time.Duration) {
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b, ok := l.buckets[key]
+	if !ok {
+		return true, 0
+	}
+	l.refill(b, now)
+	if b.tokens < 1 {
+		return false, time.Duration(math.Ceil((1 - b.tokens) * float64(l.every)))
+	}
+	return true, 0
+}
+
 func (l *FailureLimiter) refill(b *failBucket, now time.Time) {
 	if el := now.Sub(b.at); el > 0 {
 		b.tokens = math.Min(l.burst, b.tokens+float64(el)/float64(l.every))

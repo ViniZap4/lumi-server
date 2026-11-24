@@ -39,7 +39,17 @@ const (
 	ActionFederationRevoke = "admin.federation.revoke"
 	ActionUserLogout       = "admin.user.logout"
 	ActionInviteRevoke     = "admin.invite.revoke"
+	// Admin login with a user account (SPEC-PARTE2 §10).
+	ActionSessionCreate   = "admin.session.create"
+	ActionSessionLogout   = "admin.session.logout"
+	ActionLoginFailed     = domain.ActionAdminLoginFailed
+	ActionUserServerAdmin = "admin.user.server_admin"
 )
+
+// sessionTokenName is admin_tokens.name of every admin session. The
+// user is admin_tokens.user_id, so the name (copied into audit payloads
+// as token_name) carries no personal data.
+const sessionTokenName = "session"
 
 // Actor is who performs an admin action: an admin token over the API, or
 // the CLI (TokenID nil, TokenName "cli").
@@ -61,7 +71,19 @@ type Token struct {
 	LastUsedAt *time.Time
 	ExpiresAt  time.Time
 	RevokedAt  *time.Time
+
+	// Kind is KindToken ("lpa_", CLI-made) or KindSession ("lps_", made
+	// by a password login); empty reads as KindToken.
+	Kind string
+	// Sessions only: the signed-in user, and whether that account is
+	// still a server admin and not disabled (checked on every call).
+	UserID     *uuid.UUID
+	Username   string
+	UserActive bool
 }
+
+// IsSession reports whether t is an admin session ("lps_").
+func (t Token) IsSession() bool { return t.Kind == KindSession }
 
 // State is "active", "expired" or "revoked".
 func (t Token) State(now time.Time) string {
@@ -87,6 +109,7 @@ type User struct {
 	Vaults       int        // memberships, owned included
 	LastLoginAt  *time.Time // newest auth.login audit row
 	LastSeenAt   *time.Time // newest session use
+	ServerAdmin  bool       // may sign in to the admin panel
 }
 
 // State is "disabled", "locked" or "active" (disabled wins).
@@ -186,6 +209,8 @@ func (i Invite) State(now time.Time) string {
 type UserFilter struct {
 	Query string
 	State string
+	// ServerAdmin keeps only the accounts flagged server_admin.
+	ServerAdmin bool
 }
 
 // VaultFilter narrows the vault list: UserID keeps the vaults the user owns
@@ -279,6 +304,11 @@ type Store interface {
 	SetPassword(ctx context.Context, id uuid.UUID, hash string, e domain.AuditEntry) error
 	SetDisabled(ctx context.Context, id uuid.UUID, disabled bool, e domain.AuditEntry) error
 	Unlock(ctx context.Context, id uuid.UUID, e domain.AuditEntry) error
+	// SetServerAdmin sets the flag with its audit row in one transaction.
+	// Clearing it refuses with ErrLastServerAdmin when no other active
+	// (not disabled) server admin would remain, and revokes the user's
+	// admin sessions. Idempotent.
+	SetServerAdmin(ctx context.Context, id uuid.UUID, enabled bool, e domain.AuditEntry) error
 
 	ListSessions(ctx context.Context, userID *uuid.UUID, after *Cursor, limit int) ([]Session, bool, error)
 	GetSession(ctx context.Context, id string) (Session, error)
@@ -318,6 +348,15 @@ type FederationRevoker interface {
 	RevokeFederation(ctx context.Context, vaultID, fedID, actor uuid.UUID, ip, ua string) error
 }
 
+// PasswordLogin verifies a panel password login with the public login's
+// rules (*auth.Service.AdminLogin): bcrypt, per-IP and per-user rate
+// limits, persistent lockout, failed-login accounting, server_admin
+// required. Every refusal is domain.ErrInvalidCredentials (or
+// domain.ErrRateLimited), already audited as admin.login_failed.
+type PasswordLogin interface {
+	AdminLogin(ctx context.Context, in auth.LoginInput) (domain.User, error)
+}
+
 // PasswordHasher hashes with the server's bcrypt cost (*auth.Service).
 type PasswordHasher interface {
 	HashPassword(plaintext string) (string, error)
@@ -338,6 +377,7 @@ type Service struct {
 	Vaults      VaultDeleter
 	Federations FederationRevoker
 	Hasher      PasswordHasher
+	Login       PasswordLogin // nil: POST /admin/v1/session is refused
 	Live        Live
 	Log         zerolog.Logger
 
@@ -381,8 +421,12 @@ func cleanDetail(err error) string {
 // Authenticate resolves a raw bearer token. Every failure (malformed,
 // unknown, expired, revoked) is domain.ErrUnauthorized, so callers answer
 // them identically. Other errors are infrastructure failures.
+//
+// An admin session ("lps_") also needs its user to still be a server admin
+// and not disabled: revoking the flag or disabling the account ends the
+// session at its next call.
 func (s *Service) Authenticate(ctx context.Context, raw string) (Token, error) {
-	digest, err := ParseToken(raw)
+	digest, kind, err := ParseCredential(raw)
 	if err != nil {
 		return Token{}, domain.ErrUnauthorized
 	}
@@ -392,6 +436,12 @@ func (s *Service) Authenticate(ctx context.Context, raw string) (Token, error) {
 	}
 	if err != nil {
 		return Token{}, err
+	}
+	if t.Kind == "" {
+		t.Kind = KindToken
+	}
+	if t.Kind != kind || (t.IsSession() && !t.UserActive) {
+		return Token{}, domain.ErrUnauthorized
 	}
 	now := s.clock()
 	if t.State(now) != "active" {
@@ -467,6 +517,84 @@ func (s *Service) RevokeToken(ctx context.Context, a Actor, id uuid.UUID) error 
 		return err
 	}
 	s.logAction(a, ActionTokenRevoke).Str("target_token_id", id.String()).Msg("admin action")
+	return nil
+}
+
+// ---- admin sessions (password login) --------------------------------------------
+
+// ErrLastServerAdmin refuses to clear the flag of the last active server
+// admin (409 conflict, detail "last_server_admin").
+var ErrLastServerAdmin = fmt.Errorf("%w: last_server_admin", domain.ErrConflict)
+
+// errSessionLoginOff: the server was built without a PasswordLogin.
+var errSessionLoginOff = errors.New("admin: password login not configured")
+
+// CreateSession signs a server admin in with username and password and
+// mints an admin session token ("lps_…", SessionTTL, shown once). The
+// credential checks, rate limits, lockout and failure audit are the
+// PasswordLogin's; every refusal is domain.ErrInvalidCredentials or
+// domain.ErrRateLimited, never a hint that the user exists. ip and ua are
+// the panel user's, as the panel forwards them.
+func (s *Service) CreateSession(ctx context.Context, ip, ua, username, password string) (string, Token, error) {
+	if s.Login == nil {
+		return "", Token{}, errSessionLoginOff
+	}
+	u, err := s.Login.AdminLogin(ctx, auth.LoginInput{Username: username, Password: password, IP: ip, UserAgent: ua})
+	if err != nil {
+		return "", Token{}, err
+	}
+	raw, digest := NewSessionToken()
+	now := s.clock().UTC()
+	uid := u.ID
+	t := Token{
+		ID: uuid.New(), Name: sessionTokenName, Kind: KindSession,
+		CreatedAt: now, ExpiresAt: now.Add(SessionTTL),
+		UserID: &uid, Username: u.Username, UserActive: true,
+	}
+	a := Actor{TokenID: &t.ID, TokenName: t.Name, IP: ip}
+	e := s.entry(a, ActionSessionCreate, &uid, nil, map[string]any{
+		"username":   u.Username,
+		"expires_at": t.ExpiresAt.Format(time.RFC3339),
+	})
+	if ua != "" {
+		e.UserAgent = &ua
+	}
+	if err := s.Store.CreateToken(ctx, t, digest, e); err != nil {
+		return "", Token{}, err
+	}
+	s.logAction(a, ActionSessionCreate).Str("user_id", uid.String()).Msg("admin action")
+	return raw, t, nil
+}
+
+// EndSession revokes the caller's own admin session (panel "Sair").
+// Only sessions sign out this way: an "lpa_" token is revoked by id
+// (DELETE /tokens/{id}) or in the terminal.
+func (s *Service) EndSession(ctx context.Context, a Actor, t Token) error {
+	if !t.IsSession() {
+		return fmt.Errorf("%w: not an admin session (revoke tokens by id)", domain.ErrConflict)
+	}
+	e := s.entry(a, ActionSessionLogout, t.UserID, nil, map[string]any{"username": t.Username})
+	if err := s.Store.RevokeToken(ctx, t.ID, s.clock().UTC(), e); err != nil {
+		return err
+	}
+	s.logAction(a, ActionSessionLogout).Msg("admin action")
+	return nil
+}
+
+// SetServerAdmin grants or removes the server_admin flag. Removing it from
+// the last active server admin is refused (ErrLastServerAdmin), whoever
+// asks, so the panel's password login always keeps one account; removing
+// it revokes that user's admin sessions. Idempotent and audited.
+func (s *Service) SetServerAdmin(ctx context.Context, a Actor, id uuid.UUID, enabled bool) error {
+	u, err := s.Store.GetUser(ctx, id)
+	if err != nil {
+		return err
+	}
+	e := s.entry(a, ActionUserServerAdmin, &u.ID, nil, map[string]any{"username": u.Username, "enabled": enabled})
+	if err := s.Store.SetServerAdmin(ctx, id, enabled, e); err != nil {
+		return err
+	}
+	s.logAction(a, ActionUserServerAdmin).Str("user_id", id.String()).Bool("enabled", enabled).Msg("admin action")
 	return nil
 }
 
