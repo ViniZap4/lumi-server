@@ -24,6 +24,8 @@ func (h *Handlers) Register(app fiber.Router) {
 	app.Post("/api/auth/register", h.RegisterHandler)
 	app.Post("/api/auth/login", h.Login)
 	app.Post("/api/auth/logout", Required(h.svc), h.Logout)
+	app.Post("/api/auth/device-links", Required(h.svc), h.IssueDeviceLink)
+	app.Post("/api/auth/device-links/redeem", h.RedeemDeviceLink)
 
 	app.Get("/api/users/me", Required(h.svc), h.Me)
 	app.Patch("/api/users/me", Required(h.svc), h.UpdateMe)
@@ -43,6 +45,26 @@ type registerReq struct {
 type loginReq struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
+}
+
+type logoutReq struct {
+	Scope string `json:"scope"`
+}
+
+type issueLinkReq struct {
+	Challenge string `json:"challenge"`
+	Label     string `json:"label"`
+}
+
+type issueLinkResp struct {
+	Code      string `json:"code"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+type redeemLinkReq struct {
+	Code     string `json:"code"`
+	Verifier string `json:"verifier"`
+	Label    string `json:"label"`
 }
 
 type updateMeReq struct {
@@ -137,15 +159,82 @@ func (h *Handlers) Login(c *fiber.Ctx) error {
 	})
 }
 
+// Logout ends the caller's session. With {"scope":"device"} it also ends
+// every session linked to it by a device link (SPEC-LIVROS §8.1).
 func (h *Handlers) Logout(c *fiber.Ctx) error {
 	sess := SessionFromCtx(c)
 	if sess == nil {
 		return errorJSON(c, fiber.StatusUnauthorized, "unauthorized", "")
 	}
+	var body logoutReq
+	if len(c.Body()) > 0 {
+		if err := c.BodyParser(&body); err != nil {
+			return errorJSON(c, fiber.StatusBadRequest, "validation_failed", "invalid json body")
+		}
+	}
+	switch body.Scope {
+	case "", "session":
+	case "device":
+		if _, err := h.svc.LogoutDevice(c.UserContext(), sess.Token); err != nil {
+			return mapServiceErr(c, err)
+		}
+		return c.Status(fiber.StatusNoContent).Send(nil)
+	default:
+		return errorJSON(c, fiber.StatusBadRequest, "validation_failed", "scope must be session or device")
+	}
 	if err := h.svc.Logout(c.UserContext(), sess.Token); err != nil {
 		return mapServiceErr(c, err)
 	}
 	return c.Status(fiber.StatusNoContent).Send(nil)
+}
+
+// IssueDeviceLink mints a single-use code for another client of the same
+// user on this machine (SPEC-LIVROS §8.4).
+func (h *Handlers) IssueDeviceLink(c *fiber.Ctx) error {
+	sess := SessionFromCtx(c)
+	if sess == nil {
+		return errorJSON(c, fiber.StatusUnauthorized, "unauthorized", "")
+	}
+	var body issueLinkReq
+	if err := c.BodyParser(&body); err != nil {
+		return errorJSON(c, fiber.StatusBadRequest, "validation_failed", "invalid json body")
+	}
+	code, exp, err := h.svc.IssueDeviceLink(c.UserContext(), *sess, body.Challenge, body.Label)
+	if err != nil {
+		return mapServiceErr(c, err)
+	}
+	c.Set(fiber.HeaderCacheControl, "no-store")
+	return c.Status(fiber.StatusCreated).JSON(issueLinkResp{
+		Code:      code,
+		ExpiresAt: exp.UTC().Format("2006-01-02T15:04:05Z07:00"),
+	})
+}
+
+// RedeemDeviceLink trades a code + PKCE verifier for a new session.
+func (h *Handlers) RedeemDeviceLink(c *fiber.Ctx) error {
+	var body redeemLinkReq
+	if err := c.BodyParser(&body); err != nil {
+		return errorJSON(c, fiber.StatusBadRequest, "validation_failed", "invalid json body")
+	}
+	sess, err := h.svc.RedeemDeviceLink(c.UserContext(), body.Code, body.Verifier, body.Label,
+		c.IP(), c.Get(fiber.HeaderUserAgent))
+	if err != nil {
+		return mapServiceErr(c, err)
+	}
+	user, err := h.svc.users.GetByID(c.UserContext(), sess.UserID)
+	if err != nil {
+		return mapServiceErr(c, err)
+	}
+	c.Set(fiber.HeaderCacheControl, "no-store")
+	return c.Status(fiber.StatusOK).JSON(sessionResp{
+		Token:     sess.Token,
+		ExpiresAt: sess.ExpiresAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+		User: userDTO{
+			ID:          user.ID.String(),
+			Username:    user.Username,
+			DisplayName: user.DisplayName,
+		},
+	})
 }
 
 func (h *Handlers) Me(c *fiber.Ctx) error {
@@ -200,6 +289,10 @@ func (h *Handlers) ChangePassword(c *fiber.Ctx) error {
 
 func mapServiceErr(c *fiber.Ctx, err error) error {
 	switch {
+	case errors.Is(err, ErrInvalidLink):
+		return errorJSON(c, fiber.StatusUnauthorized, "invalid_link", "")
+	case errors.Is(err, ErrDeviceLinksDisabled):
+		return errorJSON(c, fiber.StatusNotFound, "not_found", "device links are disabled")
 	case errors.Is(err, domain.ErrValidation):
 		return errorJSON(c, fiber.StatusBadRequest, "validation_failed", err.Error())
 	case errors.Is(err, domain.ErrConsentRequired):

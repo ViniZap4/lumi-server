@@ -490,6 +490,8 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("auth service: %w", err)
 	}
+	// Device links (SPEC-LIVROS §8.4): app ↔ TUI sign-in on the same machine.
+	authSvc.SetDeviceLinkStore(pg.NewDeviceLinkStore(pool))
 
 	// Bootstrap admin if env supplies credentials and DB is empty.
 	if err := auth.Bootstrap(ctx, authSvc, userStore, auth.BootstrapConfig{
