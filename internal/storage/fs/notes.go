@@ -27,6 +27,9 @@ func (m *Manager) NotePath(slug, relativePath string) (string, error) {
 	return full, nil
 }
 
+// WriteNote writes a note atomically. Markdown notes get frontmatter
+// rendered above body; canvas files (".canvas", SPEC-PARTE2 §6) have no
+// frontmatter, so frontmatter is ignored and body is written verbatim.
 func (m *Manager) WriteNote(slug, relativePath string, frontmatter map[string]any, body []byte) error {
 	full, err := m.NotePath(slug, relativePath)
 	if err != nil {
@@ -35,9 +38,11 @@ func (m *Manager) WriteNote(slug, relativePath string, frontmatter map[string]an
 	if err := os.MkdirAll(filepath.Dir(full), noteDirPerm); err != nil {
 		return fmt.Errorf("storage/fs: ensure note dir: %w", err)
 	}
-	data, err := WriteFrontmatter(frontmatter, body)
-	if err != nil {
-		return err
+	data := body
+	if !domain.IsCanvasPath(relativePath) {
+		if data, err = WriteFrontmatter(frontmatter, body); err != nil {
+			return err
+		}
 	}
 	if err := AtomicWrite(full, data, noteFilePerm); err != nil {
 		return fmt.Errorf("storage/fs: write note: %w", err)
@@ -45,6 +50,8 @@ func (m *Manager) WriteNote(slug, relativePath string, frontmatter map[string]an
 	return nil
 }
 
+// ReadNote returns a note's frontmatter and body. A canvas file has no
+// frontmatter: it comes back whole as the body with an empty map.
 func (m *Manager) ReadNote(slug, relativePath string) (map[string]any, []byte, error) {
 	full, err := m.NotePath(slug, relativePath)
 	if err != nil {
@@ -56,6 +63,9 @@ func (m *Manager) ReadNote(slug, relativePath string) (map[string]any, []byte, e
 			return nil, nil, fmt.Errorf("%w: note %q in vault %q", domain.ErrNotFound, relativePath, slug)
 		}
 		return nil, nil, fmt.Errorf("storage/fs: read note: %w", err)
+	}
+	if domain.IsCanvasPath(relativePath) {
+		return map[string]any{}, data, nil
 	}
 	front, body, err := ParseFrontmatter(data)
 	if err != nil {

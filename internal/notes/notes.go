@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -283,6 +284,9 @@ type CreateInput struct {
 	Title string
 	Body  string
 	Tags  []string
+	// Kind is domain.NoteKindMarkdown (default when empty) or
+	// domain.NoteKindCanvas.
+	Kind  string
 	Actor uuid.UUID
 	IP    string
 	UA    string
@@ -302,15 +306,46 @@ type UpdateInput struct {
 // ---- Service: Create -------------------------------------------------------
 
 // Create slugifies Title into a unique note ID inside the vault, writes the
-// markdown file with frontmatter, mirrors metadata to Postgres, and audits.
+// file (markdown with frontmatter, or a raw canvas), mirrors metadata to
+// Postgres, and audits.
 //
-// Conflict policy: if the derived ID is already taken, an integer suffix is
-// appended (`hello`, `hello-2`, `hello-3`, …) until a free slot is found.
-// Phase 2.1 limit: 50 attempts before bailing with ErrConflict.
+// ID rule (docs/CRDT-CLIENT-PROTOCOL.md §13): a markdown note's id is the
+// slug ([a-z0-9-]) and its path "<id>.md"; a canvas's id is
+// "<slug>.canvas" and its path the same. Slugs never contain a dot, so
+// the two id spaces are disjoint: "a.md" and "a.canvas" are the distinct
+// ids "a" and "a.canvas". Ids never change afterwards (moves keep them).
+//
+// Conflict policy: if the derived ID (or its path) is already taken, an
+// integer suffix is appended to the slug (`hello`, `hello-2`, `hello-3`,
+// …) until a free slot is found. Limit: 50 attempts before ErrConflict.
 func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput) (domain.Note, error) {
 	title := strings.TrimSpace(in.Title)
 	if title == "" {
 		return domain.Note{}, fmt.Errorf("%w: title is required", domain.ErrValidation)
+	}
+	kind := in.Kind
+	if kind == "" {
+		kind = domain.NoteKindMarkdown
+	}
+	switch kind {
+	case domain.NoteKindMarkdown:
+	case domain.NoteKindCanvas:
+		if len(in.Tags) > 0 {
+			return domain.Note{}, fmt.Errorf("%w: a canvas has no frontmatter, so no tags", domain.ErrValidation)
+		}
+		if strings.TrimSpace(in.Body) == "" {
+			in.Body = EmptyCanvas
+		}
+		// Only the create is checked: live edits may be mid-way through
+		// a JSON change, so later writes are not (SPEC-PARTE2 §6).
+		if !json.Valid([]byte(in.Body)) {
+			return domain.Note{}, fmt.Errorf("%w: canvas body must be valid JSON", domain.ErrValidation)
+		}
+	default:
+		return domain.Note{}, fmt.Errorf("%w: kind must be markdown or canvas", domain.ErrValidation)
+	}
+	if err := validateBody(in.Body); err != nil {
+		return domain.Note{}, err
 	}
 	v, err := s.vaults.GetByID(ctx, vaultID)
 	if err != nil {
@@ -318,11 +353,15 @@ func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput)
 	}
 
 	base := slugifyTitle(title)
-	id, err := s.allocateNoteID(ctx, vaultID, base)
+	id, relPath, err := s.allocateNoteID(ctx, vaultID, base, kind)
 	if err != nil {
 		return domain.Note{}, err
 	}
-	relPath := id + ".md"
+	if kind == domain.NoteKindCanvas {
+		// No frontmatter: the title is the file name, so a client that
+		// only sees the file derives the same one.
+		title = domain.NoteStem(relPath)
+	}
 	now := s.now().UTC()
 
 	front := map[string]any{
@@ -395,21 +434,49 @@ func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput)
 	return note, nil
 }
 
-func (s *Service) allocateNoteID(ctx context.Context, vaultID uuid.UUID, base string) (string, error) {
+// EmptyCanvas is the body of a canvas created without one.
+const EmptyCanvas = `{"nodes":[],"edges":[]}` + "\n"
+
+// validateBody applies the limits shared by every note kind: valid UTF-8
+// and at most domain.MaxNoteBodyBytes.
+func validateBody(body string) error {
+	if len(body) > domain.MaxNoteBodyBytes {
+		return fmt.Errorf("%w: body larger than %d bytes", domain.ErrValidation, domain.MaxNoteBodyBytes)
+	}
+	if !utf8.ValidString(body) {
+		return fmt.Errorf("%w: body is not valid UTF-8", domain.ErrValidation)
+	}
+	return nil
+}
+
+// allocateNoteID picks the first free id of the kind's id rule (see
+// Create) whose path is also free: a note moved onto "hello.md" keeps
+// its own id, so a free id "hello" does not imply a free path.
+func (s *Service) allocateNoteID(ctx context.Context, vaultID uuid.UUID, base, kind string) (id, relPath string, err error) {
 	const maxAttempts = 50
 	for i := 0; i < maxAttempts; i++ {
-		candidate := base
+		stem := base
 		if i > 0 {
-			candidate = fmt.Sprintf("%s-%d", base, i+1)
+			stem = fmt.Sprintf("%s-%d", base, i+1)
 		}
-		if _, err := s.notes.Get(ctx, vaultID, candidate); err != nil {
-			if errors.Is(err, domain.ErrNotFound) {
-				return candidate, nil
-			}
-			return "", err
+		id, relPath = stem, stem+domain.NoteExtMarkdown
+		if kind == domain.NoteKindCanvas {
+			id = stem + domain.NoteExtCanvas
+			relPath = id
 		}
+		if _, err := s.notes.Get(ctx, vaultID, id); err == nil {
+			continue
+		} else if !errors.Is(err, domain.ErrNotFound) {
+			return "", "", err
+		}
+		if _, err := s.notes.GetByPath(ctx, vaultID, relPath); err == nil {
+			continue
+		} else if !errors.Is(err, domain.ErrNotFound) {
+			return "", "", err
+		}
+		return id, relPath, nil
 	}
-	return "", fmt.Errorf("%w: too many ID collisions for %q", domain.ErrConflict, base)
+	return "", "", fmt.Errorf("%w: too many ID collisions for %q", domain.ErrConflict, base)
 }
 
 // ---- Service: Read ---------------------------------------------------------
@@ -459,11 +526,24 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 		return domain.Note{}, err
 	}
 
+	canvas := domain.IsCanvasPath(n.Path)
+	if canvas && (in.Title != nil || in.Tags != nil) {
+		return domain.Note{}, fmt.Errorf("%w: a canvas has no frontmatter: its title is its file name (move it to rename)", domain.ErrValidation)
+	}
+	if in.Body != nil {
+		if err := validateBody(*in.Body); err != nil {
+			return domain.Note{}, err
+		}
+	}
+
 	moved := false
 	newPath := n.Path
 	if in.Path != nil {
 		cleaned, err := validateNoteRelPath(*in.Path)
 		if err != nil {
+			return domain.Note{}, err
+		}
+		if err := sameKind(n.Path, cleaned); err != nil {
 			return domain.Note{}, err
 		}
 		if cleaned != n.Path {
@@ -494,6 +574,9 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 	edited := false
 	now := s.now().UTC()
 	newTitle := n.Title
+	if canvas {
+		newTitle = domain.NoteStem(newPath)
+	}
 	if in.Title != nil {
 		t := strings.TrimSpace(*in.Title)
 		if t == "" {
@@ -542,6 +625,7 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 		Title:     newTitle,
 		CreatedAt: n.CreatedAt,
 		UpdatedAt: now,
+		CRDTEpoch: n.CRDTEpoch,
 	}
 	if !edited && !moved {
 		return n, nil
@@ -571,10 +655,20 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 	return updated, nil
 }
 
+// sameKind refuses a move that would change a note's kind: a markdown
+// file renamed to .canvas (or back) would be read with the other format.
+func sameKind(oldPath, newPath string) error {
+	if domain.NoteKindOf(oldPath) != domain.NoteKindOf(newPath) {
+		return fmt.Errorf("%w: a move cannot change the note kind (keep the %s extension)", domain.ErrValidation, domain.NoteExt(domain.NoteKindOf(oldPath)))
+	}
+	return nil
+}
+
 // validateNoteRelPath normalises (trim + path.Clean) and then applies
 // domain.ValidateNotePath: rejects absolute paths, parent traversals,
-// hidden/dot segments, and any path that does not end in `.md`. fs.SafeJoin enforces the same plus
-// symlink-escape — this check exists to fail early with a friendlier error.
+// hidden/dot segments, and any path that does not end in `.md` or
+// `.canvas`. fs.SafeJoin enforces the same plus symlink-escape — this
+// check exists to fail early with a friendlier error.
 func validateNoteRelPath(raw string) (string, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
@@ -583,9 +677,6 @@ func validateNoteRelPath(raw string) (string, error) {
 	cleaned := path.Clean(s)
 	if cleaned == "." || strings.HasPrefix(cleaned, "/") || strings.HasPrefix(cleaned, "..") {
 		return "", fmt.Errorf("%w: path %q escapes vault", domain.ErrValidation, raw)
-	}
-	if !strings.HasSuffix(cleaned, ".md") {
-		return "", fmt.Errorf("%w: path must end with .md", domain.ErrValidation)
 	}
 	// Canonical-form policy shared with the federation relay: no hidden or
 	// dot segments (keeps writes out of .lumi/), no backslashes, bounded.
@@ -1123,6 +1214,8 @@ type noteDTO struct {
 	// CRDTEpoch: opaque CRDT lineage id (protocol §12); compare for
 	// equality only.
 	CRDTEpoch string `json:"crdt_epoch,omitempty"`
+	// Kind is "markdown" or "canvas", derived from the path extension.
+	Kind string `json:"kind"`
 }
 
 func toDTO(n domain.Note) noteDTO {
@@ -1134,6 +1227,7 @@ func toDTO(n domain.Note) noteDTO {
 		CreatedAt: n.CreatedAt.UTC().Format(time.RFC3339),
 		UpdatedAt: n.UpdatedAt.UTC().Format(time.RFC3339),
 		CRDTEpoch: n.CRDTEpoch,
+		Kind:      domain.NoteKindOf(n.Path),
 	}
 }
 
@@ -1208,6 +1302,7 @@ type createReq struct {
 	Title string   `json:"title"`
 	Body  string   `json:"body"`
 	Tags  []string `json:"tags,omitempty"`
+	Kind  string   `json:"kind,omitempty"` // "markdown" (default) or "canvas"
 }
 
 // create — POST /api/vaults/:vault/notes
@@ -1225,6 +1320,7 @@ func (h *Handlers) create(c *fiber.Ctx) error {
 		Title: req.Title,
 		Body:  req.Body,
 		Tags:  req.Tags,
+		Kind:  req.Kind,
 		Actor: uid,
 		IP:    c.IP(),
 		UA:    string(c.Request().Header.UserAgent()),
@@ -1275,6 +1371,7 @@ func (h *Handlers) getContent(c *fiber.Ctx) error {
 		"id":          n.ID,
 		"vault_id":    n.VaultID.String(),
 		"path":        n.Path,
+		"kind":        domain.NoteKindOf(n.Path),
 		"frontmatter": yamlToJSON(front),
 		"body":        string(body),
 	})

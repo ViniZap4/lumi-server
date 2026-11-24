@@ -48,6 +48,9 @@ func (s *Service) MoveFromFederation(ctx context.Context, vaultID uuid.UUID, id,
 	if err != nil {
 		return err
 	}
+	if err := sameKind(n.Path, cleaned); err != nil {
+		return err
+	}
 	v, err := s.vaults.GetByID(ctx, vaultID)
 	if err != nil {
 		return err
@@ -55,6 +58,9 @@ func (s *Service) MoveFromFederation(ctx context.Context, vaultID uuid.UUID, id,
 	title := strings.TrimSpace(newTitle)
 	if title == "" {
 		title = n.Title
+	}
+	if domain.IsCanvasPath(cleaned) {
+		title = domain.NoteStem(cleaned)
 	}
 	if cleaned == n.Path && title == n.Title {
 		return nil

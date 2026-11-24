@@ -298,3 +298,22 @@ func TestReconcileDirSurfacesExistingFiles(t *testing.T) {
 		t.Fatalf("relative path = %q", ev.RelativePath)
 	}
 }
+
+func TestCanvasFileFiresEvent(t *testing.T) {
+	_, _, root, rec, teardown := newTestManager(t, WithDebounce(20*time.Millisecond))
+	defer teardown()
+
+	p := filepath.Join(root, "vault", "board.canvas")
+	if err := os.WriteFile(p, []byte(`{"nodes":[],"edges":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ev, ok := rec.waitForEvent(time.Second)
+	if !ok || ev.RelativePath != "board.canvas" || ev.VaultSlug != "vault" {
+		t.Fatalf("event = %+v ok=%v", ev, ok)
+	}
+	for _, name := range []string{".board.canvas.swp", "board.canvas~", "board.canvas.tmp"} {
+		if isInterestingPath(filepath.Join(root, "vault", name)) {
+			t.Errorf("%s should be ignored", name)
+		}
+	}
+}

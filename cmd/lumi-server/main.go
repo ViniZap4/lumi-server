@@ -21,6 +21,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/recover"
@@ -834,6 +835,12 @@ func buildFSHandler(
 		_, body, err := fsMgr.ReadNote(v.Slug, n.Path)
 		if err != nil {
 			log.Warn().Err(err).Str("path", n.Path).Msg("read note failed")
+			return
+		}
+		// Same limits as the API: a binary or oversized file must not
+		// enter the CRDT (a canvas is raw JSON text, never parsed here).
+		if len(body) > domain.MaxNoteBodyBytes || !utf8.Valid(body) {
+			log.Warn().Str("path", n.Path).Int("bytes", len(body)).Msg("external edit skipped: not UTF-8 or too large")
 			return
 		}
 

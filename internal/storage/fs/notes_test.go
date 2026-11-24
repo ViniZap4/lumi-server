@@ -196,3 +196,29 @@ func TestManager_RemoveVaultDir_RefusesToDeleteRoot(t *testing.T) {
 		// Either ErrPathEscape (root resolve) or ErrValidation is fine.
 	}
 }
+
+// A canvas has no frontmatter: WriteNote ignores the map and ReadNote
+// returns the whole file as the body, even one that starts with "---".
+func TestManager_CanvasIsRaw(t *testing.T) {
+	mgr, root := newTestManager(t)
+	const text = "---\nnot: frontmatter\n---\n{\"nodes\":[]}"
+	if err := mgr.WriteNote("vault", "b/board.canvas", map[string]any{"title": "x"}, []byte(text)); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "vault", "b", "board.canvas"))
+	if err != nil || string(raw) != text {
+		t.Fatalf("file = %q err=%v", raw, err)
+	}
+	front, body, err := mgr.ReadNote("vault", "b/board.canvas")
+	if err != nil || len(front) != 0 || string(body) != text {
+		t.Fatalf("read front=%v body=%q err=%v", front, body, err)
+	}
+	// Markdown keeps its frontmatter handling.
+	if err := mgr.WriteNote("vault", "n.md", map[string]any{"title": "x"}, []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	front, body, err = mgr.ReadNote("vault", "n.md")
+	if err != nil || front["title"] != "x" || string(body) != "body" {
+		t.Fatalf("markdown front=%v body=%q err=%v", front, body, err)
+	}
+}

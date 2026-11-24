@@ -23,7 +23,9 @@
 //
 // # Scope of this slice
 //
-//   - WRITE events on `*.md` files inside a vault → dispatched.
+//   - WRITE events on `*.md` and `*.canvas` files inside a vault →
+//     dispatched (a canvas is diff-merged the same way: the CRDT text is
+//     the whole JSON file).
 //   - CREATE of new directories → automatically watched + reconciled
 //     (synthesised WRITE for files already present, to close the
 //     classic fsnotify race).
@@ -393,7 +395,7 @@ func (m *Manager) dispatch(ev fsnotify.Event) {
 	m.debounceMu.Unlock()
 }
 
-// reconcileDir synthesises Write events for every existing `.md` file
+// reconcileDir synthesises Write events for every existing note file
 // inside dir so the caller sees them as fresh writes. Closes the
 // fsnotify race where a directory is created and populated before our
 // Add() lands.
@@ -460,9 +462,9 @@ func (m *Manager) fire(absPath string) {
 
 // ---- Helpers ---------------------------------------------------------------
 
-// isInterestingPath returns true iff absPath looks like a real
-// markdown file under a vault. Editor temp files, dotfiles, and
-// non-`.md` extensions are excluded.
+// isInterestingPath returns true iff absPath looks like a real note
+// (markdown or canvas) under a vault. Editor temp files, dotfiles, and
+// extensions other than `.md` and `.canvas` are excluded.
 func isInterestingPath(absPath string) bool {
 	base := filepath.Base(absPath)
 	if base == "" {
@@ -475,7 +477,7 @@ func isInterestingPath(absPath string) bool {
 	if base == "4913" || strings.HasSuffix(base, "~") || strings.HasSuffix(base, ".swp") || strings.HasSuffix(base, ".swo") || strings.HasSuffix(base, ".tmp") {
 		return false
 	}
-	if !strings.HasSuffix(strings.ToLower(base), ".md") {
+	if lower := strings.ToLower(base); !strings.HasSuffix(lower, ".md") && !strings.HasSuffix(lower, ".canvas") {
 		return false
 	}
 	// Anything under a `.lumi/` directory inside the path is metadata.
