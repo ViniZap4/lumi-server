@@ -10,6 +10,7 @@
 package notes
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -355,7 +356,7 @@ func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput)
 		if len(in.Tags) > 0 {
 			return domain.Note{}, fmt.Errorf("%w: a canvas has no frontmatter, so no tags", domain.ErrValidation)
 		}
-		if strings.TrimSpace(in.Body) == "" {
+		if strings.TrimSpace(in.Body) == "" || isEmptyCanvasJSON(in.Body) {
 			in.Body = EmptyCanvas
 		}
 		// Only the create is checked: live edits may be mid-way through
@@ -456,8 +457,22 @@ func (s *Service) Create(ctx context.Context, vaultID uuid.UUID, in CreateInput)
 	return note, nil
 }
 
-// EmptyCanvas is the body of a canvas created without one.
-const EmptyCanvas = `{"nodes":[],"edges":[]}` + "\n"
+// EmptyCanvas is the body of a canvas created empty: Obsidian's
+// multi-line layout, so the first card two clients add concurrently is a
+// small line-hunk insert that merges into valid JSON (on the single-line
+// form both inserts land inside the same "[]" and the merge breaks the
+// JSON). Existing canvases are never rewritten.
+const EmptyCanvas = "{\n\t\"nodes\":[],\n\t\"edges\":[]\n}"
+
+// isEmptyCanvasJSON reports whether body is exactly an empty canvas
+// ({"nodes":[],"edges":[]} in any whitespace layout).
+func isEmptyCanvasJSON(body string) bool {
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, []byte(body)); err != nil {
+		return false
+	}
+	return buf.String() == `{"nodes":[],"edges":[]}`
+}
 
 // validateBody applies the limits shared by every note kind: valid UTF-8
 // and at most domain.MaxNoteBodyBytes.

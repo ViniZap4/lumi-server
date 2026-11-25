@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ViniZap4/lumi-server/internal/capguard"
+	"github.com/ViniZap4/lumi-server/internal/crdt"
 	"github.com/ViniZap4/lumi-server/internal/domain"
 	"github.com/ViniZap4/lumi-server/internal/wsync"
 )
@@ -66,8 +67,31 @@ func TestCanvas_CreateWritesRawJSONAndDerivesIDAndTitle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if EmptyCanvas != "{\n\t\"nodes\":[],\n\t\"edges\":[]\n}" {
+		t.Fatalf("EmptyCanvas = %q", EmptyCanvas)
+	}
 	if got := f.rawFile(t, e.Path); got != EmptyCanvas {
 		t.Fatalf("empty canvas file = %q", got)
+	}
+	if snap, err := f.svc.GetSnapshot(ctx, f.vault.ID, e.ID); err != nil || snap.Text != EmptyCanvas {
+		t.Fatalf("empty canvas crdt text = %q err=%v", snap.Text, err)
+	}
+	// A client-sent single-line empty canvas gets the multi-line layout.
+	c, err := f.svc.Create(ctx, f.vault.ID, CreateInput{Title: "Compact", Kind: domain.NoteKindCanvas, Body: ` {"nodes": [], "edges": []}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := f.rawFile(t, c.Path); got != EmptyCanvas {
+		t.Fatalf("compact empty canvas file = %q", got)
+	}
+	// A canvas with content is kept byte for byte.
+	const oneCard = `{"nodes":[{"id":"a","type":"text","text":"x","x":0,"y":0,"width":1,"height":1}],"edges":[]}`
+	k, err := f.svc.Create(ctx, f.vault.ID, CreateInput{Title: "Kept", Kind: domain.NoteKindCanvas, Body: oneCard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := f.rawFile(t, k.Path); got != oneCard {
+		t.Fatalf("non-empty canvas rewritten: %q", got)
 	}
 }
 
@@ -326,5 +350,43 @@ func TestCanvas_HTTPKindInCreateListAndChanges(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("changes missing canvas kind: %s", raw)
+	}
+}
+
+// Two concurrent first cards on the multi-line empty canvas land as whole
+// lines of their own (line-hunk inserts that never interleave inside a
+// line and leave "edges" alone). Whether the merged array is valid JSON
+// still depends on the clients' card layout: two bare objects end up
+// without a comma between them.
+func TestCanvas_EmptyLayoutKeepsConcurrentFirstCardsWhole(t *testing.T) {
+	base := crdt.NewDoc()
+	defer base.Close()
+	if _, err := base.ApplyTextDiff(EmptyCanvas, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := base.EncodeStateAsUpdate()
+	edit := func(card, origin string) []byte {
+		d, _ := crdt.LoadDoc(state)
+		defer d.Close()
+		u, err := d.ApplyTextDiff("{\n\t\"nodes\":[\n\t\t"+card+"\n\t],\n\t\"edges\":[]\n}", origin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u
+	}
+	cardA := `{"id":"a","type":"text","text":"A","x":0,"y":0,"width":1,"height":1}`
+	cardB := `{"id":"b","type":"text","text":"B","x":9,"y":9,"width":1,"height":1}`
+	for _, u := range [][]byte{edit(cardA, "alice"), edit(cardB, "bob")} {
+		if err := base.ApplyUpdate(u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	text, _ := base.Text()
+	whole := map[string]bool{}
+	for _, l := range strings.Split(text, "\n") {
+		whole[strings.TrimSpace(l)] = true
+	}
+	if !whole[cardA] || !whole[cardB] || !whole[`"edges":[]`] {
+		t.Fatalf("cards interleaved or edges touched:\n%s", text)
 	}
 }
