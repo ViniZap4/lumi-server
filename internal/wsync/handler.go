@@ -398,13 +398,11 @@ func (h *Handler) issueTicket(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_body"})
 		}
 	}
+	// Anything but an explicit "read" is gated like an edit socket first
+	// (so a mirror answers mirror_read_only before a bad mode is reported).
 	mode := ModeEdit
-	switch req.Mode {
-	case "", ModeEdit:
-	case ModeRead:
+	if req.Mode == ModeRead {
 		mode = ModeRead
-	default:
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "validation_failed", "detail": "mode must be edit or read"})
 	}
 	readOnly := mode == ModeRead
 	if rej := h.authorizeUser(c.UserContext(), user.ID, vaultID, noteID, readOnly); rej != nil {
@@ -419,6 +417,9 @@ func (h *Handler) issueTicket(c *fiber.Ctx) error {
 		default:
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "unavailable"})
 		}
+	}
+	if req.Mode != "" && req.Mode != ModeEdit && req.Mode != ModeRead {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "validation_failed", "detail": "mode must be edit or read"})
 	}
 	var epoch string
 	if h.epochOf != nil {

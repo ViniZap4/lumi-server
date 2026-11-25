@@ -84,8 +84,12 @@ func TestTicket_ReadMode(t *testing.T) {
 	if st, _ := env.mintMode(t, "viewer", "n1", ``); st != http.StatusForbidden {
 		t.Fatalf("viewer edit ticket: %d", st)
 	}
-	if st, _ := env.mintMode(t, "viewer", "n1", `{"mode":"write"}`); st != http.StatusBadRequest {
-		t.Fatalf("bad mode: %d", st)
+	// An unknown mode is gated as an edit socket, then refused as invalid.
+	if st, _ := env.mintMode(t, "viewer", "n1", `{"mode":"write"}`); st != http.StatusForbidden {
+		t.Fatalf("viewer, bad mode: %d", st)
+	}
+	if st, _ := env.mintMode(t, "alice", "n1", `{"mode":"write"}`); st != http.StatusBadRequest {
+		t.Fatalf("editor, bad mode: %d", st)
 	}
 	if st, _ := env.mintMode(t, "stranger", "n1", `{"mode":"read"}`); st != http.StatusForbidden {
 		t.Fatalf("stranger read ticket: %d", st)
