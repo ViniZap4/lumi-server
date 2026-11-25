@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -224,6 +225,19 @@ func TestTwoServerMirror(t *testing.T) {
 		return ""
 	})
 
+	// M2: a read-only live socket on the mirror receives home's edits.
+	var live struct {
+		ID string `json:"id"`
+	}
+	aAdmin.mustDo(http.MethodPost, "/api/vaults/"+V+"/notes", map[string]any{"title": "Live", "body": "live\n"}, http.StatusCreated, &live)
+	eventually(t, wait, "live note on B", func() string {
+		if status, c := bAdmin.content(V, live.ID); status != http.StatusOK || c.Body != "live\n" {
+			return fmt.Sprintf("%d %+v", status, c)
+		}
+		return ""
+	})
+	readLive(t, bAdmin, aAdmin, V, live.ID)
+
 	// #6: delete and recreate at home → the mirror follows the new lineage.
 	var oldNote, newNote struct {
 		CRDTEpoch string `json:"crdt_epoch"`
@@ -299,6 +313,13 @@ func TestTwoServerMirror(t *testing.T) {
 			return fmt.Sprintf("status %d", status)
 		}
 		return ""
+	})
+	// The reconnect was an incremental resume (§A7.2), not a full pass.
+	eventually(t, wait, "resume on A", func() string {
+		if a.logContains(`federation: mirror resumed from its home seq`) {
+			return ""
+		}
+		return "no resume logged"
 	})
 	eventually(t, wait, "pending deletes drained on A", func() string {
 		if feds := aAdmin.federations(V); len(feds) != 1 || feds[0].PendingDeletes != 0 || feds[0].LagSeq != 0 {
@@ -401,6 +422,76 @@ func forgeFromMirror(t *testing.T, a, b *server, aAdmin *client, vault, note str
 	for {
 		if _, _, err := conn.ReadMessage(); err != nil {
 			return // home closed the link
+		}
+	}
+}
+
+// readLive opens a read-only live socket (ws-ticket mode=read) on the
+// mirror, checks that a write is refused (4403), and that an edit at home
+// reaches a second read socket live.
+func readLive(t *testing.T, mirror, home *client, vault, note string) {
+	t.Helper()
+	open := func() *fws.Conn {
+		var tk struct {
+			Ticket string `json:"ticket"`
+			Mode   string `json:"mode"`
+		}
+		mirror.mustDo(http.MethodPost, "/api/vaults/"+vault+"/notes/"+note+"/ws-ticket", map[string]string{"mode": "read"}, http.StatusCreated, &tk)
+		if tk.Mode != "read" {
+			t.Fatalf("ticket mode %q", tk.Mode)
+		}
+		wsURL := "ws" + strings.TrimPrefix(mirror.srv.base, "http") + "/api/vaults/" + vault + "/notes/" + note + "/sync?ticket=" + tk.Ticket
+		conn, _, err := (&fws.Dialer{HandshakeTimeout: 5 * time.Second}).Dial(wsURL, nil)
+		if err != nil {
+			t.Fatalf("read socket dial: %v", err)
+		}
+		return conn
+	}
+	// A write on a read socket closes it.
+	conn := open()
+	doc := crdt.NewDoc()
+	upd, _ := doc.ApplyTextDiff("forged by a reader", "evil")
+	doc.Close()
+	_ = conn.WriteMessage(fws.BinaryMessage, wsync.EncodeSyncUpdate(upd))
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for {
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			var ce *fws.CloseError
+			if !errors.As(err, &ce) || ce.Code != wsync.CloseForbidden {
+				t.Fatalf("reader write: %v", err)
+			}
+			break
+		}
+	}
+	conn.Close()
+
+	conn = open()
+	defer conn.Close()
+	// Join empty: ask for the full state (CRDT protocol), never send edits.
+	empty := crdt.NewDoc()
+	sv, _ := empty.StateVectorV1()
+	empty.Close()
+	if err := conn.WriteMessage(fws.BinaryMessage, wsync.EncodeSyncStep1(sv)); err != nil {
+		t.Fatal(err)
+	}
+	marker := fmt.Sprintf("live-%d", time.Now().UnixNano())
+	home.editREST(vault, note, func(s string) string { return s + marker + "\n" })
+	_ = conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+	got := crdt.NewDoc()
+	defer got.Close()
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read socket never saw the home edit: %v", err)
+		}
+		m, err := wsync.DecodeMessage(msg)
+		if err != nil || m.Type != wsync.MessageSync || m.SyncSub == wsync.SyncStep1 {
+			continue
+		}
+		_ = got.ApplyUpdate(m.Body)
+		if text, _ := got.Text(); strings.Contains(text, marker) {
+			return
 		}
 	}
 }

@@ -171,7 +171,7 @@ type server struct {
 	root    string // LUMI_ROOT
 }
 
-func startServer(t *testing.T, name, dbURL string) *server {
+func startServer(t *testing.T, name, dbURL string, extraEnv ...string) *server {
 	t.Helper()
 	port := freePort(t)
 	root := t.TempDir()
@@ -203,6 +203,7 @@ func startServer(t *testing.T, name, dbURL string) *server {
 		"LUMI_FEDERATION_ALLOWED_CIDRS=127.0.0.0/8",
 		"LUMI_TOS_VERSION=", "LUMI_PRIVACY_VERSION=",
 	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
