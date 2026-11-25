@@ -239,6 +239,7 @@ func buildCLIAdmin(ctx context.Context, cfg config, zlog zerolog.Logger, pool *p
 		MigrationsDir: migrationsDir(),
 		Mirrors:       fedSvc,
 		Planner:       mirrorPlanner(cfg.publicBaseURL),
+		Publish:       pg.NewPublishStore(pool),
 	}, nil
 }
 

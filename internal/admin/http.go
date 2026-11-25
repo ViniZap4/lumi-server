@@ -640,6 +640,11 @@ type FederationJSON struct {
 	PromotedAt            *string       `json:"promoted_at"`
 	Violations24h         int64         `json:"violations_24h"`
 	Backfill              *BackfillJSON `json:"backfill"`
+	LastIntegrityAt       *string       `json:"last_integrity_at"`
+	Divergent24h          int64         `json:"divergent_24h"`
+	// Publish is the owner's publish policy of a publish mirror (null
+	// otherwise): {"allowed","scope","index"}.
+	Publish json.RawMessage `json:"publish"`
 }
 
 type BackfillJSON struct {
@@ -664,6 +669,12 @@ func ToFederationJSON(f Federation) FederationJSON {
 	}
 	if f.Backfill != nil {
 		out.Backfill = &BackfillJSON{Active: f.Backfill.Active, Synced: f.Backfill.Synced, Total: f.Backfill.Total}
+	}
+	out.LastIntegrityAt = tsPtr(f.LastIntegrityAt)
+	out.Divergent24h = f.Divergent24h
+	out.Publish = json.RawMessage("null")
+	if len(f.Publish) > 0 && json.Valid(f.Publish) {
+		out.Publish = json.RawMessage(f.Publish)
 	}
 	return out
 }
@@ -1112,7 +1123,10 @@ func (h *HTTP) resyncFederation(c *fiber.Ctx) error {
 		}
 	}
 	if body.NoteID != "" {
-		return errorJSON(c, fiber.StatusBadRequest, "validation", "note_id: single-note rebuild is not supported yet (full resync only)")
+		note := body.NoteID
+		return h.federationOp(func(s *Service, ctx context.Context, a Actor, id uuid.UUID) (Federation, error) {
+			return s.ResyncMirrorNote(ctx, a, id, note)
+		})(c)
 	}
 	return h.federationOp((*Service).ResyncMirror)(c)
 }

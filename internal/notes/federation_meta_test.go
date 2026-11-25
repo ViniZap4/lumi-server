@@ -152,3 +152,56 @@ func TestApplyFrontmatterEdgeCases(t *testing.T) {
 		t.Fatalf("canvas frontmatter: %s %v", fm, err)
 	}
 }
+
+type metaRecorder struct{ ids []string }
+
+func (r *metaRecorder) NoteCreated(uuid.UUID, string, string, string) {}
+func (r *metaRecorder) NoteDeleted(uuid.UUID, string)                 {}
+func (r *metaRecorder) NoteMoved(uuid.UUID, string, string, string)   {}
+func (r *metaRecorder) NoteMetaChanged(_ uuid.UUID, id string)        { r.ids = append(r.ids, id) }
+
+// §A15.1: PATCH {"publish": true|false} toggles the frontmatter flag,
+// replicates it (meta changed) and keeps the body; a canvas refuses it.
+func TestUpdatePublishFlag(t *testing.T) {
+	f := newMetaFixture(t)
+	ctx := context.Background()
+	rec := &metaRecorder{}
+	f.svc.SetFederationNotifier(rec)
+	f.row(t, "post", "post.md")
+	if err := f.mgr.WriteNote("book", "post.md", map[string]any{"id": "post", "title": "Post"}, []byte("body\n")); err != nil {
+		t.Fatal(err)
+	}
+	on, off := true, false
+	if _, err := f.svc.Update(ctx, f.vault, "post", UpdateInput{Publish: &on}); err != nil {
+		t.Fatal(err)
+	}
+	front, body, _ := f.mgr.ReadNote("book", "post.md")
+	if front["publish"] != true || string(body) != "body\n" {
+		t.Fatalf("after publish: %v %q", front, body)
+	}
+	fm, _ := f.svc.FrontmatterForFederation(ctx, f.vault, "post")
+	if string(fm) == "" || !json.Valid(fm) || !containsKey(fm, "publish") {
+		t.Fatalf("replicated frontmatter %s", fm)
+	}
+	if _, err := f.svc.Update(ctx, f.vault, "post", UpdateInput{Publish: &off}); err != nil {
+		t.Fatal(err)
+	}
+	if front, _, _ := f.mgr.ReadNote("book", "post.md"); front["publish"] != nil {
+		t.Fatalf("after unpublish: %v", front)
+	}
+	if len(rec.ids) != 2 {
+		t.Fatalf("meta notifications %v", rec.ids)
+	}
+	f.row(t, "board", "board.canvas")
+	_ = f.mgr.WriteNote("book", "board.canvas", nil, []byte(`{"nodes":[]}`))
+	if _, err := f.svc.Update(ctx, f.vault, "board", UpdateInput{Publish: &on}); err == nil {
+		t.Fatal("canvas accepted a publish flag")
+	}
+}
+
+func containsKey(fm []byte, k string) bool {
+	var m map[string]any
+	_ = json.Unmarshal(fm, &m)
+	_, ok := m[k]
+	return ok
+}

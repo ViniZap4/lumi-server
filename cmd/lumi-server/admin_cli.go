@@ -32,7 +32,7 @@ import (
 // isAdminCommand reports whether args[0] is an admin CLI subcommand.
 func isAdminCommand(cmd string) bool {
 	switch cmd {
-	case "token", "status", "user", "session", "vault", "federation", "audit", "admin", "mirror":
+	case "token", "status", "user", "session", "vault", "federation", "audit", "admin", "mirror", "publish":
 		return true
 	}
 	return false
@@ -65,6 +65,9 @@ const adminUsage = `Administration (docs/ADMIN.md; same rules as the admin API):
   lumi-server mirror resync <id>                  mirror side: forget progress, full pass
   lumi-server mirror pause|resume <id>
   lumi-server mirror promote <vault> --confirm    mirror becomes an independent home (CLI only)
+  lumi-server publish enable <vault> --slug s [--robots noindex|index]   serve a publish mirror at /p/<slug>
+  lumi-server publish disable <vault>
+  lumi-server publish list [--json]               (anonymous endpoints also need LUMI_PUBLISH_ENABLED=true)
   lumi-server audit [--limit 50] [--before id] [--scope all|admin] [--user u] [--vault v] [--json]
 <user> is a username or id; <vault> a slug or id.`
 
@@ -173,7 +176,8 @@ func (e *cliEnv) dispatch(ctx context.Context, args []string) error {
 			"pause": e.federationOp("pause"), "resume": e.federationOp("resume")},
 		"mirror": {"list": e.mirrorList, "status": e.federationStatus, "resync": e.federationOp("resync"),
 			"pause": e.federationOp("pause"), "resume": e.federationOp("resume"), "promote": e.mirrorPromote},
-		"admin": {"list": e.adminList, "grant": e.adminFlag(true), "revoke": e.adminFlag(false)},
+		"admin":   {"list": e.adminList, "grant": e.adminFlag(true), "revoke": e.adminFlag(false)},
+		"publish": {"enable": e.publishEnable, "disable": e.publishDisable, "list": e.publishList},
 	}
 	var fn func(context.Context, *admin.Service, []string) error
 	rest := args[1:]

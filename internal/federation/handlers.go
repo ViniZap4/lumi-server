@@ -134,8 +134,10 @@ type createInviteReq struct {
 	Mode string `json:"mode,omitempty"`
 	// SeverPolicy (mirrors): "keep" (default) or "purge".
 	SeverPolicy string `json:"sever_policy,omitempty"`
-	// Publish is reserved for publish mirrors (M3) and refused for now.
-	Publish any `json:"publish,omitempty"`
+	// Publish makes a publish mirror (M3, §A15): {"allowed": true,
+	// "scope": "flagged"|"all"|"folder:<prefix>", "index": false}. Needs
+	// vault.manage on top of vault.federate.
+	Publish *PublishPolicy `json:"publish,omitempty"`
 }
 
 func (h *Handlers) createInvite(c *fiber.Ctx) error {
@@ -152,9 +154,14 @@ func (h *Handlers) createInvite(c *fiber.Ctx) error {
 		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "invalid_body"})
 	}
 	if req.Publish != nil {
-		return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "validation", "message": "publish mirrors are not supported yet"})
+		// Publishing is an owner decision (LGPD consent): vault.manage
+		// on top of vault.federate.
+		if err := capguard.Require(c, h.resolver, vid, domain.CapVaultManage); err != nil {
+			return nil
+		}
 	}
 	in := CreateInviteInput{
+		Publish:       req.Publish,
 		VaultID:       vid,
 		Actor:         actor,
 		ServerURLHint: req.ServerURLHint,
@@ -336,7 +343,7 @@ func toInviteDTO(inv domain.FederationInvite) fiber.Map {
 		"revoked":         inv.RevokedAt != nil,
 		"mode":            orDefault(inv.Mode, ModeReplica),
 		"sever_policy":    orDefault(inv.SeverPolicy, SeverKeep),
-		"publish":         nil,
+		"publish":         UnmarshalPublish(inv.Publish),
 	}
 }
 
@@ -358,21 +365,27 @@ func toFederationDTO(f domain.Federation, st LinkStats) fiber.Map {
 		"created_at":     f.CreatedAt.UTC().Format(time.RFC3339),
 		"mode":           orDefault(f.Mode, ModeReplica),
 		"sever_policy":   orDefault(f.SeverPolicy, SeverKeep),
-		"publish":        nil,
+		"publish":        UnmarshalPublish(f.Publish),
 		"paused":         f.PausedAt != nil,
 	}
 	if f.Mode == ModeMirror {
 		if f.Role == "home" {
 			out["mirror_acked_seq"] = f.MirrorAckedSeq
+			out["head_seq"] = st.HeadSeq
 			out["lag_seq"] = st.LagSeq
 			out["pending_deletes"] = st.PendingDeletes
 			out["oldest_pending_delete_at"] = nil
 			if st.OldestPendingDeleteAt != nil {
 				out["oldest_pending_delete_at"] = st.OldestPendingDeleteAt.UTC().Format(time.RFC3339)
 			}
+			out["erasure_lagging"] = st.ErasureLagging
 		} else {
 			out["home_seq"] = f.HomeSeq
 			out["promoted"] = f.PromotedAt != nil
+			out["last_integrity_at"] = nil
+			if f.LastIntegrityAt != nil {
+				out["last_integrity_at"] = f.LastIntegrityAt.UTC().Format(time.RFC3339)
+			}
 		}
 	}
 	out["last_contact_at"] = nil

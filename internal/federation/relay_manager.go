@@ -233,12 +233,21 @@ func (m *Manager) connectOnce(ctx context.Context, vaultID uuid.UUID, homeURL st
 	if err != nil {
 		return err
 	}
+	mirror := link.Mode == ModeMirror
+	if mirror {
+		// Tell home our first frame is frameResumeFrom (§A7.2).
+		wsURL += "&resume=1"
+	}
 	conn, err := m.dialer(ctx, wsURL)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 	m.log.Info().Str("home", homeURL).Str("vault", vaultID.String()).Msg("federation: relay link up")
-	sess := m.links.NewSessionWith(ctx, conn, vaultID, homeURL, "follower", SessionOptions{Mode: link.Mode})
+	opts := SessionOptions{Mode: link.Mode, SendResume: mirror, ResumeFrom: link.HomeSeq}
+	if link.LastIntegrityAt != nil {
+		opts.LastIntegrity = *link.LastIntegrityAt
+	}
+	sess := m.links.NewSessionWith(ctx, conn, vaultID, homeURL, "follower", opts)
 	return sess.Run()
 }
 

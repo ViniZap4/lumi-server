@@ -84,10 +84,12 @@ func (h *RelayHandlers) challenge(c *fiber.Ctx) error {
 }
 
 const (
-	relayVaultKey = "federation.vault"
-	relayPeerKey  = "federation.peer"
-	relayProtoKey = "federation.proto"
-	relayModeKey  = "federation.mode"
+	relayVaultKey   = "federation.vault"
+	relayPeerKey    = "federation.peer"
+	relayProtoKey   = "federation.proto"
+	relayModeKey    = "federation.mode"
+	relayResumeKey  = "federation.resume"
+	relayPublishKey = "federation.publish"
 )
 
 // upgradeGuard authenticates the WS upgrade: single-use nonce bound to
@@ -134,6 +136,17 @@ func (h *RelayHandlers) upgradeGuard(c *fiber.Ctx) error {
 		proto = 1
 	}
 	c.Locals(relayProtoKey, proto)
+	// A mirror that opens with frameResumeFrom says so; the opening then
+	// waits for it (§A7.2). Unsigned: lying only delays its own opening.
+	c.Locals(relayResumeKey, mode == ModeMirror && c.Query("resume") == "1")
+	publish := UnmarshalPublish(fed.Publish)
+	if len(fed.Publish) > 0 && (publish == nil || mode != ModeMirror) {
+		// A publish link whose policy cannot be read would otherwise run
+		// as a full mirror: fail closed.
+		h.log.Error().Str("peer", peerURL).Str("vault", vaultID.String()).Msg("federation: unreadable publish policy, refusing link")
+		return c.Status(http.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
+	}
+	c.Locals(relayPublishKey, publish)
 	return c.Next()
 }
 
@@ -148,7 +161,11 @@ func (h *RelayHandlers) handleConn(conn *websocket.Conn) {
 	h.log.Info().Str("peer", peerURL).Str("vault", vaultID.String()).Msg("federation: follower connected")
 	proto, _ := conn.Locals(relayProtoKey).(int)
 	mode, _ := conn.Locals(relayModeKey).(string)
-	sess := h.links.NewSessionWith(nil, conn, vaultID, peerURL, "home", SessionOptions{PeerProto: proto, Mode: mode})
+	resume, _ := conn.Locals(relayResumeKey).(bool)
+	publish, _ := conn.Locals(relayPublishKey).(*PublishPolicy)
+	sess := h.links.NewSessionWith(nil, conn, vaultID, peerURL, "home", SessionOptions{
+		PeerProto: proto, Mode: mode, ExpectResume: resume, Publish: publish,
+	})
 	if err := sess.Run(); err != nil {
 		h.log.Warn().Err(err).Str("peer", peerURL).Msg("federation: relay session ended")
 	}

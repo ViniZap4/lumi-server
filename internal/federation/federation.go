@@ -131,6 +131,8 @@ type AcceptResponse struct {
 	// Mode and SeverPolicy come from home's invite row (v2 homes).
 	Mode        string `json:"mode,omitempty"`
 	SeverPolicy string `json:"sever_policy,omitempty"`
+	// Publish is the owner's publish consent of a publish mirror (M3).
+	Publish *PublishPolicy `json:"publish,omitempty"`
 }
 
 type VaultInfo struct {
@@ -171,6 +173,12 @@ type Service struct {
 	mirrorCache  *mirrorCache
 	violationsMu sync.Mutex
 	violations   map[string][]time.Time
+
+	// M2 (mirror_ops.go): erasure SLA alerting and integrity bookkeeping.
+	erasureSLA   time.Duration
+	erasureMu    sync.Mutex
+	erasureAlert map[uuid.UUID]time.Time // link id → last alert
+	links        *Links
 }
 
 // Feed is the account-feed surface the federation layer publishes to
@@ -231,20 +239,21 @@ func NewService(ctx context.Context, d Deps) (*Service, error) {
 		return nil, err
 	}
 	svc := &Service{
-		pub:         pub,
-		priv:        priv,
-		federations: d.Federations,
-		invites:     d.Invites,
-		vaults:      d.Vaults,
-		creator:     d.Creator,
-		client:      d.Client,
-		audit:       d.Audit,
-		baseURL:     strings.TrimRight(d.BaseURL, "/"),
-		now:         time.Now,
-		net:         d.Net,
-		operators:   d.Operators,
-		mirrorCache: newMirrorCache(),
-		violations:  map[string][]time.Time{},
+		pub:          pub,
+		priv:         priv,
+		federations:  d.Federations,
+		invites:      d.Invites,
+		vaults:       d.Vaults,
+		creator:      d.Creator,
+		client:       d.Client,
+		audit:        d.Audit,
+		baseURL:      strings.TrimRight(d.BaseURL, "/"),
+		now:          time.Now,
+		net:          d.Net,
+		operators:    d.Operators,
+		mirrorCache:  newMirrorCache(),
+		violations:   map[string][]time.Time{},
+		erasureAlert: map[uuid.UUID]time.Time{},
 	}
 	if svc.client == nil {
 		svc.client = newHTTPClient(d.Net)
@@ -296,8 +305,11 @@ type CreateInviteInput struct {
 	ExpiresAt     time.Time
 	// Mode is ModeReplica (default) or ModeMirror. SeverPolicy is
 	// SeverKeep (default) or SeverPurge.
-	Mode          string
-	SeverPolicy   string
+	Mode        string
+	SeverPolicy string
+	// Publish makes a publish mirror (M3): mirror mode only. The caller
+	// must hold vault.manage as well as vault.federate (handler).
+	Publish       *PublishPolicy
 	IP, UserAgent string
 }
 
@@ -327,9 +339,23 @@ func (s *Service) CreateInvite(ctx context.Context, in CreateInviteInput) (domai
 	if mode != ModeReplica && mode != ModeMirror {
 		return domain.FederationInvite{}, fmt.Errorf("%w: mode must be replica or mirror", domain.ErrValidation)
 	}
+	var publish *PublishPolicy
+	if in.Publish != nil {
+		if mode != ModeMirror {
+			return domain.FederationInvite{}, fmt.Errorf("%w: publish requires mode mirror", domain.ErrValidation)
+		}
+		p, err := in.Publish.Normalize()
+		if err != nil {
+			return domain.FederationInvite{}, err
+		}
+		publish = &p
+	}
 	policy := in.SeverPolicy
 	if policy == "" {
 		policy = SeverKeep
+		if publish != nil {
+			policy = SeverPurge // D7 (a): publish mirrors purge on revoke
+		}
 	}
 	if policy != SeverKeep && policy != SeverPurge {
 		return domain.FederationInvite{}, fmt.Errorf("%w: sever_policy must be keep or purge", domain.ErrValidation)
@@ -340,6 +366,7 @@ func (s *Service) CreateInvite(ctx context.Context, in CreateInviteInput) (domai
 	inv := domain.FederationInvite{
 		Mode:          mode,
 		SeverPolicy:   policy,
+		Publish:       MarshalPublish(publish),
 		Token:         newToken(),
 		VaultID:       in.VaultID,
 		InviterUserID: in.Actor,
@@ -356,6 +383,7 @@ func (s *Service) CreateInvite(ctx context.Context, in CreateInviteInput) (domai
 		"expires_at":      inv.ExpiresAt,
 		"mode":            inv.Mode,
 		"sever_policy":    inv.SeverPolicy,
+		"publish":         publish,
 	})
 	return inv, nil
 }
@@ -481,6 +509,7 @@ func (s *Service) Accept(ctx context.Context, req AcceptRequest) (AcceptResponse
 		CreatedAt:    now.UTC(),
 		Mode:         mode,
 		SeverPolicy:  policy,
+		Publish:      inv.Publish,
 	}); err != nil {
 		return AcceptResponse{}, err
 	}
@@ -498,6 +527,7 @@ func (s *Service) Accept(ctx context.Context, req AcceptRequest) (AcceptResponse
 		Home:        ident,
 		Mode:        mode,
 		SeverPolicy: policy,
+		Publish:     UnmarshalPublish(inv.Publish),
 	}, nil
 }
 
@@ -595,6 +625,17 @@ func (s *Service) Join(ctx context.Context, in JoinInput) (domain.Vault, domain.
 	if policy != SeverPurge {
 		policy = SeverKeep
 	}
+	var publish []byte
+	if resp.Publish != nil {
+		if mode != ModeMirror {
+			return domain.Vault{}, domain.Federation{}, fmt.Errorf("%w: publish on a replica link", domain.ErrConflict)
+		}
+		p, err := resp.Publish.Normalize()
+		if err != nil {
+			return domain.Vault{}, domain.Federation{}, fmt.Errorf("federation: home sent an invalid publish policy: %w", err)
+		}
+		publish = MarshalPublish(&p)
+	}
 
 	replica, err := s.provisionLocal(ctx, resp.Vault, mode, in)
 	if err != nil {
@@ -615,6 +656,7 @@ func (s *Service) Join(ctx context.Context, in JoinInput) (domain.Vault, domain.
 		CreatedAt:    s.now().UTC(),
 		Mode:         mode,
 		SeverPolicy:  policy,
+		Publish:      publish,
 	})
 	if err != nil {
 		return domain.Vault{}, domain.Federation{}, err

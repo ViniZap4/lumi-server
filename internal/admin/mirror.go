@@ -21,6 +21,12 @@ const (
 	ActionMirrorResync     = "admin.mirror.resync"
 )
 
+// NoteResyncer (optional on MirrorOps) rebuilds one note of a live mirror
+// link from home (*federation.Service.ResyncNote).
+type NoteResyncer interface {
+	ResyncNote(ctx context.Context, id uuid.UUID, noteID string) (domain.Federation, error)
+}
+
 // MirrorOps is the link control surface (*federation.Service). In the
 // running server it also stops/starts the live link; from the CLI only
 // the rows change and the server converges within its reconcile interval.
@@ -86,8 +92,19 @@ func (s *Service) mirrorOps() (MirrorOps, error) {
 	return s.Mirrors, nil
 }
 
+// linkActionNote is the single-note resync flavour of linkAction.
+func (s *Service) linkActionNote(ctx context.Context, a Actor, id uuid.UUID, noteID string,
+	run func(MirrorOps, context.Context, uuid.UUID) (domain.Federation, error)) (Federation, error) {
+	return s.linkActionWith(ctx, a, id, ActionMirrorResync, true, map[string]any{"note_id": noteID}, run)
+}
+
 // linkAction audits then runs a pause/resume/resync.
 func (s *Service) linkAction(ctx context.Context, a Actor, id uuid.UUID, action string, mirrorOnly bool,
+	run func(MirrorOps, context.Context, uuid.UUID) (domain.Federation, error)) (Federation, error) {
+	return s.linkActionWith(ctx, a, id, action, mirrorOnly, nil, run)
+}
+
+func (s *Service) linkActionWith(ctx context.Context, a Actor, id uuid.UUID, action string, mirrorOnly bool, extra map[string]any,
 	run func(MirrorOps, context.Context, uuid.UUID) (domain.Federation, error)) (Federation, error) {
 	f, err := s.Store.GetFederation(ctx, id)
 	if err != nil {
@@ -103,12 +120,16 @@ func (s *Service) linkAction(ctx context.Context, a Actor, id uuid.UUID, action 
 	if f.Status != "active" {
 		return Federation{}, fmt.Errorf("%w: federation %s", domain.ErrConflict, f.Status)
 	}
-	e := s.entry(a, action, nil, &f.VaultID, map[string]any{
+	payload := map[string]any{
 		"federation_id": f.ID,
 		"peer_url":      f.PeerURL,
 		"role":          f.Role,
 		"mode":          f.Mode,
-	})
+	}
+	for k, v := range extra {
+		payload[k] = v
+	}
+	e := s.entry(a, action, nil, &f.VaultID, payload)
 	if err := s.Store.RecordAudit(ctx, e); err != nil {
 		return Federation{}, fmt.Errorf("audit %s: %w", action, err)
 	}
@@ -133,6 +154,26 @@ func (s *Service) ResumeFederation(ctx context.Context, a Actor, id uuid.UUID) (
 // ResyncMirror forgets a mirror's progress and runs a full pass.
 func (s *Service) ResyncMirror(ctx context.Context, a Actor, id uuid.UUID) (Federation, error) {
 	return s.linkAction(ctx, a, id, ActionMirrorResync, true, MirrorOps.ResyncLink)
+}
+
+// ResyncMirrorNote rebuilds one note of a mirror link (mirror side, the
+// link must be connected): the local history is dropped and the full
+// state requested from home. Audited admin.mirror.resync with note_id.
+func (s *Service) ResyncMirrorNote(ctx context.Context, a Actor, id uuid.UUID, noteID string) (Federation, error) {
+	if noteID == "" || len(noteID) > 256 {
+		return Federation{}, invalid("note_id", "is invalid")
+	}
+	ops, err := s.mirrorOps()
+	if err != nil {
+		return Federation{}, err
+	}
+	nr, ok := ops.(NoteResyncer)
+	if !ok {
+		return Federation{}, fmt.Errorf("%w: single-note resync needs the running server", domain.ErrConflict)
+	}
+	return s.linkActionNote(ctx, a, id, noteID, func(_ MirrorOps, ctx context.Context, id uuid.UUID) (domain.Federation, error) {
+		return nr.ResyncNote(ctx, id, noteID)
+	})
 }
 
 // PromoteMirror turns the mirror of vaultRef (slug or id) into an

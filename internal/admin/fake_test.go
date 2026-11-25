@@ -459,6 +459,9 @@ func (f *fakeStore) ListFederations(_ context.Context, filter FederationFilter, 
 		if filter.Mode != "" && x.Mode != filter.Mode {
 			continue
 		}
+		if filter.VaultID != nil && x.VaultID != *filter.VaultID {
+			continue
+		}
 		out = append(out, *x)
 	}
 	return out, false, nil

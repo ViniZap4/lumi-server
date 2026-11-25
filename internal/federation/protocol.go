@@ -36,7 +36,7 @@ const (
 	// peer that advertised v2 (see RelayProtoVersion), so v1 peers never
 	// see them.
 	frameMirrorAck  uint64 = 8  // varUint(home_vault_seq)            mirror → home
-	frameResumeFrom uint64 = 9  // varUint(home_vault_seq)            mirror → home (reserved, M2)
+	frameResumeFrom uint64 = 9  // varUint(home_vault_seq)            mirror → home (§A7.2)
 	frameChangesEnd uint64 = 10 // varUint(home_vault_seq)            home → mirror
 	frameNoteMeta2  uint64 = 11 // noteMeta varBytes(frontmatterJSON) — frontmatter (G1)
 )
@@ -210,6 +210,9 @@ func EncodeMirrorAck(seq int64) []byte { return encodeSeqFrame(frameMirrorAck, s
 // before it.
 func EncodeChangesEnd(seq int64) []byte { return encodeSeqFrame(frameChangesEnd, seq) }
 
+// EncodeResumeFrom asks home for the changes after seq (0 = full manifest).
+func EncodeResumeFrom(seq int64) []byte { return encodeSeqFrame(frameResumeFrom, seq) }
+
 func readEpoch(buf []byte) (string, int, error) {
 	e, n, err := readVarString(buf)
 	if err != nil {
@@ -227,6 +230,17 @@ func EncodeNoteSync(noteID string, payload []byte) []byte {
 	out = writeVarBytes(out, []byte(noteID))
 	return writeVarBytes(out, payload)
 }
+
+// EncodeNoteSyncSV is EncodeNoteSync plus the sender's state vector of
+// the note as optional trailing data (§A9: home's Step2 to a mirror, so
+// the mirror can tell whether its copy diverged). Decoders that predate it
+// ignore the trailing bytes.
+func EncodeNoteSyncSV(noteID string, payload, sv []byte) []byte {
+	return writeVarBytes(EncodeNoteSync(noteID, payload), sv)
+}
+
+// maxStateVectorBytes caps the trailing state vector of a noteSync frame.
+const maxStateVectorBytes = 1 << 20
 
 // EncodeNoteAnnounce advertises a note the peer may not have yet, with
 // its epoch as optional trailing data.
@@ -276,6 +290,9 @@ type Frame struct {
 	Payload  []byte     // frameNoteSync: y-protocols message; frameControlState: state JSON
 	Sig      []byte     // frameControlState
 	Seq      int64      // frameControlAck, frameMirrorAck, frameResumeFrom, frameChangesEnd
+	// SV is the sender's state vector of the note (frameNoteSync, optional
+	// trailing data; home → mirror Step2s).
+	SV []byte
 	// Proto is the peer's relay protocol version advertised in a
 	// manifest (1 when absent).
 	Proto int
@@ -345,11 +362,23 @@ func DecodeFrame(buf []byte) (Frame, error) {
 		if err != nil {
 			return Frame{}, err
 		}
-		payload, _, err := readVarBytes(body[n:])
+		payload, n2, err := readVarBytes(body[n:])
 		if err != nil {
 			return Frame{}, err
 		}
-		return Frame{Type: typ, NoteID: noteID, Payload: payload}, nil
+		f := Frame{Type: typ, NoteID: noteID, Payload: payload}
+		if rest := body[n+n2:]; len(rest) > 0 {
+			// Optional trailing state vector (§A9).
+			sv, _, err := readVarBytes(rest)
+			if err != nil {
+				return Frame{}, err
+			}
+			if len(sv) > maxStateVectorBytes {
+				return Frame{}, fmt.Errorf("%w: state vector too large", errFrameTooLarge)
+			}
+			f.SV = sv
+		}
+		return f, nil
 	case frameNoteAnnounce, frameNoteMove:
 		m, n, err := readNoteMeta(body)
 		if err != nil {

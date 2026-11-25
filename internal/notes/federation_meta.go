@@ -207,3 +207,22 @@ func normalizeJSONNumber(v any) any {
 		return v
 	}
 }
+
+// ReadBodyForFederation returns the note's body as stored on disk (no
+// frontmatter; a canvas file whole) for the mirror integrity pass;
+// domain.ErrNotFound when the row or the file is missing.
+func (s *Service) ReadBodyForFederation(ctx context.Context, vaultID uuid.UUID, noteID string) (string, error) {
+	n, err := s.notes.Get(ctx, vaultID, noteID)
+	if err != nil {
+		return "", err
+	}
+	v, err := s.vaults.GetByID(ctx, vaultID)
+	if err != nil {
+		return "", err
+	}
+	_, body, err := s.fs.ReadNote(v.Slug, n.Path)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}

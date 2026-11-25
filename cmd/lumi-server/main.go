@@ -43,7 +43,9 @@ import (
 	"github.com/ViniZap4/lumi-server/internal/fswatch"
 	"github.com/ViniZap4/lumi-server/internal/invites"
 	"github.com/ViniZap4/lumi-server/internal/members"
+	"github.com/ViniZap4/lumi-server/internal/metrics"
 	"github.com/ViniZap4/lumi-server/internal/notes"
+	"github.com/ViniZap4/lumi-server/internal/publish"
 	"github.com/ViniZap4/lumi-server/internal/roles"
 	"github.com/ViniZap4/lumi-server/internal/storage/fs"
 	"github.com/ViniZap4/lumi-server/internal/storage/pg"
@@ -218,6 +220,12 @@ type config struct {
 	federationOperators []string
 
 	admin adminConfig // LUMI_ADMIN_ADDR, LUMI_ADMIN_TRUSTED_PROXIES (admin.go)
+
+	// Mirrors M2/M3 (docs/SPEC-ESPELHO-SELADO.md §A8, §A14, §A15).
+	erasureSLA         time.Duration // LUMI_MIRROR_ERASURE_SLA (default 24h)
+	metricsAddr        string        // LUMI_METRICS_ADDR (off when empty)
+	metricsVaultLabels bool          // LUMI_METRICS_VAULT_LABELS
+	publishEnabled     bool          // LUMI_PUBLISH_ENABLED
 }
 
 func loadConfig() (config, error) {
@@ -273,6 +281,17 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("LUMI_FEDERATION_ALLOWED_CIDRS: %w", err)
 	}
 	c.federationNet.AllowedCIDRs = cidrs
+	c.erasureSLA = federation.DefaultErasureSLA
+	if v := os.Getenv("LUMI_MIRROR_ERASURE_SLA"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return config{}, fmt.Errorf("LUMI_MIRROR_ERASURE_SLA: want a positive duration like 24h, got %q", v)
+		}
+		c.erasureSLA = d
+	}
+	c.metricsAddr = strings.TrimSpace(os.Getenv("LUMI_METRICS_ADDR"))
+	c.metricsVaultLabels = envBool("LUMI_METRICS_VAULT_LABELS", false)
+	c.publishEnabled = envBool("LUMI_PUBLISH_ENABLED", false)
 	if c.admin, err = loadAdminConfig(c); err != nil {
 		return config{}, err
 	}
@@ -616,7 +635,22 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 			zlog.Error().Str("vault", vaultID.String()).Str("note", noteID).Str("origin", origin).
 				Msg("mirror.local_write_blocked: persisted update on a mirror did not come from home")
 		},
+		// M2: incremental resume, divergence rebuild, integrity pass.
+		Changes: noteStore.Changes,
+		ResetDoc: func(ctx context.Context, vaultID uuid.UUID, noteID string) error {
+			// Readers reconnect (1012) and rejoin the rebuilt history.
+			wsHub.DropNote(vaultID, noteID, 1012, "mirror_rebuild")
+			return noteYjsStore.ResetNote(ctx, vaultID, noteID)
+		},
+		ReadBody: notesSvc.ReadBodyForFederation,
 	})
+	relayLinks.SetDeps(func(d *federation.RelayDeps) {
+		d.Divergent = federationSvc.MirrorDivergent
+		d.IntegrityDone = federationSvc.RecordIntegrity
+		// M3: a publish mirror gets a minimised, re-signed control state.
+		d.ControlFor = federationSvc.ControlStateFor
+	})
+	federationSvc.SetLinks(relayLinks)
 	crdtRegistry.SetOnPersist(relayLinks.OnPersist)
 	notesSvc.SetFederationNotifier(relayLinks)
 	relayManager := federation.NewManager(federationSvc, relayLinks, nil, zlog)
@@ -651,6 +685,26 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 	if err := relayManager.Start(ctx); err != nil {
 		zlog.Warn().Err(err).Msg("federation: relay manager start")
 	}
+	// M2: erasure SLA alert (home side), metrics (opt-in).
+	federationSvc.SetErasureSLA(cfg.erasureSLA)
+	go federationSvc.RunErasureMonitor(ctx, time.Hour)
+	if cfg.metricsAddr != "" {
+		metrics.Register(mirrorGauges(fedStore, federationSvc, relayLinks, cfg.metricsVaultLabels))
+		go func() {
+			zlog.Info().Str("addr", cfg.metricsAddr).Msg("metrics listening")
+			if err := metrics.Serve(ctx, cfg.metricsAddr); err != nil {
+				zlog.Error().Err(err).Msg("metrics listener")
+			}
+		}()
+	}
+	// M3: anonymous publish endpoints (off unless LUMI_PUBLISH_ENABLED).
+	publishHandlers := publish.NewHandlers(&publish.Service{
+		Enabled:  cfg.publishEnabled,
+		Settings: pg.NewPublishStore(pool),
+		Links:    fedStore,
+		Vaults:   vaultStore,
+		Notes:    notesSvc,
+	})
 	invitesSvc := invites.NewService(invites.Deps{
 		Repo:          inviteStore,
 		Users:         userStore,
@@ -742,6 +796,7 @@ func buildApp(ctx context.Context, cfg config, zlog zerolog.Logger, pool *pgxpoo
 			invites.NewHandlers(invitesSvc).RegisterPublic,
 			federation.NewHandlers(federationSvc, fedResolver).RegisterPublic,
 			federation.NewRelayHandlers(federationSvc, relayLinks, zlog).Register,
+			publishHandlers.Register,
 			func(r fiber.Router) { wsHandler.Register(r.Group("/api")) },
 		},
 		[]func(fiber.Router){

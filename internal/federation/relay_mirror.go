@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ViniZap4/lumi-server/internal/domain"
+	"github.com/ViniZap4/lumi-server/internal/metrics"
 	"github.com/ViniZap4/lumi-server/internal/wsync"
 )
 
@@ -49,7 +50,13 @@ func (s *Session) homeMirrorFrame(f Frame) (bool, error) {
 		}
 		return true, nil
 	case frameResumeFrom:
-		return true, nil // incremental resume is M2: the opening already sent the manifest
+		if s.expectResume {
+			select {
+			case s.resumeCh <- f.Seq:
+			default: // only the first one counts
+			}
+		}
+		return true, nil
 	case frameNoteSync:
 		if err := validateNoteID(f.NoteID); err != nil {
 			return true, err
@@ -90,6 +97,7 @@ func (s *Session) mirrorViolation(f Frame, noteID string) {
 	kind := frameKind(f.Type)
 	s.deps.Log.Warn().Str("peer", s.peerURL).Str("vault", s.vaultID.String()).
 		Str("frame", kind).Str("note", noteID).Msg("federation: mirror sent content, closing link")
+	metrics.MirrorViolation.Inc()
 	s.close()
 	if s.deps.MirrorViolation != nil {
 		// Async: three violations revoke the link, which re-enters the
@@ -144,6 +152,10 @@ type backfill struct {
 	pendingHead  int64
 	havePending  bool
 	lastHeadSent int64 // home side: last frameChangesEnd value
+	// resuming: the mirror asked for an incremental resume and collects
+	// the notes home announces until frameChangesEnd.
+	resuming  bool
+	resumeIDs []string
 }
 
 // BackfillProgress is the catch-up state of a mirror link.
@@ -159,7 +171,30 @@ func (s *Session) mirrorFrame(f Frame) (bool, error) {
 	case frameManifest:
 		return true, s.mirrorManifest(f)
 	case frameChangesEnd:
+		s.bf.mu.Lock()
+		resumed, ids := s.bf.resuming, s.bf.resumeIDs
+		s.bf.resuming, s.bf.resumeIDs = false, nil
+		s.bf.mu.Unlock()
+		if resumed {
+			// End of an incremental resume: fetch the changed notes
+			// under the same window as a full backfill; the head is
+			// acknowledged once they are all applied.
+			s.startBackfill(ids)
+		}
 		s.onHomeHead(f.Seq)
+		return true, nil
+	case frameNoteAnnounce:
+		if err := s.mirrorEnsure(f.Note); err != nil {
+			return true, err
+		}
+		s.bf.mu.Lock()
+		if s.bf.resuming {
+			s.bf.resumeIDs = append(s.bf.resumeIDs, f.Note.ID)
+			s.bf.mu.Unlock()
+			return true, nil
+		}
+		s.bf.mu.Unlock()
+		s.sendStep1(f.Note.ID)
 		return true, nil
 	case frameNoteSync:
 		if err := validateNoteID(f.NoteID); err != nil {
@@ -177,6 +212,9 @@ func (s *Session) mirrorFrame(f Frame) (bool, error) {
 			return true, nil // home never needs anything from a mirror
 		case wsync.SyncStep2:
 			err := s.applyRemote(f.NoteID, msg.Body)
+			if err == nil && len(f.SV) > 0 {
+				s.checkMirrorDivergence(f.NoteID, f.SV)
+			}
 			s.backfillRelease(f.NoteID)
 			return true, err
 		case wsync.SyncUpdate:
@@ -196,6 +234,11 @@ func (s *Session) mirrorFrame(f Frame) (bool, error) {
 // mirrorManifest reconciles the copy with home's full listing.
 func (s *Session) mirrorManifest(f Frame) error {
 	s.peerProto.Store(int32(f.Proto))
+	// Home answered the resume with a full listing (cursor below its
+	// tombstone floor, or a home that predates resume).
+	s.bf.mu.Lock()
+	s.bf.resuming, s.bf.resumeIDs = false, nil
+	s.bf.mu.Unlock()
 	known := make(map[string]bool, len(f.Manifest))
 	ids := make([]string, 0, len(f.Manifest))
 	for _, m := range f.Manifest {

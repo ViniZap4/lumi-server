@@ -19,6 +19,7 @@ import (
 
 	"github.com/ViniZap4/lumi-server/internal/crdt"
 	"github.com/ViniZap4/lumi-server/internal/domain"
+	"github.com/ViniZap4/lumi-server/internal/metrics"
 	"github.com/ViniZap4/lumi-server/internal/wsync"
 )
 
@@ -132,7 +133,33 @@ type RelayDeps struct {
 	// origin is not the home link (should never happen: the hub guard
 	// refuses local writes first).
 	LocalWriteBlocked func(vaultID uuid.UUID, noteID, origin string)
+
+	// M2 operations (relay_mirror.go); all nil-safe.
+	// Changes (home) pages the vault's change log for an incremental
+	// resume (§A7.2). nil always answers a resume with the full manifest.
+	Changes ChangesFunc
+	// ResetDoc (mirror) drops a note's local CRDT history under the same
+	// row and epoch (live room closed, snapshot and update log deleted) so
+	// it can be rebuilt from home's full state (§A9). nil disables the
+	// rebuild (divergence is still reported).
+	ResetDoc func(ctx context.Context, vaultID uuid.UUID, noteID string) error
+	// Divergent is told about a mirror copy whose state vector is not
+	// dominated by home's (side is "home" or "mirror").
+	Divergent func(vaultID uuid.UUID, peerURL, noteID, side string)
+	// ReadBody (mirror) returns the note's body as stored on disk (no
+	// frontmatter) for the integrity pass; domain.ErrNotFound when the
+	// file is missing. nil skips the file comparison.
+	ReadBody func(ctx context.Context, vaultID uuid.UUID, noteID string) (string, error)
+	// IntegrityDone (mirror) records a finished integrity pass (§A10).
+	IntegrityDone func(vaultID uuid.UUID, peerURL string, r IntegrityReport)
+	// ControlFor (home) returns the control document for one link: a
+	// publish mirror gets a minimised, re-signed copy (publish.go). nil
+	// sends ControlCurrent's document to every link.
+	ControlFor func(ctx context.Context, vaultID uuid.UUID, peerURL string) (state, sig []byte, ok bool)
 }
+
+// ChangesFunc pages a vault's change log (notes.Service.Changes).
+type ChangesFunc func(ctx context.Context, vaultID uuid.UUID, after int64, limit int) (domain.NoteChanges, error)
 
 // FrontmatterFunc returns a note's frontmatter as a JSON object of the keys
 // not derived from the CRDT or the note row (tags, created_at, unknown
@@ -175,6 +202,11 @@ func NewLinks(rootCtx context.Context, deps RelayDeps) *Links {
 	return &Links{byVault: map[uuid.UUID][]*Session{}, deps: deps, rootCtx: rootCtx}
 }
 
+// SetDeps adjusts the relay dependencies at wiring time (before any
+// session starts): callbacks that need the federation service, built
+// after the Links.
+func (l *Links) SetDeps(fn func(*RelayDeps)) { fn(&l.deps) }
+
 func (l *Links) add(s *Session) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -215,10 +247,14 @@ func (l *Links) OnPersist(vaultID uuid.UUID, noteID string, update []byte, origi
 		if !s.sendsContent() {
 			// A mirror never authors content: anything persisted here
 			// that did not come from home is a bug or tampering.
+			metrics.MirrorLocalWriteBlocked.Inc()
 			if l.deps.LocalWriteBlocked != nil {
 				l.deps.LocalWriteBlocked(vaultID, noteID, originKind)
 			}
 			continue
+		}
+		if s.publish != nil && !s.isPublished(noteID) {
+			continue // out of a publish mirror's scope: never leaves home
 		}
 		s.send(EncodeNoteSync(noteID, wsync.EncodeSyncUpdate(update)))
 	}
@@ -275,6 +311,10 @@ func (l *Links) NoteCreated(vaultID uuid.UUID, noteID, path, title string) {
 	update := EncodeNoteSync(noteID, wsync.EncodeSyncUpdate(state))
 	meta2 := l.meta2Frame(vaultID, meta)
 	for _, s := range sessions {
+		if s.publish != nil {
+			s.publishSync(noteID, false)
+			continue
+		}
 		s.send(announce)
 		if meta2 != nil && s.speaksV2() {
 			s.send(meta2)
@@ -300,11 +340,16 @@ func (l *Links) fanMeta2(vaultID uuid.UUID, noteID string, except *Session) {
 		return
 	}
 	frame := l.meta2Frame(vaultID, NoteMeta{ID: n.ID, Path: n.Path, Title: n.Title})
-	if frame == nil {
-		return
-	}
 	for _, s := range sessions {
-		if s != except && s.speaksV2() {
+		if s == except {
+			continue
+		}
+		if s.publish != nil {
+			// The frontmatter may have flipped publish: re-evaluate.
+			s.publishSync(noteID, false)
+			continue
+		}
+		if frame != nil && s.speaksV2() {
 			s.send(frame)
 		}
 	}
@@ -344,6 +389,10 @@ func (l *Links) fanMove(vaultID uuid.UUID, m NoteMeta, except *Session) {
 		if s == except {
 			continue
 		}
+		if s.publish != nil {
+			s.publishSync(m.ID, true)
+			continue
+		}
 		s.send(frame)
 	}
 }
@@ -358,6 +407,12 @@ func (l *Links) PushControl(vaultID uuid.UUID, state, sig []byte) {
 			// the link's users: refresh the ceiling before anything else
 			// arrives on it.
 			s.setCaps(PeerCeiling(state, s.peerURL))
+			if s.publish != nil {
+				if st, sg, ok := s.controlFor(); ok {
+					s.send(EncodeControlState(st, sg))
+				}
+				continue
+			}
 			s.send(frame)
 		}
 	}
@@ -367,6 +422,10 @@ func (l *Links) fanDelete(vaultID uuid.UUID, noteID string, except *Session) {
 	frame := EncodeNoteDelete(noteID)
 	for _, s := range l.contentSessionsFor(vaultID) {
 		if s == except {
+			continue
+		}
+		if s.publish != nil {
+			s.publishDelete(noteID)
 			continue
 		}
 		s.send(frame)
@@ -419,8 +478,27 @@ type Session struct {
 	// note.create): their first content may land without note.edit.
 	createdHere map[string]bool
 
-	// Mirror side: windowed backfill state (mirror_backfill.go).
+	// Mirror side: windowed backfill state (relay_mirror.go).
 	bf backfill
+
+	// Incremental resume (§A7.2). Home: expectResume makes the opening
+	// wait for the mirror's frameResumeFrom (delivered on resumeCh).
+	// Mirror: resumeFrom is the home seq it asks to resume after.
+	expectResume bool
+	resumeCh     chan int64
+	sendResume   bool
+	resumeFrom   int64
+	// lastIntegrity (mirror) is when the last integrity pass finished.
+	lastIntegrity time.Time
+	// divergentSeen dedupes divergence reports per note per connection.
+	divergentSeen map[string]bool
+
+	// publish (home side of a publish mirror link, M3) filters every
+	// outbound frame to in-scope notes; published tracks the ids the
+	// mirror currently holds. nil for every other link.
+	publish   *PublishPolicy
+	pubMu     sync.Mutex
+	published map[string]bool
 }
 
 // sendsContent reports whether this side may send content frames on the
@@ -436,6 +514,17 @@ type SessionOptions struct {
 	// PeerProto is the peer's advertised relay protocol (home side, from
 	// the WS query); a follower learns home's from the manifest.
 	PeerProto int
+	// ExpectResume (home side of a mirror link): the mirror advertised
+	// that its first frame is a frameResumeFrom; the opening waits for it.
+	ExpectResume bool
+	// SendResume / ResumeFrom (mirror side): open with
+	// frameResumeFrom(ResumeFrom).
+	SendResume bool
+	ResumeFrom int64
+	// LastIntegrity (mirror side) schedules the next integrity pass.
+	LastIntegrity time.Time
+	// Publish (home side of a publish mirror link) is the link's scope.
+	Publish *PublishPolicy
 }
 
 // Link modes (vault_federations.mode).
@@ -476,6 +565,17 @@ func (l *Links) NewSessionWith(ctx context.Context, conn wsConn, vaultID uuid.UU
 		step1Sent:   map[string]bool{},
 		denied:      map[string]bool{},
 		createdHere: map[string]bool{},
+
+		expectResume:  o.ExpectResume && o.Mode == ModeMirror && role == "home",
+		resumeCh:      make(chan int64, 1),
+		sendResume:    o.SendResume && o.Mode == ModeMirror && role == "follower",
+		resumeFrom:    o.ResumeFrom,
+		lastIntegrity: o.LastIntegrity,
+		divergentSeen: map[string]bool{},
+	}
+	if o.Publish != nil && o.Mode == ModeMirror && role == "home" {
+		sess.publish = o.Publish
+		sess.published = map[string]bool{}
 	}
 	sess.peerProto.Store(int32(o.PeerProto))
 	return sess
@@ -520,7 +620,28 @@ func (s *Session) Run() error {
 		}
 	}()
 
-	if s.role == "home" {
+	switch {
+	case s.role == "home" && s.expectResume:
+		// The mirror's first frame says where to resume from; the read
+		// loop hands it over. A mirror that never sends it gets the full
+		// manifest after resumeWait.
+		s.loadCaps()
+		go func() {
+			var seq int64
+			select {
+			case seq = <-s.resumeCh:
+			case <-time.After(resumeWait):
+			case <-s.done:
+				return
+			}
+			if err := s.sendOpeningFrom(seq); err != nil {
+				s.deps.Log.Warn().Err(err).Str("peer", s.peerURL).Msg("federation: mirror opening")
+				s.close()
+				return
+			}
+			s.headLoop()
+		}()
+	case s.role == "home":
 		s.loadCaps()
 		if err := s.sendOpening(); err != nil {
 			return err
@@ -528,6 +649,14 @@ func (s *Session) Run() error {
 		if s.mode == ModeMirror {
 			go s.headLoop()
 		}
+	case s.mode == ModeMirror:
+		if s.sendResume {
+			s.bf.mu.Lock()
+			s.bf.resuming = s.resumeFrom > 0
+			s.bf.mu.Unlock()
+			s.send(EncodeResumeFrom(s.resumeFrom))
+		}
+		go s.integrityLoop()
 	}
 	return s.readLoop()
 }
@@ -540,6 +669,7 @@ func (s *Session) writePump() {
 				s.close()
 				return
 			}
+			countFrame("out", frame)
 		case <-s.done:
 			return
 		}
@@ -549,16 +679,38 @@ func (s *Session) writePump() {
 // sendOpening (home): manifest of every note, a Step1 per note so the
 // follower can send us what we're missing while we send Step2s with what
 // they're missing, then the current signed control state (F3).
-func (s *Session) sendOpening() error {
+func (s *Session) sendOpening() error { return s.sendOpeningFrom(0) }
+
+// sendOpeningFrom is the opening; a mirror that resumes from a home seq
+// gets the change log after it instead of the manifest when possible.
+// Opening frames are queued blocking (the writer drains them), so a large
+// vault cannot overflow the send buffer before the link even starts.
+func (s *Session) sendOpeningFrom(resumeFrom int64) error {
+	if s.mode == ModeMirror && resumeFrom > 0 && s.publish == nil {
+		ok, err := s.sendResumeChanges(resumeFrom)
+		if err != nil {
+			return err
+		}
+		if ok {
+			s.deps.Log.Info().Str("peer", s.peerURL).Str("vault", s.vaultID.String()).Int64("from", resumeFrom).
+				Msg("federation: mirror resumed from its home seq")
+			s.sendControl()
+			s.sendHead(true)
+			return nil
+		}
+	}
 	metas, err := s.listAllNotes()
 	if err != nil {
 		return err
 	}
-	s.send(EncodeManifest(metas))
+	if s.publish != nil {
+		metas = s.publishScope(metas)
+	}
+	s.sendWait(EncodeManifest(metas))
 	if s.speaksV2() {
 		for _, m := range metas {
 			if frame := s.links.meta2Frame(s.vaultID, m); frame != nil {
-				s.send(frame)
+				s.sendWait(frame)
 			}
 		}
 	}
@@ -568,15 +720,30 @@ func (s *Session) sendOpening() error {
 			s.sendStep1(m.ID)
 		}
 	}
-	if s.deps.ControlCurrent != nil {
-		if state, sig, ok := s.deps.ControlCurrent(s.ctx, s.vaultID); ok {
-			s.send(EncodeControlState(state, sig))
-		}
-	}
+	s.sendControl()
 	if s.mode == ModeMirror {
 		s.sendHead(true)
 	}
 	return nil
+}
+
+// sendControl queues home's current signed control document.
+func (s *Session) sendControl() {
+	if s.deps.ControlCurrent == nil {
+		return
+	}
+	if state, sig, ok := s.controlFor(); ok {
+		s.sendWait(EncodeControlState(state, sig))
+	}
+}
+
+// sendWait queues a frame, waiting for room in the send buffer (opening
+// only: live fan-out uses send, which never blocks).
+func (s *Session) sendWait(frame []byte) {
+	select {
+	case s.sendCh <- frame:
+	case <-s.done:
+	}
 }
 
 func (s *Session) listAllNotes() ([]NoteMeta, error) {
@@ -607,6 +774,7 @@ func (s *Session) readLoop() error {
 				return err
 			}
 		}
+		countFrame("in", data)
 		frame, err := DecodeFrame(data)
 		if err != nil {
 			return fmt.Errorf("federation: bad frame from %s: %w", s.peerURL, err)
@@ -991,6 +1159,16 @@ func frameKind(t uint64) string {
 		return "move"
 	case frameNoteMeta2:
 		return "note_meta2"
+	case frameControlState:
+		return "control_state"
+	case frameControlAck:
+		return "control_ack"
+	case frameMirrorAck:
+		return "mirror_ack"
+	case frameResumeFrom:
+		return "resume_from"
+	case frameChangesEnd:
+		return "changes_end"
 	default:
 		return fmt.Sprintf("frame_%d", t)
 	}
@@ -1048,6 +1226,9 @@ func (s *Session) handleStep1(noteID string, sv []byte) error {
 			return nil
 		}
 		return err
+	}
+	if s.mode == ModeMirror && s.role == "home" {
+		return s.answerMirrorStep1(noteID, sv)
 	}
 	diff, err := s.withDoc(noteID, func(doc *crdt.Doc) ([]byte, error) {
 		return doc.EncodeDiffSince(sv)
@@ -1159,4 +1340,15 @@ func validateNoteID(id string) error {
 // containment check on every disk access.
 func validateRelPath(p string) error {
 	return domain.ValidateNotePath(p)
+}
+
+// countFrame feeds the relay counters (lumi_relay_frames_total /
+// lumi_relay_bytes_total). Unknown types are bucketed as "other".
+func countFrame(dir string, frame []byte) {
+	kind := "other"
+	if t, _, err := readVarUint(frame); err == nil && t >= frameManifest && t <= frameNoteMeta2 {
+		kind = frameKind(t)
+	}
+	metrics.RelayFrames.With(dir, kind).Inc()
+	metrics.RelayBytes.With(dir).Add(int64(len(frame)))
 }

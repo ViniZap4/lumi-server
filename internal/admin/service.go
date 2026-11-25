@@ -254,6 +254,11 @@ type Federation struct {
 	PendingDeletes        int64
 	OldestPendingDeleteAt *time.Time
 	Violations24h         int64
+	// M2/M3: last completed integrity pass (mirror side), audited
+	// divergences in the last 24 h (home side), publish policy JSON.
+	LastIntegrityAt *time.Time
+	Divergent24h    int64
+	Publish         []byte
 	// Backfill is the live catch-up of a mirror link on this (mirror)
 	// server; nil when unknown (CLI, no session up).
 	Backfill *BackfillProgress
@@ -429,6 +434,8 @@ type Service struct {
 	Progress func(vaultID uuid.UUID) (BackfillProgress, bool)
 	// Planner turns home's replicated control state into a promotion.
 	Planner func(state []byte) (Promotion, error)
+	// Publish is the publish-mirror opt-in store (CLI); nil refuses.
+	Publish PublishStore
 
 	Version       string
 	MigrationsDir string

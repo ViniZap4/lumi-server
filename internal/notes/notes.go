@@ -316,9 +316,13 @@ type UpdateInput struct {
 	Body  *string
 	Path  *string
 	Tags  *[]string
-	Actor uuid.UUID
-	IP    string
-	UA    string
+	// Publish sets (true) or removes (false) the frontmatter flag
+	// "publish: true" that puts a note in a publish mirror's "flagged"
+	// scope (docs/SPEC-ESPELHO-SELADO.md §A15.1).
+	Publish *bool
+	Actor   uuid.UUID
+	IP      string
+	UA      string
 }
 
 // ---- Service: Create -------------------------------------------------------
@@ -546,7 +550,7 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 	}
 
 	canvas := domain.IsCanvasPath(n.Path)
-	if canvas && (in.Title != nil || in.Tags != nil) {
+	if canvas && (in.Title != nil || in.Tags != nil || in.Publish != nil) {
 		return domain.Note{}, fmt.Errorf("%w: a canvas has no frontmatter: its title is its file name (move it to rename)", domain.ErrValidation)
 	}
 	if in.Body != nil {
@@ -611,6 +615,17 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 		front["tags"] = *in.Tags
 		edited = true
 	}
+	if in.Publish != nil {
+		cur, _ := front["publish"].(bool)
+		if *in.Publish != cur {
+			if *in.Publish {
+				front["publish"] = true
+			} else {
+				delete(front, "publish")
+			}
+			edited = true
+		}
+	}
 	if in.Body != nil {
 		body = []byte(*in.Body)
 		edited = true
@@ -657,8 +672,9 @@ func (s *Service) Update(ctx context.Context, vaultID uuid.UUID, id string, in U
 	if (moved || newTitle != n.Title) && s.fedNotify != nil {
 		s.fedNotify.NoteMoved(vaultID, id, newPath, newTitle)
 	}
-	// Tags live only in the frontmatter: replicate them (G1).
-	if in.Tags != nil {
+	// Tags and the publish flag live only in the frontmatter: replicate
+	// them (G1); a publish link re-evaluates its scope on it.
+	if in.Tags != nil || in.Publish != nil {
 		s.notifyMetaChanged(vaultID, id)
 	}
 
@@ -1410,6 +1426,8 @@ type updateReq struct {
 	Body  *string   `json:"body,omitempty"`
 	Path  *string   `json:"path,omitempty"`
 	Tags  *[]string `json:"tags,omitempty"`
+	// Publish toggles the frontmatter flag publish: true (§A15.1).
+	Publish *bool `json:"publish,omitempty"`
 }
 
 // update — PATCH /api/vaults/:vault/notes/:id
@@ -1433,13 +1451,14 @@ func (h *Handlers) update(c *fiber.Ctx) error {
 	}
 	uid, _ := capguard.UserIDFrom(c)
 	n, err := h.svc.Update(c.UserContext(), vaultID, id, UpdateInput{
-		Title: req.Title,
-		Body:  req.Body,
-		Path:  req.Path,
-		Tags:  req.Tags,
-		Actor: uid,
-		IP:    c.IP(),
-		UA:    string(c.Request().Header.UserAgent()),
+		Title:   req.Title,
+		Body:    req.Body,
+		Path:    req.Path,
+		Tags:    req.Tags,
+		Publish: req.Publish,
+		Actor:   uid,
+		IP:      c.IP(),
+		UA:      string(c.Request().Header.UserAgent()),
 	})
 	if err != nil {
 		return mapErr(c, err)

@@ -249,3 +249,20 @@ SELECT COALESCE(MAX(id), 0) FROM note_yjs_updates
 	}
 	return id, nil
 }
+
+// ResetNote drops a note's persisted CRDT history (snapshot and update
+// log) and keeps the row and its epoch: a mirror rebuilding a diverged
+// copy from home's full state (docs/SPEC-ESPELHO-SELADO.md §A9).
+func (s *NoteYjsStore) ResetNote(ctx context.Context, vaultID uuid.UUID, noteID string) error {
+	err := runTx(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `DELETE FROM note_yjs_updates WHERE vault_id = $1 AND note_id = $2`, vaultID, noteID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM note_yjs_snapshots WHERE vault_id = $1 AND note_id = $2`, vaultID, noteID)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("note_yjs reset: %w", errMap(err))
+	}
+	return nil
+}

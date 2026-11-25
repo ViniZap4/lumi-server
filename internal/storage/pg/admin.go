@@ -643,6 +643,10 @@ SELECT f.id, f.vault_id, v.slug, v.name, f.role, f.peer_url, f.jurisdiction, f.s
        END,
        (SELECT count(*) FROM audit_log a
          WHERE a.vault_id = f.vault_id AND a.action = 'federation.mirror_violation'
+           AND a.payload->>'peer_url' = f.peer_url AND a.created_at > NOW() - interval '24 hours'),
+       f.last_integrity_at, f.publish,
+       (SELECT count(*) FROM audit_log a
+         WHERE a.vault_id = f.vault_id AND a.action = 'federation.mirror_divergent'
            AND a.payload->>'peer_url' = f.peer_url AND a.created_at > NOW() - interval '24 hours')
   FROM vault_federations f
   JOIN vaults v ON v.id = f.vault_id
@@ -655,7 +659,8 @@ func scanAdminFederation(row pgx.Row) (admin.Federation, error) {
 		&f.Status, &f.LastAckedSeq, &f.ControlSeq, &f.CreatedAt, &f.RevokedAt,
 		&f.Mode, &f.SeverPolicy, &f.MirrorAckedSeq, &f.HomeSeq, &f.HeadSeq,
 		&f.LastContactAt, &f.PausedAt, &f.PromotedAt,
-		&f.PendingDeletes, &f.OldestPendingDeleteAt, &f.Violations24h)
+		&f.PendingDeletes, &f.OldestPendingDeleteAt, &f.Violations24h,
+		&f.LastIntegrityAt, &f.Publish, &f.Divergent24h)
 	if err != nil {
 		return admin.Federation{}, fmt.Errorf("admin store: federation: %w", errMap(err))
 	}

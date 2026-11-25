@@ -218,6 +218,13 @@ const (
 	ActionMirrorLocalWriteBlocked   = "mirror.local_write_blocked"  // mirror: a local write was refused
 	ActionMirrorPromote             = "mirror.promote"
 	ActionMirrorPurged              = "mirror.purged"
+	// M2/M3 (docs/SPEC-ESPELHO-SELADO.md §A8, §A9, §A15).
+	ActionFederationMirrorDivergent = "federation.mirror_divergent" // home: a mirror's copy is not dominated by home's
+	ActionFederationErasureLagging  = "federation.erasure_lagging"  // home: a mirror has not applied deletes within the SLA
+	ActionFederationUnlinked        = "federation.unlinked"         // home: the mirror's operator unlinked
+	ActionMirrorIntegrity           = "mirror.integrity"            // mirror: an integrity pass rewrote files
+	ActionPublishEnable             = "publish.enable"
+	ActionPublishDisable            = "publish.disable"
 )
 
 // Federation binds a vault to a peer server (v3 F1). On the home server the
@@ -247,6 +254,11 @@ type Federation struct {
 	PausedAt          *time.Time
 	ResyncRequestedAt *time.Time
 	PromotedAt        *time.Time
+	// LastIntegrityAt (mirror side): last completed integrity pass.
+	LastIntegrityAt *time.Time
+	// Publish is the publish policy JSON of a publish mirror link (nil
+	// for every other link); see federation.PublishPolicy.
+	Publish []byte
 }
 
 // IsMirrorFollower reports whether this row makes the local vault a
@@ -271,4 +283,15 @@ type FederationInvite struct {
 	// fixed by home at invite time.
 	Mode        string
 	SeverPolicy string
+	// Publish is the publish policy JSON (nil = not a publish mirror).
+	Publish []byte
+}
+
+// PublishSetting is a mirror operator's opt-in to serve a publish mirror
+// anonymously (publish_settings, migration 0012).
+type PublishSetting struct {
+	VaultID   uuid.UUID
+	BasePath  string // "/p/<slug>"
+	Robots    string // "noindex" | "index"
+	EnabledAt time.Time
 }

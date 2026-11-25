@@ -204,6 +204,10 @@ func TestMirrorVault_EveryWriteRouteIsReadOnly(t *testing.T) {
 			t.Errorf("%s on a mirror: %d %v, want 403 mirror_read_only", key, status, out)
 		}
 	}
+	// M2: a read-only live socket is a read and works on a mirror.
+	if status, out := call(http.MethodPost, "/api/vaults/"+vaultID.String()+"/notes/"+noteID+"/ws-ticket", token, map[string]string{"mode": "read"}); status != http.StatusCreated || out["mode"] != "read" {
+		t.Errorf("read ticket on a mirror: %d %v", status, out)
+	}
 	sort.Strings(checked)
 	t.Logf("checked %d write routes:\n%s", len(checked), strings.Join(checked, "\n"))
 	if len(checked) < 20 {

@@ -71,8 +71,10 @@ func TestMirrorAdminRoutes(t *testing.T) {
 	if r := h.do(t, "POST", "/admin/v1/federations/"+home.ID.String()+"/resync", h.token, ""); r.status != 400 {
 		t.Fatalf("resync on home side: %d %s", r.status, r.body)
 	}
-	if r := h.do(t, "POST", "/admin/v1/federations/"+follower.ID.String()+"/resync", h.token, `{"note_id":"a"}`); r.status != 400 {
-		t.Fatalf("single-note resync: %d %s", r.status, r.body)
+	// Single-note resync needs the running server (the CLI's MirrorOps
+	// cannot reach a live session).
+	if r := h.do(t, "POST", "/admin/v1/federations/"+follower.ID.String()+"/resync", h.token, `{"note_id":"a"}`); r.status != 409 {
+		t.Fatalf("single-note resync without a live relay: %d %s", r.status, r.body)
 	}
 	if r := h.do(t, "POST", "/admin/v1/federations/"+follower.ID.String()+"/resync", h.token, ""); r.status != 200 {
 		t.Fatalf("resync: %d %s", r.status, r.body)
@@ -116,5 +118,40 @@ func TestPromoteMirror(t *testing.T) {
 	}
 	if _, _, err := f.svc.PromoteMirror(ctx, CLI, "book"); err == nil {
 		t.Fatal("second promotion accepted")
+	}
+}
+
+type noteMirrorOps struct {
+	fakeMirrorOps
+	notes []string
+}
+
+func (m *noteMirrorOps) ResyncNote(_ context.Context, id uuid.UUID, noteID string) (domain.Federation, error) {
+	m.notes = append(m.notes, id.String()+":"+noteID)
+	return domain.Federation{ID: id}, nil
+}
+
+func TestMirrorAdmin_SingleNoteResync(t *testing.T) {
+	h := newHarness(t)
+	ops := &noteMirrorOps{}
+	h.svc.Mirrors = ops
+	follower := &Federation{ID: uuid.New(), VaultID: uuid.New(), Role: "follower", Mode: "mirror", PeerURL: "https://home.example",
+		Status: "active", CreatedAt: time.Now(), Publish: []byte(`{"allowed":true,"scope":"flagged"}`)}
+	h.store.feds[follower.ID] = follower
+	r := h.do(t, "POST", "/admin/v1/federations/"+follower.ID.String()+"/resync", h.token, `{"note_id":"alpha"}`)
+	if r.status != 200 {
+		t.Fatalf("note resync: %d %s", r.status, r.body)
+	}
+	if len(ops.notes) != 1 || ops.notes[0] != follower.ID.String()+":alpha" || len(ops.calls) != 0 {
+		t.Fatalf("ops = %v / %v", ops.notes, ops.calls)
+	}
+	if a := checkAdminAudit(t, h, ActionMirrorResync, nil); !strings.Contains(string(a.Payload), `"note_id":"alpha"`) {
+		t.Fatalf("audit payload %s", a.Payload)
+	}
+	if pub, _ := r.json(t)["publish"].(map[string]any); pub["scope"] != "flagged" {
+		t.Fatalf("publish in detail: %s", r.body)
+	}
+	if r := h.do(t, "POST", "/admin/v1/federations/"+follower.ID.String()+"/resync", h.token, `{"note_id":"`+strings.Repeat("x", 300)+`"}`); r.status != 400 {
+		t.Fatalf("long note id: %d", r.status)
 	}
 }

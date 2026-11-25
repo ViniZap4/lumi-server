@@ -197,6 +197,9 @@ type LinkStats struct {
 	LagSeq                int64
 	PendingDeletes        int64
 	OldestPendingDeleteAt *time.Time
+	// ErasureLagging: the oldest unacknowledged delete is older than the
+	// erasure SLA (LUMI_MIRROR_ERASURE_SLA, §A8).
+	ErasureLagging bool
 }
 
 // MirrorLinkStats computes lag and pending deletes of a home-side mirror
@@ -214,6 +217,9 @@ func (s *Service) MirrorLinkStats(ctx context.Context, f domain.Federation) Link
 	}
 	if n, oldest, err := s.mirrors.PendingDeletes(ctx, f.VaultID, f.MirrorAckedSeq); err == nil {
 		st.PendingDeletes, st.OldestPendingDeleteAt = n, oldest
+		if n > 0 && oldest != nil && s.now().Sub(*oldest) > s.ErasureSLA() {
+			st.ErasureLagging = true
+		}
 	}
 	return st
 }

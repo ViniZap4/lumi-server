@@ -53,12 +53,13 @@ func NewFederationStore(pool *pgxpool.Pool) *FederationStore {
 }
 
 const federationCols = `id, vault_id, role, peer_url, peer_pubkey, jurisdiction, status, last_acked_seq, created_at, revoked_at,
-  mode, sever_policy, mirror_acked_seq, home_seq, last_contact_at, paused_at, resync_requested_at, promoted_at`
+  mode, sever_policy, mirror_acked_seq, home_seq, last_contact_at, paused_at, resync_requested_at, promoted_at,
+  last_integrity_at, publish`
 
 func (s *FederationStore) Insert(ctx context.Context, f domain.Federation) (domain.Federation, error) {
 	const q = `
-INSERT INTO vault_federations (id, vault_id, role, peer_url, peer_pubkey, jurisdiction, status, created_at, mode, sever_policy)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+INSERT INTO vault_federations (id, vault_id, role, peer_url, peer_pubkey, jurisdiction, status, created_at, mode, sever_policy, publish)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
 	if f.ID == uuid.Nil {
 		f.ID = uuid.New()
 	}
@@ -71,7 +72,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 	if f.SeverPolicy == "" {
 		f.SeverPolicy = "keep"
 	}
-	_, err := s.pool.Exec(ctx, q, f.ID, f.VaultID, f.Role, f.PeerURL, f.PeerPubKey, f.Jurisdiction, f.Status, f.CreatedAt, f.Mode, f.SeverPolicy)
+	_, err := s.pool.Exec(ctx, q, f.ID, f.VaultID, f.Role, f.PeerURL, f.PeerPubKey, f.Jurisdiction, f.Status, f.CreatedAt, f.Mode, f.SeverPolicy, jsonbOrNil(f.Publish))
 	if err != nil {
 		return domain.Federation{}, fmt.Errorf("federation store: insert: %w", errMap(err))
 	}
@@ -151,7 +152,8 @@ func (s *FederationStore) UpdateStatus(ctx context.Context, id uuid.UUID, status
 func scanFederation(scan func(dest ...any) error) (domain.Federation, error) {
 	var f domain.Federation
 	if err := scan(&f.ID, &f.VaultID, &f.Role, &f.PeerURL, &f.PeerPubKey, &f.Jurisdiction, &f.Status, &f.LastAckedSeq, &f.CreatedAt, &f.RevokedAt,
-		&f.Mode, &f.SeverPolicy, &f.MirrorAckedSeq, &f.HomeSeq, &f.LastContactAt, &f.PausedAt, &f.ResyncRequestedAt, &f.PromotedAt); err != nil {
+		&f.Mode, &f.SeverPolicy, &f.MirrorAckedSeq, &f.HomeSeq, &f.LastContactAt, &f.PausedAt, &f.ResyncRequestedAt, &f.PromotedAt,
+		&f.LastIntegrityAt, &f.Publish); err != nil {
 		return domain.Federation{}, err
 	}
 	return f, nil
@@ -276,19 +278,19 @@ func NewFederationInviteStore(pool *pgxpool.Pool) *FederationInviteStore {
 	return &FederationInviteStore{pool: pool}
 }
 
-const fedInviteCols = `token, vault_id, inviter_user_id, server_url_hint, expires_at, created_at, used_at, revoked_at, mode, sever_policy`
+const fedInviteCols = `token, vault_id, inviter_user_id, server_url_hint, expires_at, created_at, used_at, revoked_at, mode, sever_policy, publish`
 
 func (s *FederationInviteStore) Create(ctx context.Context, inv domain.FederationInvite) error {
 	const q = `
-INSERT INTO federation_invites (token, vault_id, inviter_user_id, server_url_hint, expires_at, created_at, mode, sever_policy)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+INSERT INTO federation_invites (token, vault_id, inviter_user_id, server_url_hint, expires_at, created_at, mode, sever_policy, publish)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 	if inv.Mode == "" {
 		inv.Mode = "replica"
 	}
 	if inv.SeverPolicy == "" {
 		inv.SeverPolicy = "keep"
 	}
-	_, err := s.pool.Exec(ctx, q, inv.Token, inv.VaultID, inv.InviterUserID, inv.ServerURLHint, inv.ExpiresAt, inv.CreatedAt, inv.Mode, inv.SeverPolicy)
+	_, err := s.pool.Exec(ctx, q, inv.Token, inv.VaultID, inv.InviterUserID, inv.ServerURLHint, inv.ExpiresAt, inv.CreatedAt, inv.Mode, inv.SeverPolicy, jsonbOrNil(inv.Publish))
 	if err != nil {
 		return fmt.Errorf("federation invite store: create: %w", errMap(err))
 	}
@@ -300,7 +302,7 @@ func (s *FederationInviteStore) Get(ctx context.Context, token string) (domain.F
 	var inv domain.FederationInvite
 	err := s.pool.QueryRow(ctx, q, token).Scan(
 		&inv.Token, &inv.VaultID, &inv.InviterUserID, &inv.ServerURLHint,
-		&inv.ExpiresAt, &inv.CreatedAt, &inv.UsedAt, &inv.RevokedAt, &inv.Mode, &inv.SeverPolicy,
+		&inv.ExpiresAt, &inv.CreatedAt, &inv.UsedAt, &inv.RevokedAt, &inv.Mode, &inv.SeverPolicy, &inv.Publish,
 	)
 	if err != nil {
 		if errors.Is(errMap(err), domain.ErrNotFound) {
@@ -349,11 +351,30 @@ func (s *FederationInviteStore) ListForVault(ctx context.Context, vaultID uuid.U
 		var inv domain.FederationInvite
 		if err := rows.Scan(
 			&inv.Token, &inv.VaultID, &inv.InviterUserID, &inv.ServerURLHint,
-			&inv.ExpiresAt, &inv.CreatedAt, &inv.UsedAt, &inv.RevokedAt, &inv.Mode, &inv.SeverPolicy,
+			&inv.ExpiresAt, &inv.CreatedAt, &inv.UsedAt, &inv.RevokedAt, &inv.Mode, &inv.SeverPolicy, &inv.Publish,
 		); err != nil {
 			return nil, fmt.Errorf("federation invite store: list scan: %w", err)
 		}
 		out = append(out, inv)
 	}
 	return out, rows.Err()
+}
+
+// jsonbOrNil passes a JSON document to a JSONB parameter (nil → NULL).
+func jsonbOrNil(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return string(b)
+}
+
+// RecordIntegrity stamps a mirror link's last completed integrity pass.
+func (s *FederationStore) RecordIntegrity(ctx context.Context, vaultID uuid.UUID, peerURL string, at time.Time) error {
+	_, err := s.pool.Exec(ctx, `
+UPDATE vault_federations SET last_integrity_at = $3
+ WHERE vault_id = $1 AND peer_url = $2 AND role = 'follower'`, vaultID, peerURL, at)
+	if err != nil {
+		return fmt.Errorf("federation store: integrity: %w", errMap(err))
+	}
+	return nil
 }
