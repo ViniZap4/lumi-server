@@ -2,6 +2,7 @@ package auth
 
 import (
 	"errors"
+	"strconv"
 
 	"github.com/gofiber/fiber/v2"
 
@@ -109,6 +110,10 @@ func (h *Handlers) RegisterHandler(c *fiber.Ctx) error {
 		UserAgent: c.Get(fiber.HeaderUserAgent),
 	})
 	if err != nil {
+		var locked *domain.AccountLockedError
+		if errors.As(err, &locked) {
+			return accountLocked(c, locked)
+		}
 		return mapServiceErr(c, err)
 	}
 	user, err := h.svc.users.GetByID(c.UserContext(), sess.UserID)
@@ -142,6 +147,10 @@ func (h *Handlers) Login(c *fiber.Ctx) error {
 		UserAgent: c.Get(fiber.HeaderUserAgent),
 	})
 	if err != nil {
+		var locked *domain.AccountLockedError
+		if errors.As(err, &locked) {
+			return accountLocked(c, locked)
+		}
 		return mapServiceErr(c, err)
 	}
 	user, err := h.svc.users.GetByID(c.UserContext(), sess.UserID)
@@ -219,6 +228,10 @@ func (h *Handlers) RedeemDeviceLink(c *fiber.Ctx) error {
 	sess, err := h.svc.RedeemDeviceLink(c.UserContext(), body.Code, body.Verifier, body.Label,
 		c.IP(), c.Get(fiber.HeaderUserAgent))
 	if err != nil {
+		var locked *domain.AccountLockedError
+		if errors.As(err, &locked) {
+			return accountLocked(c, locked)
+		}
 		return mapServiceErr(c, err)
 	}
 	user, err := h.svc.users.GetByID(c.UserContext(), sess.UserID)
@@ -285,6 +298,14 @@ func (h *Handlers) ChangePassword(c *fiber.Ctx) error {
 		return mapServiceErr(c, err)
 	}
 	return c.Status(fiber.StatusNoContent).Send(nil)
+}
+
+// accountLocked answers a right password on a locked account:
+// 423 {"error":"account_locked","retry_after":<s>} with Retry-After.
+func accountLocked(c *fiber.Ctx, e *domain.AccountLockedError) error {
+	secs := e.RetryAfterSeconds()
+	c.Set(fiber.HeaderRetryAfter, strconv.Itoa(secs))
+	return c.Status(fiber.StatusLocked).JSON(fiber.Map{"error": "account_locked", "retry_after": secs})
 }
 
 func mapServiceErr(c *fiber.Ctx, err error) error {

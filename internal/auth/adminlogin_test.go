@@ -111,16 +111,26 @@ func TestAdminLogin_LockoutShared(t *testing.T) {
 		t.Fatal("not locked after the threshold")
 	}
 	good := LoginInput{Username: "alice", Password: "correct horse 9"}
-	if _, err := svc.AdminLogin(ctx, good); !errors.Is(err, domain.ErrInvalidCredentials) {
+	if _, err := svc.AdminLogin(ctx, good); !errors.Is(err, domain.ErrAccountLocked) {
 		t.Fatalf("locked admin login: %v", err)
 	}
 	if e, p := audit.last(t); e.Action != domain.ActionAdminLoginFailed || p["reason"] != "account_locked" {
 		t.Fatalf("audit %s %v", e.Action, p)
 	}
+	// A wrong password while locked reveals nothing.
+	if _, err := svc.AdminLogin(ctx, LoginInput{Username: "alice", Password: "wrong pass 1"}); !errors.Is(err, domain.ErrInvalidCredentials) {
+		t.Fatalf("locked admin wrong password: %v", err)
+	}
 	// The lock is the account's, not the route's: the public login is
-	// refused too.
-	if _, err := svc.Login(ctx, good); !errors.Is(err, domain.ErrInvalidCredentials) {
+	// refused too, with the same account_locked.
+	if _, err := svc.Login(ctx, good); !errors.Is(err, domain.ErrAccountLocked) {
 		t.Fatalf("public login while locked: %v", err)
+	}
+	// A locked non-admin with the right password learns nothing from the
+	// panel (it stays the generic refusal), but does on the public login.
+	repo.users[u.ID].ServerAdmin = false
+	if _, err := svc.AdminLogin(ctx, good); !errors.Is(err, domain.ErrInvalidCredentials) || errors.Is(err, domain.ErrAccountLocked) {
+		t.Fatalf("locked non-admin panel login: %v", err)
 	}
 }
 

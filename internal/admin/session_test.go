@@ -285,3 +285,27 @@ func TestCredentialParsing(t *testing.T) {
 		}
 	}
 }
+
+// lockedLogin plays a locked server admin: the right password gets the
+// lock, anything else the generic refusal.
+type lockedLogin struct{ fakeLogin }
+
+func (l *lockedLogin) AdminLogin(ctx context.Context, in auth.LoginInput) (domain.User, error) {
+	if in.Username == "alice" && in.Password == "correct horse 9" {
+		return domain.User{}, &domain.AccountLockedError{RetryAfter: 42 * time.Second}
+	}
+	return domain.User{}, domain.ErrInvalidCredentials
+}
+
+func TestSessionLogin_LockedAdmin(t *testing.T) {
+	h, _, _ := newSessionHarness(t)
+	h.svc.Login = &lockedLogin{}
+	r := h.login(t, "alice", "correct horse 9")
+	if r.status != 423 || r.header.Get("Retry-After") != "42" || r.body != `{"error":"account_locked","retry_after":42}` {
+		t.Fatalf("locked: %d %q %s", r.status, r.header.Get("Retry-After"), r.body)
+	}
+	r = h.login(t, "alice", "wrong")
+	if r.status != 401 || r.body != `{"error":"invalid_credentials"}` {
+		t.Fatalf("wrong while locked: %d %s", r.status, r.body)
+	}
+}

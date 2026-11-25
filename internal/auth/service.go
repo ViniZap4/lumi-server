@@ -234,10 +234,18 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (domain.Session, err
 // be a server admin. Every refusal is audited as admin.login_failed and
 // answered with domain.ErrInvalidCredentials (or domain.ErrRateLimited),
 // so the caller cannot tell an unknown user from a wrong password, a
-// locked account or a non-admin. It issues nothing: the admin service
+// disabled account or a non-admin. The one exception mirrors the public
+// login: a locked server admin who gives the RIGHT password gets
+// *domain.AccountLockedError. It issues nothing: the admin service
 // mints its own session token.
 func (s *Service) AdminLogin(ctx context.Context, in LoginInput) (domain.User, error) {
 	user, err := s.verifyLogin(ctx, in, domain.ActionAdminLoginFailed)
+	var locked *domain.AccountLockedError
+	if errors.As(err, &locked) && !user.ServerAdmin {
+		// The panel tells a lock only to a server admin who proved the
+		// password; anyone else learns nothing about the account.
+		return domain.User{}, domain.ErrInvalidCredentials
+	}
 	if err != nil {
 		return domain.User{}, err
 	}
@@ -286,13 +294,25 @@ func (s *Service) verifyLogin(ctx context.Context, in LoginInput, failAction str
 		return domain.User{}, domain.ErrInvalidCredentials
 	}
 
-	// A disabled or locked account gets the same answer as a wrong
-	// password, after the same bcrypt cost, so the response reveals
-	// neither the state nor that the account exists.
+	// A disabled account gets the same answer as a wrong password, after
+	// the same bcrypt cost, so the response reveals neither the state nor
+	// that the account exists. A locked account is told so only when the
+	// password is right (the caller already owns the account); a wrong
+	// password during the lock is the generic refusal and does not extend
+	// the lock.
 	if realUser {
-		if reason := blockedReason(user, time.Now()); reason != "" {
-			_ = CheckPassword(s.dummyHash, in.Password)
+		now := time.Now()
+		if reason := blockedReason(user, now); reason != "" {
 			id := user.ID
+			if reason == "account_locked" {
+				if CheckPassword(hash, in.Password) == nil {
+					fail(&id, reason)
+					return user, &domain.AccountLockedError{RetryAfter: user.LockedUntil.Sub(now)}
+				}
+				fail(&id, "account_locked_bad_password")
+				return domain.User{}, domain.ErrInvalidCredentials
+			}
+			_ = CheckPassword(s.dummyHash, in.Password)
 			fail(&id, reason)
 			return domain.User{}, domain.ErrInvalidCredentials
 		}

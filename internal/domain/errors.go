@@ -3,6 +3,8 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"math"
+	"time"
 )
 
 // Sentinel errors. HTTP layer maps these to status codes; service layer wraps
@@ -27,7 +29,29 @@ var (
 	ErrRateLimited        = errors.New("rate limited")
 	ErrTLSRequired        = errors.New("TLS required")
 	ErrResyncRequired     = errors.New("resync required")
+	ErrAccountLocked      = errors.New("account locked")
 )
+
+// AccountLockedError refuses a login whose password was RIGHT but whose
+// account is under the persistent lockout. Only a caller that proved the
+// password learns of the lock; a wrong password during a lock stays
+// ErrInvalidCredentials (no username or lock oracle). HTTP layers answer
+// 423 {"error":"account_locked","retry_after":<s>} with Retry-After.
+type AccountLockedError struct {
+	RetryAfter time.Duration
+}
+
+func (e *AccountLockedError) Error() string { return "account locked" }
+func (e *AccountLockedError) Unwrap() error { return ErrAccountLocked }
+
+// RetryAfterSeconds is RetryAfter rounded up, at least 1.
+func (e *AccountLockedError) RetryAfterSeconds() int {
+	s := int(math.Ceil(e.RetryAfter.Seconds()))
+	if s < 1 {
+		s = 1
+	}
+	return s
+}
 
 // ErrMirrorReadOnly refuses a write to a vault this server only mirrors
 // (docs/SPEC-ESPELHO-SELADO.md §A6). It is an ErrForbidden; HTTP layers

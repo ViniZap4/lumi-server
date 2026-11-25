@@ -1,12 +1,18 @@
 package auth
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"golang.org/x/crypto/bcrypt"
@@ -152,8 +158,9 @@ func TestLoginRefusesDisabledAndLocked(t *testing.T) {
 	}
 	repo.users[u.ID].DisabledAt = nil
 
-	// Wrong passwords count and lock after the threshold; the lock then
-	// refuses even the right password, with the same error.
+	// Wrong passwords count and lock after the threshold. The lock then
+	// refuses the right password with account_locked (the caller proved
+	// ownership) and a wrong one with the generic error (no lock oracle).
 	for i := 0; i < LockoutThreshold; i++ {
 		if _, err := svc.Login(ctx, LoginInput{Username: "alice", Password: "wrong pass 1"}); !errors.Is(err, domain.ErrInvalidCredentials) {
 			t.Fatal(err)
@@ -162,12 +169,30 @@ func TestLoginRefusesDisabledAndLocked(t *testing.T) {
 	if repo.fails != LockoutThreshold || repo.users[u.ID].LockedUntil == nil {
 		t.Fatalf("fails=%d locked=%v", repo.fails, repo.users[u.ID].LockedUntil)
 	}
-	if _, err := svc.Login(ctx, good); !errors.Is(err, domain.ErrInvalidCredentials) {
+	_, err = svc.Login(ctx, good)
+	var locked *domain.AccountLockedError
+	if !errors.As(err, &locked) || !errors.Is(err, domain.ErrAccountLocked) || errors.Is(err, domain.ErrInvalidCredentials) {
 		t.Fatalf("locked login: %v", err)
+	}
+	if s := locked.RetryAfterSeconds(); s < 1 || s > 60 {
+		t.Fatalf("retry_after = %d", s)
+	}
+	if _, err := svc.Login(ctx, LoginInput{Username: "alice", Password: "wrong pass 1"}); !errors.Is(err, domain.ErrInvalidCredentials) || errors.Is(err, domain.ErrAccountLocked) {
+		t.Fatalf("wrong password while locked: %v", err)
 	}
 	if repo.fails != LockoutThreshold {
 		t.Fatal("attempts during the lock were counted")
 	}
+	if len(sess.m) != 0 {
+		t.Fatal("a locked login issued a session")
+	}
+	// Disabled beats locked: the generic refusal even with the password.
+	now2 := time.Now()
+	repo.users[u.ID].DisabledAt = &now2
+	if _, err := svc.Login(ctx, good); !errors.Is(err, domain.ErrInvalidCredentials) {
+		t.Fatalf("disabled+locked login: %v", err)
+	}
+	repo.users[u.ID].DisabledAt = nil
 
 	// Unlock (operator) then a successful login resets the counter.
 	repo.users[u.ID].LockedUntil = nil
@@ -176,5 +201,58 @@ func TestLoginRefusesDisabledAndLocked(t *testing.T) {
 	}
 	if repo.reset != 1 || repo.users[u.ID].FailedLogins != 0 {
 		t.Fatalf("reset=%d failed=%d", repo.reset, repo.users[u.ID].FailedLogins)
+	}
+}
+
+// TestLoginHTTPLockedContract pins the wire contract the clients build on:
+// right password on a locked account → 423 account_locked + retry_after +
+// Retry-After; wrong password → the plain 401 invalid_credentials.
+func TestLoginHTTPLockedContract(t *testing.T) {
+	svc, repo, _, u := newLockoutService(t)
+	until := time.Now().Add(90 * time.Second)
+	repo.users[u.ID].LockedUntil = &until
+	app := fiber.New()
+	NewHandlers(svc).Register(app)
+
+	post := func(pw string) (*http.Response, map[string]any) {
+		b, _ := json.Marshal(map[string]string{"username": "alice", "password": pw})
+		req := httptest.NewRequest("POST", "/api/auth/login", bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		out := map[string]any{}
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp, out
+	}
+
+	resp, body := post("correct horse 9")
+	if resp.StatusCode != http.StatusLocked || body["error"] != "account_locked" {
+		t.Fatalf("locked: %d %v", resp.StatusCode, body)
+	}
+	ra, ok := body["retry_after"].(float64)
+	if !ok || ra < 85 || ra > 91 || float64(int(ra)) != ra {
+		t.Fatalf("retry_after %v", body["retry_after"])
+	}
+	if h := resp.Header.Get("Retry-After"); h != strconv.Itoa(int(ra)) {
+		t.Fatalf("Retry-After header %q vs %v", h, ra)
+	}
+	if _, has := body["token"]; has {
+		t.Fatal("token leaked on a locked login")
+	}
+
+	resp, body = post("wrong pass 1")
+	if resp.StatusCode != http.StatusUnauthorized || body["error"] != "invalid_credentials" || resp.Header.Get("Retry-After") != "" || len(body) != 1 {
+		t.Fatalf("wrong while locked: %d %v", resp.StatusCode, body)
+	}
+	// Unknown user: same 401 shape.
+	b, _ := json.Marshal(map[string]string{"username": "nobody", "password": "correct horse 9"})
+	req := httptest.NewRequest("POST", "/api/auth/login", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	r2, _ := app.Test(req, -1)
+	if r2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unknown: %d", r2.StatusCode)
 	}
 }

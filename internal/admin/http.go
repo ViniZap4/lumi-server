@@ -855,8 +855,10 @@ type sessionReq struct {
 //
 // 201 {"token": "lps_…", "id", "name", "kind": "session", "expires_at",
 // "user": {"id","username"}}. Every refusal (unknown user, wrong password,
-// locked or disabled account, not a server admin) is the same
-// 401 {"error":"invalid_credentials"}; the per-IP failure budget of the
+// disabled account, not a server admin, a wrong password on a locked
+// account) is the same 401 {"error":"invalid_credentials"}; only a server
+// admin who gives the right password on a locked account gets
+// 423 {"error":"account_locked","retry_after":<s>} with Retry-After; the per-IP failure budget of the
 // admin listener applies on top of the login's own per-IP and per-user
 // limits (429 rate_limited with Retry-After either way).
 func (h *HTTP) createSession(c *fiber.Ctx) error {
@@ -877,6 +879,14 @@ func (h *HTTP) createSession(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusCreated).JSON(out)
 	case errors.Is(err, domain.ErrRateLimited):
 		return rateLimited(c, time.Minute)
+	case errors.Is(err, domain.ErrAccountLocked):
+		var locked *domain.AccountLockedError
+		secs := 60
+		if errors.As(err, &locked) {
+			secs = locked.RetryAfterSeconds()
+		}
+		c.Set(fiber.HeaderRetryAfter, strconv.Itoa(secs))
+		return c.Status(fiber.StatusLocked).JSON(fiber.Map{"error": "account_locked", "retry_after": secs})
 	case errors.Is(err, domain.ErrInvalidCredentials):
 		if ok, wait := h.Limiter.Allow(key); !ok {
 			return rateLimited(c, wait)
