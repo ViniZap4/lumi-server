@@ -70,6 +70,12 @@ const (
 	CloseNotFound     = 4404
 )
 
+// Socket modes of a ws-ticket.
+const (
+	ModeEdit = "edit"
+	ModeRead = "read"
+)
+
 // RevalidateInterval is how often a live socket re-checks its session and
 // note.edit capability.
 var RevalidateInterval = 2 * time.Minute
@@ -163,7 +169,7 @@ type rejection struct {
 }
 
 // authorize runs every gate and returns the user id or the close code.
-func (h *Handler) authorize(ctx context.Context, token string, vaultID uuid.UUID, noteID string) (uuid.UUID, *rejection) {
+func (h *Handler) authorize(ctx context.Context, token string, vaultID uuid.UUID, noteID string, readOnly bool) (uuid.UUID, *rejection) {
 	if token == "" {
 		return uuid.Nil, &rejection{CloseUnauthorized, "unauthorized"}
 	}
@@ -178,15 +184,16 @@ func (h *Handler) authorize(ctx context.Context, token string, vaultID uuid.UUID
 			return uuid.Nil, &rejection{websocket.CloseInternalServerErr, "auth_unavailable"}
 		}
 	}
-	if rej := h.authorizeUser(ctx, uid, vaultID, noteID); rej != nil {
+	if rej := h.authorizeUser(ctx, uid, vaultID, noteID, readOnly); rej != nil {
 		return uuid.Nil, rej
 	}
 	return uid, nil
 }
 
 // authorizeUser runs the capability and existence gates for an already
-// authenticated user.
-func (h *Handler) authorizeUser(ctx context.Context, uid, vaultID uuid.UUID, noteID string) *rejection {
+// authenticated user: note.edit for a live editing socket, note.read for
+// a read-only one (docs/SPEC-ESPELHO-SELADO.md §A6.2).
+func (h *Handler) authorizeUser(ctx context.Context, uid, vaultID uuid.UUID, noteID string, readOnly bool) *rejection {
 	role, err := h.resolver.RoleForUser(ctx, vaultID, uid)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
@@ -194,7 +201,11 @@ func (h *Handler) authorizeUser(ctx context.Context, uid, vaultID uuid.UUID, not
 		}
 		return &rejection{websocket.CloseInternalServerErr, "authz_unavailable"}
 	}
-	if !role.Capabilities.Has(domain.CapNoteEdit) {
+	need := domain.CapNoteEdit
+	if readOnly {
+		need = domain.CapNoteRead
+	}
+	if !role.Capabilities.Has(need) {
 		if role.MirrorReadOnly {
 			return &rejection{CloseForbidden, "mirror_read_only"}
 		}
@@ -277,9 +288,10 @@ func (h *Handler) redeemTicket(c *fiber.Ctx, ticket string, vaultID uuid.UUID, v
 			return "", uuid.Nil, invalid
 		}
 	}
-	if rej := h.authorizeUser(ctx, uid, vaultID, noteID); rej != nil {
+	if rej := h.authorizeUser(ctx, uid, vaultID, noteID, b.ReadOnly); rej != nil {
 		return "", uuid.Nil, rej
 	}
+	c.Locals("wsync.readonly", b.ReadOnly)
 	if b.CRDTEpoch != "" && h.epochOf != nil {
 		cur, err := h.epochOf(ctx, vaultID, noteID)
 		switch {
@@ -305,7 +317,7 @@ func (h *Handler) authorizeLegacy(ctx context.Context, token string, vaultID uui
 		}
 		return uuid.Nil, &rejection{CloseNotFound, "note_not_found"}
 	default:
-		return h.authorize(ctx, token, vaultID, noteID)
+		return h.authorize(ctx, token, vaultID, noteID, false)
 	}
 }
 
@@ -351,6 +363,16 @@ type ticketResponse struct {
 	// CRDTEpoch is the lineage of the doc the socket will join (protocol
 	// §12). Omitted when the server runs without epoch support.
 	CRDTEpoch string `json:"crdt_epoch,omitempty"`
+	// Mode is "edit" or "read" (a read ticket's socket never edits).
+	Mode string `json:"mode"`
+}
+
+// ticketReq is the optional body of POST .../ws-ticket.
+type ticketReq struct {
+	// Mode: "edit" (default; needs note.edit) or "read" (needs only
+	// note.read; the socket is closed with 4403 read_only on any update
+	// that would change the doc).
+	Mode string `json:"mode"`
 }
 
 // issueTicket mints a single-use WS ticket for the caller's current
@@ -370,7 +392,22 @@ func (h *Handler) issueTicket(c *fiber.Ctx) error {
 	if noteID == "" || strings.ContainsAny(noteID, "/\\") {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not_found"})
 	}
-	if rej := h.authorizeUser(c.UserContext(), user.ID, vaultID, noteID); rej != nil {
+	var req ticketReq
+	if len(c.Body()) > 0 {
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_body"})
+		}
+	}
+	mode := ModeEdit
+	switch req.Mode {
+	case "", ModeEdit:
+	case ModeRead:
+		mode = ModeRead
+	default:
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "validation_failed", "detail": "mode must be edit or read"})
+	}
+	readOnly := mode == ModeRead
+	if rej := h.authorizeUser(c.UserContext(), user.ID, vaultID, noteID, readOnly); rej != nil {
 		switch rej.code {
 		case CloseForbidden:
 			if rej.reason == "mirror_read_only" {
@@ -407,7 +444,7 @@ func (h *Handler) issueTicket(c *fiber.Ctx) error {
 	// the handler returns: clone everything the table outlives us with.
 	ticket, exp, err := h.tickets.Issue(TicketBinding{
 		UserID: user.ID, Session: strings.Clone(sess.Token), VaultID: vaultID, NoteID: strings.Clone(noteID),
-		CRDTEpoch: epoch,
+		CRDTEpoch: epoch, ReadOnly: readOnly,
 	})
 	switch {
 	case errors.Is(err, ErrTicketUserLimit):
@@ -424,6 +461,7 @@ func (h *Handler) issueTicket(c *fiber.Ctx) error {
 		Ticket:    ticket,
 		ExpiresAt: exp.UTC().Format(time.RFC3339),
 		CRDTEpoch: epoch,
+		Mode:      mode,
 	})
 }
 
@@ -448,6 +486,7 @@ func (h *Handler) handleConn(c *websocket.Conn) {
 	}
 	userID, _ := c.Locals("wsync.user").(uuid.UUID)
 	clientID, _ := c.Locals("wsync.client").(uuid.UUID)
+	readOnly, _ := c.Locals("wsync.readonly").(bool)
 
 	// Cap memory growth from a hostile peer. Default is unlimited.
 	c.SetReadLimit(MaxFrameBytes)
@@ -462,6 +501,7 @@ func (h *Handler) handleConn(c *websocket.Conn) {
 	defer h.hub.ReleaseUserSlot(userID)
 
 	sub := h.hub.NewSubscriberWithClient(userID, clientID)
+	sub.ReadOnly = readOnly
 	// websocket.Conn doesn't expose UserContext — use a background ctx
 	// for the synchronous Join call (it returns quickly after LoadDoc).
 	room, err := h.hub.Join(context.Background(), vaultID, noteID, sub)
@@ -531,7 +571,7 @@ func (h *Handler) handleConn(c *websocket.Conn) {
 				return
 			case <-t.C:
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				_, rej := h.authorize(ctx, token, vaultID, noteID)
+				_, rej := h.authorize(ctx, token, vaultID, noteID, readOnly)
 				cancel()
 				if rej != nil && rej.code != websocket.CloseInternalServerErr {
 					_ = writeCloseCode(c, rej.code, rej.reason)
@@ -594,6 +634,16 @@ func (h *Handler) handleMessage(room *Room, sub *Subscriber, userID uuid.UUID, m
 			// Both carry an update blob the server should adopt and
 			// fan out. The distinction matters only to the client.
 			if len(msg.Body) == 0 {
+				return
+			}
+			if sub.ReadOnly {
+				// A read socket may echo what the server already has
+				// (the [0,0] Step2 of a fresh client, or a cached replica
+				// with nothing new); anything that would change the doc
+				// ends the socket.
+				if changed, err := room.WouldChange(msg.Body); err != nil || changed {
+					sub.CloseWithCode(CloseForbidden, "read_only")
+				}
 				return
 			}
 			if err := room.ApplyAndBroadcast(msg.Body, sub, userID); err != nil {

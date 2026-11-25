@@ -81,6 +81,9 @@ type TicketBinding struct {
 	// so a client never joins a history other than the one the ticket
 	// response told it about.
 	CRDTEpoch string
+	// ReadOnly marks a ticket minted with mode "read": the socket needs
+	// only note.read and never applies an update.
+	ReadOnly bool
 }
 
 type ticketEntry struct {

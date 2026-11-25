@@ -179,6 +179,10 @@ type Subscriber struct {
 	closeReason string
 
 	aw awarenessTracker
+
+	// ReadOnly marks a read-ticket socket: it receives the doc and live
+	// updates and never writes (any changing update closes it, 4403).
+	ReadOnly bool
 }
 
 // CloseSubscriber closes Done idempotently so the pump goroutine can exit.
@@ -627,6 +631,26 @@ func (h *Hub) View(ctx context.Context, vaultID uuid.UUID, noteID string, fn fun
 	}
 	defer h.release(room, false)
 	return fn(room.doc)
+}
+
+// WouldChange reports whether applying update would change the doc,
+// evaluated on a throwaway copy under the room's op lock.
+func (r *Room) WouldChange(update []byte) (bool, error) {
+	if len(update) == 0 || (len(update) == 2 && update[0] == 0 && update[1] == 0) {
+		return false, nil
+	}
+	r.opMu.Lock()
+	state, err := r.doc.EncodeStateAsUpdate()
+	r.opMu.Unlock()
+	if err != nil {
+		return false, err
+	}
+	probe, err := crdt.LoadDoc(state)
+	if err != nil {
+		return false, err
+	}
+	defer probe.Close()
+	return probe.ApplyUpdateChanged(update)
 }
 
 // Doc exposes the underlying CRDT document for handshake reads (state
