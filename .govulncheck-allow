@@ -1,0 +1,18 @@
+# Reachable vulnerabilities accepted for a limited time (read by scripts/govulncheck.sh).
+# Format: ID  expiry(YYYY-MM-DD, UTC)  reason. An expired entry blocks CI again.
+#
+# Go 1.25 standard library (and golang.org/x/net >= v0.60.0, which needs Go 1.26):
+# fixed only in Go 1.26.x. Clearing these needs the Go 1.25 -> 1.26 toolchain bump
+# (CI image, Dockerfile, go.mod), an owner decision because of the cgo libyrs link
+# (see the server Dockerfile note on LLVM bitcode). Found 2026-11-26 by govulncheck v1.7.0.
+GO-2026-6859  2026-12-31  stdlib net/http, fixed in go1.26.11 (toolchain bump pending)
+GO-2026-6809  2026-12-31  stdlib crypto/x509, fixed in go1.26.10 (toolchain bump pending)
+GO-2026-6617  2026-12-31  stdlib net/http + x/net, fixed in go1.26.9 / x/net v0.60.0 (needs Go 1.26)
+GO-2026-6613  2026-12-31  stdlib net/http, fixed in go1.26.9 (toolchain bump pending)
+GO-2026-6612  2026-12-31  stdlib net/http + x/net, fixed in go1.26.9 / x/net v0.60.0 (needs Go 1.26)
+GO-2026-6611  2026-12-31  stdlib net/http + x/net, fixed in go1.26.9 / x/net v0.60.0 (needs Go 1.26)
+GO-2026-6610  2026-12-31  stdlib net/http + x/net, fixed in go1.26.9 / x/net v0.60.0 (needs Go 1.26)
+GO-2026-6608  2026-12-31  stdlib mime/multipart + net/textproto, fixed in go1.26.9 (toolchain bump pending)
+GO-2026-6607  2026-12-31  stdlib crypto/tls, fixed in go1.26.9 (toolchain bump pending)
+GO-2026-6605  2026-12-31  stdlib net/http, fixed in go1.26.9 (toolchain bump pending)
+GO-2026-6603  2026-12-31  stdlib net/http + x/net, fixed in go1.26.9 / x/net v0.60.0 (needs Go 1.26)

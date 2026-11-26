@@ -29,6 +29,8 @@ jobs:
       RUSTUP_VERSION: "1.29.3"
       RUSTUP_SHA256: b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
       RUST_TOOLCHAIN: "1.100.0"
+      # govulncheck pinned (newest release that still builds with Go 1.25).
+      GOVULNCHECK_VERSION: "v1.7.0"
       CGO_ENABLED: "1"
     steps:
       - name: checkout (with third_party/y-crdt)
@@ -36,6 +38,10 @@ jobs:
           TOKEN: ${{ github.token }}
           SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           YCRDT_GIT_URL: ${{ vars.YCRDT_GIT_URL }}
+          # Base for the migration policy check: the PR's target branch, or the
+          # commit a push to main started from.
+          BASE_BRANCH: ${{ github.base_ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
           set -eu
           [ -n "$GITEA_URL" ] || { echo "::error::set the LAN_GIT_URL organisation variable"; exit 1; }
@@ -46,6 +52,13 @@ jobs:
           git remote add origin "$GITEA_URL/${{ github.repository }}.git"
           git fetch -q --depth 1 origin "$SHA"
           git checkout -q FETCH_HEAD
+          if [ -n "${BASE_BRANCH:-}" ]; then
+            printf '%s' "$BASE_BRANCH" | grep -Eq '^[A-Za-z0-9._/-]{1,100}$' || { echo "::error::invalid base branch"; exit 1; }
+            git fetch -q --depth 1 origin "+refs/heads/$BASE_BRANCH:refs/ci/migrations-base"
+          elif printf '%s' "${PUSH_BEFORE:-}" | grep -Eq '^[0-9a-f]{40}$' && [ "$PUSH_BEFORE" != 0000000000000000000000000000000000000000 ]; then
+            git fetch -q --depth 1 origin "$PUSH_BEFORE" && git update-ref refs/ci/migrations-base FETCH_HEAD \
+              || echo "::warning::could not fetch the push base $PUSH_BEFORE; migration check runs without a base"
+          fi
           # y-crdt is public on GitHub; optionally use a local mirror.
           if [ -n "${YCRDT_GIT_URL:-}" ]; then
             git config --global "url.$YCRDT_GIT_URL.insteadOf" "https://github.com/y-crdt/y-crdt.git"
@@ -54,6 +67,19 @@ jobs:
           git config --global --unset-all "http.$GITEA_URL/.extraheader"
           git log --oneline -1
           git submodule status
+
+      - name: migration policy (numbered by merge order, no gaps)
+        # See scripts/check-migrations.sh. Fails a PR whose new migration number is
+        # <= the max on the base, that edits/removes a shipped migration, or that
+        # leaves a gap or duplicate.
+        run: |
+          set -eu
+          sh scripts/check-migrations_test.sh
+          if git rev-parse --verify --quiet refs/ci/migrations-base >/dev/null; then
+            sh scripts/check-migrations.sh refs/ci/migrations-base
+          else
+            sh scripts/check-migrations.sh
+          fi
 
       - name: install Rust (pinned)
         run: |
@@ -82,6 +108,14 @@ jobs:
 
       - name: go vet
         run: go vet ./...
+
+      - name: govulncheck (blocking)
+        # Fails on any reachable vulnerability not listed (with an unexpired date)
+        # in .govulncheck-allow. Needs libyrs.h for the cgo packages, hence after libyrs.
+        run: |
+          set -eu
+          go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          sh scripts/govulncheck.sh ./...
 
       - name: go test
         # Real libyrs: the crdt/wsync/notes tests exercise yrs, not a stub.
