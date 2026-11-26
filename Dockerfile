@@ -13,17 +13,21 @@
 #      container, and /vaults owned by nonroot (65532) so a fresh named
 #      volume inherits a writable owner.
 # Both build images are bookworm (same glibc), so the .a links cleanly.
-# Note: Go >= 1.27 rejects archives carrying LLVM bitcode sections in
-# #cgo LDFLAGS; keep the Go image on 1.25.x (or strip bitcode) when bumping.
+# Note: since Go 1.26.x cmd/go rejects archives in #cgo LDFLAGS that carry
+# LLVM bitcode sections, and the Rust std objects inside libyrs.a ship with
+# embedded bitcode, so the yrs stage strips it (scripts/strip-lto.sh).
 
 # ---- yrs (y-crdt) ----------------------------------------------------------
 FROM rust:1.100.0-bookworm AS yrs
 WORKDIR /src
 COPY third_party/y-crdt ./third_party/y-crdt
-RUN cargo build --release --locked -p yffi --manifest-path third_party/y-crdt/Cargo.toml
+COPY scripts/strip-lto.sh ./scripts/strip-lto.sh
+RUN cargo build --release --locked -p yffi --manifest-path third_party/y-crdt/Cargo.toml \
+    && rustup component add llvm-tools \
+    && sh scripts/strip-lto.sh third_party/y-crdt/target/release/libyrs.a
 
 # ---- Go build --------------------------------------------------------------
-FROM golang:1.25.14-bookworm AS builder
+FROM golang:1.26.11-bookworm AS builder
 WORKDIR /src
 
 # Pre-fetch Go deps for a stable cache layer.

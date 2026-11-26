@@ -6,7 +6,7 @@ package notes
 // owns on top of SQL: routing, capability check, DTO mapping and JSON.
 // SQL itself is covered by the integration load test.
 //
-//   GOTOOLCHAIN=go1.25.5 go test -run '^$' -bench . -benchmem ./internal/notes
+//   GOTOOLCHAIN=go1.26.11 go test -run '^$' -bench . -benchmem ./internal/notes
 
 import (
 	"context"

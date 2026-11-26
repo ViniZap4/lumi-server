@@ -23,6 +23,8 @@ libyrs:
 	cargo build --release -p yffi --manifest-path $(YRS_DIR)/Cargo.toml
 	mkdir -p $(CRDT_LIBDIR) $(CRDT_INCDIR)
 	cp $(YRS_OUT)/libyrs.a $(CRDT_LIBDIR)/libyrs.a
+	# Go >= 1.26 refuses archives with embedded LLVM bitcode (Rust std ships it).
+	sh scripts/strip-lto.sh $(CRDT_LIBDIR)/libyrs.a
 	cp $(YRS_DIR)/tests-ffi/include/libyrs.h $(CRDT_INCDIR)/libyrs.h
 	# cbindgen emits redundant `typedef X X;` lines for opaque structs
 	# that cgo rejects as a "type conversion loop". Patch them out.

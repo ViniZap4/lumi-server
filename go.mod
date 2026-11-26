@@ -1,6 +1,8 @@
 module github.com/ViniZap4/lumi-server
 
-go 1.25.0
+go 1.26.0
+
+toolchain go1.26.11
 
 require (
 	github.com/fasthttp/websocket v1.5.3

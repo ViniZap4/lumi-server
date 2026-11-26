@@ -9,7 +9,7 @@ package wsync
 // (compaction is waited for before counting), so it gates the Postgres
 // work of the live path without a database in CI.
 //
-//   GOTOOLCHAIN=go1.25.5 go test -run '^$' -bench . -benchmem ./internal/wsync
+//   GOTOOLCHAIN=go1.26.11 go test -run '^$' -bench . -benchmem ./internal/wsync
 
 import (
 	"context"

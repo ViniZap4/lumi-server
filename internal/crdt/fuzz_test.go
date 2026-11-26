@@ -10,7 +10,7 @@ import (
 // Fuzz targets for the diff and the 3-way merge (Phase 3 quality harness,
 // docs/phase3/research/09 Q6). Local session:
 //
-//	GOTOOLCHAIN=go1.25.5 go test ./internal/crdt -run '^$' -fuzz FuzzDiffHunks -fuzztime 2m
+//	GOTOOLCHAIN=go1.26.11 go test ./internal/crdt -run '^$' -fuzz FuzzDiffHunks -fuzztime 2m
 //
 // The nightly CI job (`.gitea/workflows/fuzz-nightly.yml`) runs each
 // target longer. A crasher is written to testdata/fuzz/<Target>/ and then

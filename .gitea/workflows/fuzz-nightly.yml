@@ -27,7 +27,7 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     container:
-      image: golang:1.25.14-bookworm
+      image: golang:1.26.11-bookworm
     timeout-minutes: 60
     env:
       GITEA_URL: ${{ vars.LAN_GIT_URL }}
@@ -68,7 +68,7 @@ jobs:
             "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
           echo "${RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c -
           chmod +x /tmp/rustup-init
-          /tmp/rustup-init -y -q --no-modify-path --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+          /tmp/rustup-init -y -q --no-modify-path --profile minimal --component llvm-tools --default-toolchain "$RUST_TOOLCHAIN"
           rm -f /tmp/rustup-init
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 

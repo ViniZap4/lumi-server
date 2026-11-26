@@ -4,7 +4,7 @@ package crdt
 // CI runs them on the PR and on main and blocks a > 10 % regression
 // that benchstat calls significant (scripts/bench-gate.sh).
 //
-//   GOTOOLCHAIN=go1.25.5 go test -run '^$' -bench . -benchmem ./internal/crdt
+//   GOTOOLCHAIN=go1.26.11 go test -run '^$' -bench . -benchmem ./internal/crdt
 
 import (
 	"fmt"
