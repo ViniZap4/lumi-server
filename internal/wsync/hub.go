@@ -737,6 +737,27 @@ func (h *Hub) View(ctx context.Context, vaultID uuid.UUID, noteID string, fn fun
 	return fn(room.doc)
 }
 
+// ApplyPlanned computes a change from the note's current text with plan
+// and applies the resulting ranged edits (crdt.Edit, UTF-16 offsets) to
+// the authoritative doc in one yrs transaction, under the room's op lock
+// so no other writer interleaves between the read and the write. The
+// update is then committed, broadcast and mirrored like any other.
+//
+// opts.Origin must be a server-derived op origin (ValidPlannedOrigin):
+// "op:<client>" or "ai:<runtime>", derived from the credential, never
+// read from a request body (PHASE3-PROPOSAL C7).
+func (h *Hub) ApplyPlanned(ctx context.Context, vaultID uuid.UUID, noteID string, plan crdt.Planner, opts ApplyOptions) (ApplyResult, error) {
+	if !ValidPlannedOrigin(opts.Origin) {
+		return ApplyResult{}, fmt.Errorf("%w: %q", ErrPlannedOrigin, opts.Origin)
+	}
+	room, err := h.acquire(ctx, vaultID, noteID)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	defer h.release(room, false)
+	return room.applyPlanned(plan, opts)
+}
+
 // WouldChange reports whether applying update would change the doc,
 // evaluated on a throwaway copy under the room's op lock.
 func (r *Room) WouldChange(update []byte) (bool, error) {
@@ -821,6 +842,18 @@ func (r *Room) applyText(newText string, expectSV []byte, opts ApplyOptions) (Ap
 			}
 		}
 		return r.doc.ApplyTextDiff(newText, opts.Origin)
+	})
+}
+
+// applyPlanned applies the edits plan computes against the current text
+// (see Hub.ApplyPlanned). The planner runs under the room's op lock and
+// the doc lock: it must be pure (no doc access, no I/O).
+func (r *Room) applyPlanned(plan crdt.Planner, opts ApplyOptions) (ApplyResult, error) {
+	if !ValidPlannedOrigin(opts.Origin) {
+		return ApplyResult{}, fmt.Errorf("%w: %q", ErrPlannedOrigin, opts.Origin)
+	}
+	return r.mutate(nil, opts, func() ([]byte, error) {
+		return r.doc.ApplyPlanned(plan, opts.Origin)
 	})
 }
 
