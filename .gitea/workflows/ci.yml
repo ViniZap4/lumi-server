@@ -51,6 +51,8 @@ jobs:
             git config --global "url.$YCRDT_GIT_URL.insteadOf" "https://github.com/y-crdt/y-crdt.git"
           fi
           git submodule update --init --depth 1 third_party/y-crdt
+          # Base for the benchmark gate (PRs compare against main).
+          git fetch -q --depth 1 origin main:refs/remotes/origin/main || true
           git config --global --unset-all "http.$GITEA_URL/.extraheader"
           git log --oneline -1
           git submodule status
@@ -86,6 +88,20 @@ jobs:
       - name: go test
         # Real libyrs: the crdt/wsync/notes tests exercise yrs, not a stub.
         run: go test -race -count=1 ./...
+
+      # Performance gate (docs/PERF-BUDGETS.md, umbrella): benchmarks of
+      # the PR and of main, interleaved, compared with benchstat; blocks
+      # a > 10 % significant regression in sec/op, allocs/op or
+      # repo-calls/op.
+      - name: benchmarks vs main (benchstat)
+        if: github.event_name == 'pull_request'
+        env:
+          BENCH_ROUNDS: "10"
+          BENCH_TIME: "200ms"
+        run: |
+          set -eu
+          go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260813145340-fd4a688df892
+          BENCHSTAT="$(go env GOPATH)/bin/benchstat" scripts/bench-gate.sh origin/main
 
       - name: build
         run: go build -trimpath -o /tmp/lumi-server ./cmd/lumi-server && /tmp/lumi-server version
