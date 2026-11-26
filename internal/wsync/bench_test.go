@@ -3,16 +3,18 @@ package wsync
 // Benchmarks for the live commit path (docs/PERF-BUDGETS.md, umbrella:
 // server WS update apply -> broadcast p50 <= 2 ms, p99 <= 10 ms).
 // The repo is in memory, so wall time here is the CPU floor (yrs merge,
-// eager Text/SV, broadcast, compaction every 200 updates). The
-// `repo-calls/op` metric counts storage round trips per update: it is
-// deterministic, so it gates the Postgres work WP 0.5 removes without
-// a database in CI.
+// group-commit hand-off, broadcast, background compaction every 200
+// updates). The `repo-calls/op` metric counts storage round trips per
+// update (a batched append is one, as in Postgres): it is deterministic
+// (compaction is waited for before counting), so it gates the Postgres
+// work of the live path without a database in CI.
 //
 //   GOTOOLCHAIN=go1.25.5 go test -run '^$' -bench . -benchmem ./internal/wsync
 
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,6 +47,18 @@ func (c *countingRepo) SeedSnapshot(ctx context.Context, v uuid.UUID, n string, 
 func (c *countingRepo) AppendUpdate(ctx context.Context, v uuid.UUID, n string, u []byte, actor uuid.UUID, origin string) (int64, error) {
 	c.calls.Add(1)
 	return c.memRepo.AppendUpdate(ctx, v, n, u, actor, origin)
+}
+
+// AppendUpdates makes countingRepo a crdt.BatchAppender like the Postgres
+// store: a group-commit batch is one round trip however many rows it has.
+func (c *countingRepo) AppendUpdates(ctx context.Context, rows []crdt.PendingUpdate) error {
+	c.calls.Add(1)
+	for _, u := range rows {
+		if _, err := c.memRepo.AppendUpdate(ctx, u.VaultID, u.NoteID, u.Update, u.OriginUserID, u.OriginKind); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (c *countingRepo) ListUpdatesSince(ctx context.Context, v uuid.UUID, n string, since int64, limit int) ([]crdt.UpdateRow, error) {
 	c.calls.Add(1)
@@ -102,9 +116,23 @@ func newLiveFixture(b *testing.B, size int) liveFixture {
 	return liveFixture{state: state, updates: updates}
 }
 
+// waitCompaction blocks until the room's background compaction (if any)
+// has finished, so its storage calls are counted in the chunk that
+// triggered it.
+func waitCompaction(r *Room) {
+	for r.compacting.Load() {
+		runtime.Gosched()
+	}
+	// Barrier: a compaction that already cleared compacting may still
+	// hold compactMu.
+	r.compactMu.Lock()
+	r.compactMu.Unlock()
+}
+
 // BenchmarkRoomCommitLive: one live keystroke update through
-// Room.ApplyAndBroadcast (apply, persist, count, broadcast to one peer,
-// debounced mirror scheduling, eager Text/SV), with compaction amortised.
+// Room.ApplyAndBroadcast (apply, group commit, broadcast to one peer,
+// debounced mirror scheduling; no COUNT and no eager Text/SV), with the
+// background compaction amortised.
 func BenchmarkRoomCommitLive(b *testing.B) {
 	for _, size := range []int{20 * perfcorpus.KB, 200 * perfcorpus.KB} {
 		b.Run(fmt.Sprintf("%dKB", size/perfcorpus.KB), func(b *testing.B) {
@@ -165,6 +193,7 @@ func BenchmarkRoomCommitLive(b *testing.B) {
 				}
 				if (i+1)%poolSize == 0 || i == b.N-1 {
 					b.StopTimer()
+					waitCompaction(room)
 					calls += repo.calls.Load()
 				}
 			}
@@ -213,6 +242,7 @@ func BenchmarkHubApplyText(b *testing.B) {
 				}
 			}
 			b.StopTimer()
+			waitCompaction(room)
 			b.ReportMetric(float64(repo.calls.Load())/float64(b.N), "repo-calls/op")
 		})
 	}

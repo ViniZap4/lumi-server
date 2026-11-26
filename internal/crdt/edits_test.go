@@ -2,7 +2,6 @@ package crdt
 
 import (
 	"errors"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -313,50 +312,3 @@ func boundariesOK(text string, edits []Edit) bool {
 	}
 	return true
 }
-
-func benchText(size int) string {
-	line := "- [ ] tarefa com acentuação e emoji 😀 #tag\n"
-	return strings.Repeat(line, size/len(line)+1)[:size-size%len(line)]
-}
-
-// BenchmarkApplyEdits measures a planned edit (insert, then delete, one
-// character at the start, as BenchmarkApplyTextDiff does) on notes of
-// 20 KB and 200 KB. The planner path reads the text once and skips the
-// diff; compare with BenchmarkApplyTextDiff.
-func BenchmarkApplyEdits(b *testing.B) {
-	for _, size := range []int{20 << 10, 200 << 10} {
-		b.Run(sizeName(size), func(b *testing.B) {
-			d := seededDoc(b, benchText(size))
-			defer d.Close()
-			batches := [2][]Edit{{{Pos: 0, Ins: "x"}}, {{Pos: 0, Del: 1}}}
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				if _, err := d.ApplyEdits(batches[i%2], "op:bench"); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
-	}
-}
-
-// BenchmarkApplyTextDiff is the whole-text alternative for comparison.
-func BenchmarkApplyTextDiff(b *testing.B) {
-	for _, size := range []int{20 << 10, 200 << 10} {
-		b.Run(sizeName(size), func(b *testing.B) {
-			base := benchText(size)
-			d := seededDoc(b, base)
-			defer d.Close()
-			texts := [2]string{"x" + base, base}
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				if _, err := d.ApplyTextDiff(texts[i%2], "bench"); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
-	}
-}
-
-func sizeName(n int) string { return strconv.Itoa(n>>10) + "KB" }

@@ -96,8 +96,9 @@ func BenchmarkDocApplyUpdate(b *testing.B) {
 	}
 }
 
-// BenchmarkDocTextAndStateVector: the eager Text() + StateVectorV1()
-// that wsync resultLocked runs after every commit (WP 0.5 makes it lazy).
+// BenchmarkDocTextAndStateVector: Text() + StateVectorV1(), which wsync
+// resultLocked runs only when a caller asks for it (ApplyOptions.WantText:
+// the REST/3-way paths); the live WS commit path no longer pays it.
 func BenchmarkDocTextAndStateVector(b *testing.B) {
 	for _, size := range benchSizes {
 		b.Run(sizeName(size), func(b *testing.B) {
@@ -141,6 +142,47 @@ func BenchmarkApplyTextDiff(b *testing.B) {
 						target = c[0]
 					}
 					if _, err := d.ApplyTextDiff(target, "bench"); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkApplyEdits: the server-planned ranged-edit path
+// (Doc.ApplyEdits, used by Hub.ApplyPlanned) for the same changes as
+// BenchmarkApplyTextDiff, so the two compare case by case: the planner
+// reads the text once and skips the line diff.
+func BenchmarkApplyEdits(b *testing.B) {
+	for _, size := range benchSizes {
+		text := perfcorpus.Prose(size)
+		at := perfcorpus.MidPoint(text)
+		end := at + strings.Index(text[at:], "\n\n")
+		pos := utf16Len(text[:at])
+		para := text[at:end]
+		upper := strings.ToUpper(para)
+		paraLen, upperLen := utf16Len(para), utf16Len(upper)
+		cases := map[string][2][]Edit{
+			"char": {
+				{{Pos: pos, Ins: "x"}},
+				{{Pos: pos, Del: 1}},
+			},
+			"paragraph": {
+				{{Pos: pos, Del: paraLen, Ins: upper}},
+				{{Pos: pos, Del: upperLen, Ins: para}},
+			},
+		}
+		for _, name := range []string{"char", "paragraph"} {
+			c := cases[name]
+			b.Run(sizeName(size)+"/"+name, func(b *testing.B) {
+				d := benchDoc(b, text)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					// Alternate forward and back so every iteration is a
+					// real change against the same text.
+					if _, err := d.ApplyEdits(c[i%2], "op:bench"); err != nil {
 						b.Fatal(err)
 					}
 				}
