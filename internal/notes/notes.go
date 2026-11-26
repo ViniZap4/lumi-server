@@ -939,7 +939,7 @@ func (s *Service) ApplyDiff(
 	}
 	// WantState: the response carries the post-merge state so the
 	// client has its next base without a /snapshot round-trip.
-	opts := wsync.ApplyOptions{Actor: actor, Origin: originKind, Mirror: wsync.MirrorNow, WantState: true}
+	opts := wsync.ApplyOptions{Actor: actor, Origin: originKind, Mirror: wsync.MirrorNow, WantText: true, WantState: true}
 
 	var res wsync.ApplyResult
 	switch {
@@ -1007,7 +1007,7 @@ func (s *Service) ApplyUpdate(
 		return SnapshotResult{}, err
 	}
 	res, err := s.docs.ApplyUpdate(ctx, vaultID, id, update, wsync.ApplyOptions{
-		Actor: actor, Origin: originKind, Mirror: wsync.MirrorNow, WantState: true,
+		Actor: actor, Origin: originKind, Mirror: wsync.MirrorNow, WantText: true, WantState: true,
 	})
 	if err != nil {
 		return SnapshotResult{}, fmt.Errorf("%w: apply update: %v", domain.ErrValidation, err)

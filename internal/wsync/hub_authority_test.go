@@ -85,7 +85,7 @@ func TestREST_ApplyTextWhileRoomLive(t *testing.T) {
 
 	// REST write (e.g. PATCH body / sv-matching /diff) with a sync mirror.
 	res, err := hub.ApplyText(context.Background(), v, note, "# hello brave world", nil,
-		ApplyOptions{Origin: "tui", Mirror: MirrorNow})
+		ApplyOptions{Origin: "tui", Mirror: MirrorNow, WantText: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestREST_ApplyUpdateWhileRoomLive(t *testing.T) {
 	defer hub.Leave(room, sub)
 
 	u := clientUpdate(t, room, "hello apple")
-	res, err := hub.ApplyUpdate(context.Background(), v, note, u, ApplyOptions{Origin: "apple-diff", Mirror: MirrorNow})
+	res, err := hub.ApplyUpdate(context.Background(), v, note, u, ApplyOptions{Origin: "apple-diff", Mirror: MirrorNow, WantText: true})
 	if err != nil || !res.Changed || res.Text != "hello apple" {
 		t.Fatalf("res=%+v err=%v", res, err)
 	}

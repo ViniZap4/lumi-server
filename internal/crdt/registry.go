@@ -173,13 +173,35 @@ func (r *Registry) noteLock(vaultID uuid.UUID, noteID string) *sync.Mutex {
 // installed, the document is seeded from the note's on-disk body and the
 // seed is stored as the snapshot (lazy init, protocol §10 S4).
 func (r *Registry) LoadDoc(ctx context.Context, vaultID uuid.UUID, noteID string) (*Doc, error) {
-	doc, empty, err := r.loadPersisted(ctx, vaultID, noteID)
+	doc, _, err := r.LoadDocStats(ctx, vaultID, noteID)
+	return doc, err
+}
+
+// LogStats describes a note's update log: the number of rows and the sum
+// of their blob sizes. The wsync room keeps these counters in memory so
+// the live commit path never has to COUNT the log (see MaybeCompact).
+type LogStats struct {
+	Count int64
+	Bytes int64
+}
+
+// OverThreshold reports whether the log should be folded into a
+// snapshot (either compaction threshold reached).
+func (s LogStats) OverThreshold() bool {
+	return s.Count >= CompactCountThreshold || s.Bytes >= CompactBytesThreshold
+}
+
+// LoadDocStats is LoadDoc that also reports the size of the update log it
+// replayed, so a caller can seed its compaction counters without an
+// extra COUNT query.
+func (r *Registry) LoadDocStats(ctx context.Context, vaultID uuid.UUID, noteID string) (*Doc, LogStats, error) {
+	doc, stats, empty, err := r.loadPersisted(ctx, vaultID, noteID)
 	if err != nil || !empty {
-		return doc, err
+		return doc, stats, err
 	}
 	src := r.getInitSource()
 	if src == nil {
-		return doc, nil
+		return doc, stats, nil
 	}
 	_ = doc.Close()
 
@@ -187,31 +209,32 @@ func (r *Registry) LoadDoc(ctx context.Context, vaultID uuid.UUID, noteID string
 	mu.Lock()
 	defer mu.Unlock()
 	// Re-check under the lock: a concurrent loader may have seeded.
-	doc, empty, err = r.loadPersisted(ctx, vaultID, noteID)
+	doc, stats, empty, err = r.loadPersisted(ctx, vaultID, noteID)
 	if err != nil || !empty {
-		return doc, err
+		return doc, stats, err
 	}
 	body, err := src(ctx, vaultID, noteID)
 	if err != nil {
 		_ = doc.Close()
-		return nil, fmt.Errorf("crdt registry: lazy init read body: %w", err)
+		return nil, LogStats{}, fmt.Errorf("crdt registry: lazy init read body: %w", err)
 	}
 	if body == "" {
-		return doc, nil
+		return doc, stats, nil
 	}
 	_ = doc.Close()
 	// Lazy init starts a new history: a fresh epoch, so a client replica
 	// tagged with the note's previous epoch is never merged into it.
 	seeded, _, err := r.seed(ctx, vaultID, noteID, body, "lazy-init", "")
 	if err != nil {
-		return nil, err
+		return nil, LogStats{}, err
 	}
-	return seeded, nil
+	// A seed writes only the snapshot: the log is empty.
+	return seeded, LogStats{}, nil
 }
 
 // loadPersisted rebuilds the doc from snapshot + log. empty reports that
 // nothing at all is persisted for the note.
-func (r *Registry) loadPersisted(ctx context.Context, vaultID uuid.UUID, noteID string) (*Doc, bool, error) {
+func (r *Registry) loadPersisted(ctx context.Context, vaultID uuid.UUID, noteID string) (*Doc, LogStats, bool, error) {
 	var initial []byte
 	haveSnap := false
 	snap, err := r.store.GetSnapshot(ctx, vaultID, noteID)
@@ -224,32 +247,39 @@ func (r *Registry) loadPersisted(ctx context.Context, vaultID uuid.UUID, noteID 
 		// A transient storage error must not masquerade as "no state":
 		// the caller would then seed or edit an empty doc and the next
 		// mirror would overwrite the file.
-		return nil, false, fmt.Errorf("crdt registry: get snapshot: %w", err)
+		return nil, LogStats{}, false, fmt.Errorf("crdt registry: get snapshot: %w", err)
 	}
 
 	doc, err := LoadDoc(initial)
 	if err != nil {
-		return nil, false, fmt.Errorf("crdt registry: load snapshot: %w", err)
+		return nil, LogStats{}, false, fmt.Errorf("crdt registry: load snapshot: %w", err)
 	}
 
 	updates, err := r.store.ListUpdatesSince(ctx, vaultID, noteID, 0, 0)
 	if err != nil {
 		_ = doc.Close()
-		return nil, false, fmt.Errorf("crdt registry: list updates: %w", err)
+		return nil, LogStats{}, false, fmt.Errorf("crdt registry: list updates: %w", err)
 	}
+	var stats LogStats
 	for _, u := range updates {
 		if err := doc.ApplyUpdate(u.Update); err != nil {
 			_ = doc.Close()
-			return nil, false, fmt.Errorf("crdt registry: replay update %d: %w", u.ID, err)
+			return nil, LogStats{}, false, fmt.Errorf("crdt registry: replay update %d: %w", u.ID, err)
 		}
+		stats.Count++
+		stats.Bytes += int64(len(u.Update))
 	}
-	return doc, !haveSnap && len(updates) == 0, nil
+	return doc, stats, !haveSnap && len(updates) == 0, nil
 }
 
 // PersistChange appends an update produced by a transaction on doc, then
 // runs compaction if the log has grown past either threshold. doc must
 // already reflect the change captured in update — typically you get
 // `update` from doc.ApplyTextDiff and pass the same doc straight in.
+//
+// This is the cold path (no wsync room holds the note, e.g. a federation
+// relay without a hub): it pays one COUNT per write. The live path goes
+// through AppendBatch plus in-memory LogStats and MaybeCompact instead.
 //
 // originUserID may be uuid.Nil for system-initiated writes.
 func (r *Registry) PersistChange(
@@ -272,10 +302,84 @@ func (r *Registry) PersistChange(
 		// request. Compaction will catch up on the next write.
 		return nil
 	}
-	if count < CompactCountThreshold && bytes < CompactBytesThreshold {
+	if !(LogStats{Count: int64(count), Bytes: bytes}).OverThreshold() {
 		return nil
 	}
 	return r.compact(ctx, vaultID, noteID, doc)
+}
+
+// PendingUpdate is one update-log row waiting to be appended by
+// AppendBatch.
+type PendingUpdate struct {
+	VaultID      uuid.UUID
+	NoteID       string
+	Update       []byte
+	OriginUserID uuid.UUID
+	OriginKind   string
+}
+
+// BatchAppender is optionally implemented by a SnapshotRepo that can
+// append several update-log rows in one round trip. The rows must be
+// written atomically (all or none) and in slice order.
+type BatchAppender interface {
+	AppendUpdates(ctx context.Context, rows []PendingUpdate) error
+}
+
+// AppendBatch appends rows to the update log (group commit) and returns
+// one error per row (nil when that row is durable). With a BatchAppender
+// the whole batch is one round trip; if that fails (e.g. one note of the
+// batch was deleted meanwhile and its foreign key fails) every row is
+// retried on its own so one bad row never fails its neighbours. The
+// persist hook fires for each durable row, in slice order.
+//
+// Unlike PersistChange it never counts or compacts: the caller tracks
+// LogStats and calls MaybeCompact off the hot path.
+func (r *Registry) AppendBatch(ctx context.Context, rows []PendingUpdate) []error {
+	errs := make([]error, len(rows))
+	batched := false
+	if ba, ok := r.store.(BatchAppender); ok && len(rows) > 1 {
+		batched = ba.AppendUpdates(ctx, rows) == nil
+	}
+	if !batched {
+		for i, u := range rows {
+			_, errs[i] = r.store.AppendUpdate(ctx, u.VaultID, u.NoteID, u.Update, u.OriginUserID, u.OriginKind)
+		}
+	}
+	for i, u := range rows {
+		if errs[i] == nil {
+			r.firePersistHook(u.VaultID, u.NoteID, u.Update, u.OriginKind)
+		}
+	}
+	return errs
+}
+
+// MaybeCompact verifies the log size with one CountUpdates and, when it
+// exceeds a threshold (or force is set), folds the log into a new
+// snapshot of doc. It returns the log stats measured after the call and
+// whether a compaction ran.
+//
+// Caller contract: doc must hold every update persisted for the note so
+// far (it is the note's authoritative doc), and no other writer may
+// compact the same note concurrently. force is used to repair the log
+// after a failed append: the snapshot then carries the update that never
+// reached the log, so later rows that depend on it can integrate.
+func (r *Registry) MaybeCompact(ctx context.Context, vaultID uuid.UUID, noteID string, doc *Doc, force bool) (LogStats, bool, error) {
+	count, bytes, err := r.store.CountUpdates(ctx, vaultID, noteID)
+	if err != nil {
+		return LogStats{}, false, fmt.Errorf("crdt compact: count: %w", err)
+	}
+	stats := LogStats{Count: int64(count), Bytes: bytes}
+	if !force && !stats.OverThreshold() {
+		return stats, false, nil
+	}
+	if err := r.compact(ctx, vaultID, noteID, doc); err != nil {
+		return stats, false, err
+	}
+	count, bytes, err = r.store.CountUpdates(ctx, vaultID, noteID)
+	if err != nil {
+		return LogStats{}, true, nil
+	}
+	return LogStats{Count: int64(count), Bytes: bytes}, true, nil
 }
 
 // InitFromText seeds a brand-new note's CRDT: a fresh doc holding body
@@ -316,7 +420,7 @@ func (r *Registry) InitFromTextEpoch(
 	mu := r.noteLock(vaultID, noteID)
 	mu.Lock()
 	defer mu.Unlock()
-	existing, empty, err := r.loadPersisted(ctx, vaultID, noteID)
+	existing, _, empty, err := r.loadPersisted(ctx, vaultID, noteID)
 	if err != nil {
 		return "", err
 	}

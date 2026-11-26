@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -159,6 +160,52 @@ RETURNING id`
 		return 0, fmt.Errorf("note_yjs update: append: %w", errMap(err))
 	}
 	return id, nil
+}
+
+// NoteYjsAppend is one row for AppendUpdates.
+type NoteYjsAppend struct {
+	VaultID      uuid.UUID
+	NoteID       string
+	Update       []byte
+	OriginUserID uuid.UUID // uuid.Nil records NULL
+	OriginKind   string
+}
+
+// appendUpdatesSQL builds the multi-row INSERT for n rows. Rows are listed
+// in slice order, so the BIGSERIAL ids follow it.
+func appendUpdatesSQL(n int) string {
+	var b strings.Builder
+	b.WriteString("INSERT INTO note_yjs_updates (vault_id, note_id, update_blob, origin_user_id, origin_kind) VALUES ")
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		p := i * 5
+		fmt.Fprintf(&b, "($%d,$%d,$%d,$%d,$%d)", p+1, p+2, p+3, p+4, p+5)
+	}
+	return b.String()
+}
+
+// AppendUpdates adds several rows to the update log in one statement (one
+// round trip, all or none): the group-commit path of the live hub. A
+// failing row (e.g. its note was deleted, foreign key) fails the whole
+// statement; the caller retries the rows one by one.
+func (s *NoteYjsStore) AppendUpdates(ctx context.Context, rows []NoteYjsAppend) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	args := make([]any, 0, 5*len(rows))
+	for _, r := range rows {
+		var origin any
+		if r.OriginUserID != uuid.Nil {
+			origin = r.OriginUserID
+		}
+		args = append(args, r.VaultID, r.NoteID, r.Update, origin, r.OriginKind)
+	}
+	if _, err := s.pool.Exec(ctx, appendUpdatesSQL(len(rows)), args...); err != nil {
+		return fmt.Errorf("note_yjs update: append batch: %w", errMap(err))
+	}
+	return nil
 }
 
 // ListUpdatesSince returns updates with id > sinceID in ascending order.

@@ -87,6 +87,11 @@ type ApplyOptions struct {
 	Origin string
 	// Mirror selects the disk-mirror behaviour.
 	Mirror MirrorMode
+	// WantText fills ApplyResult.Text and ApplyResult.StateVector (read
+	// under the room lock, right after the change). Off by default: the
+	// full text copy and state-vector encode are wasted work on the hot
+	// paths (live WS edits, relay), which discard them.
+	WantText bool
 	// WantState fills ApplyResult.State (full encoded doc right after the
 	// change, read under the room lock). Off by default: encoding the
 	// whole doc is wasted work on hot paths (relay, live edits).
@@ -100,7 +105,8 @@ type ApplyResult struct {
 	Changed bool
 	// Update is the lib0-v1 update that was applied (nil when !Changed).
 	Update []byte
-	// Text and StateVector describe the document right after the change.
+	// Text and StateVector describe the document right after the change;
+	// only set when ApplyOptions.WantText.
 	Text        string
 	StateVector []byte
 	// State is the full lib0-v1 encoded doc after the change; only set
@@ -113,6 +119,10 @@ type ApplyResult struct {
 
 // ErrHubClosed is returned once the Hub has been shut down.
 var ErrHubClosed = errors.New("wsync: hub is closed")
+
+// errRoomEvicted is returned for a mutation on a room that was evicted
+// or dropped while the caller held it.
+var errRoomEvicted = errors.New("wsync: room evicted")
 
 // Room is the per-note collaboration channel: it owns the single
 // authoritative in-memory *crdt.Doc for the note while anyone (a WS
@@ -141,11 +151,38 @@ type Room struct {
 	hub        *Hub
 	persistCtx context.Context
 
-	// opMu serialises mutations: apply → persist → broadcast → mirror,
-	// so the update log order matches the apply order and the no-op
-	// check cannot interleave with another writer.
+	// opMu serialises mutations: apply → enqueue for group commit, so the
+	// update log order matches the apply order and the no-op check cannot
+	// interleave with another writer. The commit itself (and the
+	// broadcast that follows it) happens outside opMu, so several writers
+	// of one note can share a batch.
 	opMu    sync.Mutex
 	evicted atomic.Bool
+	// served is set once a WebSocket subscriber joined (the room then
+	// lingers after its last release).
+	served atomic.Bool
+
+	// Commit sequencing: applied counts updates handed to the group
+	// committer, settled the ones whose commit finished (durably or with
+	// an error). Guarded by seqMu; settledCh is non-nil while someone
+	// waits for settled to advance.
+	seqMu     sync.Mutex
+	applied   uint64
+	settled   uint64
+	settledCh chan struct{}
+
+	// Update-log counters, seeded from the load and bumped per commit, so
+	// the hot path never COUNTs the log (research 03 b.2 #3). They may
+	// drift slightly; MaybeCompact verifies before compacting.
+	logCount atomic.Int64
+	logBytes atomic.Int64
+	// compactMu is held for a whole compaction (DropNote waits on it);
+	// compacting keeps at most one in flight; repair asks the next one to
+	// run regardless of size because an append failed after the update
+	// was already applied to the doc.
+	compactMu  sync.Mutex
+	compacting atomic.Bool
+	repair     atomic.Bool
 
 	// awareness register (presence.go)
 	awMu sync.Mutex
@@ -154,6 +191,9 @@ type Room struct {
 	mirrorTimer *time.Timer
 	mirrorGen   uint64
 	mirrorMu    sync.Mutex
+	// mirrorWriteMu serialises disk-mirror writes; each reads the doc
+	// text inside it, so the last write always carries the newest text.
+	mirrorWriteMu sync.Mutex
 }
 
 // Subscriber represents a single WebSocket connection within a Room.
@@ -243,6 +283,14 @@ type Hub struct {
 	// writeGuard vetoes a mutation before it touches the doc (mirror
 	// vaults accept only federation origins). nil allows everything.
 	writeGuard WriteGuard
+
+	// gc holds the adaptive group committers for update-log appends; a
+	// note always maps to the same one (gcFor), which keeps its order.
+	gc         []*groupCommitter
+	gcShards   int
+	gcMaxDelay time.Duration
+	gcMaxBatch int
+	gcObserve  func(size int, linger time.Duration)
 }
 
 // WriteGuard decides whether a mutation with the given origin may change a
@@ -323,14 +371,25 @@ func NewHub(registry *crdt.Registry, opts ...HubOption) *Hub {
 		userSlots:      make(map[uuid.UUID]int),
 		maxUserSlots:   DefaultMaxUserConnections,
 		mirrorDebounce: DefaultMirrorDebounce,
+		gcMaxDelay:     DefaultGroupCommitMaxDelay,
+		gcMaxBatch:     DefaultGroupCommitMaxBatch,
+		gcShards:       DefaultGroupCommitShards,
 	}
 	for _, o := range opts {
 		o(h)
 	}
+	if h.gcShards < 1 {
+		h.gcShards = 1
+	}
+	h.gc = make([]*groupCommitter, h.gcShards)
+	for i := range h.gc {
+		h.gc[i] = newGroupCommitter(registry, h.gcMaxDelay, h.gcMaxBatch, h.gcObserve)
+	}
 	return h
 }
 
-// Close evicts every room and stops accepting new joins. Pending debounced
+// Close evicts every room and stops accepting new joins. Updates already
+// queued for group commit are written first, then pending debounced
 // mirrors are flushed. Active subscribers are signalled via their Done
 // channels; their pump goroutines should exit promptly.
 func (h *Hub) Close() {
@@ -338,6 +397,9 @@ func (h *Hub) Close() {
 		return
 	}
 	h.rootCxl()
+	for _, c := range h.gc {
+		c.close()
+	}
 	h.bumps.close()
 	h.mu.Lock()
 	rooms := make([]*Room, 0, len(h.rooms))
@@ -407,7 +469,7 @@ func (h *Hub) acquire(ctx context.Context, vaultID uuid.UUID, noteID string) (*R
 	h.mu.Unlock()
 
 	loadCtx, cancel := context.WithTimeout(h.rootCtx, loadTimeout)
-	doc, err := h.registry.LoadDoc(loadCtx, vaultID, noteID)
+	doc, stats, err := h.registry.LoadDocStats(loadCtx, vaultID, noteID)
 	cancel()
 	if err != nil {
 		room.loadErr = err
@@ -421,8 +483,27 @@ func (h *Hub) acquire(ctx context.Context, vaultID uuid.UUID, noteID string) (*R
 		return nil, err
 	}
 	room.doc = doc
+	room.logCount.Store(stats.Count)
+	room.logBytes.Store(stats.Bytes)
 	close(room.ready)
 	return room, nil
+}
+
+// retain takes an extra reference on a room that is still registered and
+// live (background work such as a compaction), so it is not evicted and
+// its doc not closed underneath. Pair with release.
+func (h *Hub) retain(room *Room) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if room.evicted.Load() || h.rooms[roomKey(room.vaultID, room.noteID)] != room {
+		return false
+	}
+	room.refs++
+	if room.idleTimer != nil {
+		room.idleTimer.Stop()
+		room.idleTimer = nil
+	}
+	return true
 }
 
 // release drops a reference. When the last one goes, a room that served
@@ -500,6 +581,19 @@ func (h *Hub) DropNote(vaultID uuid.UUID, noteID string, code int, reason string
 	}
 	h.mu.Unlock()
 
+	// Let writes of this history finish before the caller starts the next
+	// one (ResetNote, delete + recreate): an apply already past its
+	// eviction check enqueues under opMu, so after taking opMu once every
+	// such write is queued; wait for those commits, then for an in-flight
+	// compaction, so no row or snapshot of the old history lands later.
+	room.opMu.Lock()
+	room.opMu.Unlock() //nolint:staticcheck // empty critical section is the barrier
+	settleCtx, cancel := context.WithTimeout(context.Background(), mirrorFlushTimeout)
+	_ = room.waitSettled(settleCtx)
+	cancel()
+	room.compactMu.Lock()
+	room.compactMu.Unlock() //nolint:staticcheck // barrier
+
 	room.mirrorMu.Lock()
 	if room.mirrorTimer != nil {
 		room.mirrorTimer.Stop()
@@ -547,6 +641,7 @@ func (h *Hub) Join(ctx context.Context, vaultID uuid.UUID, noteID string, sub *S
 	room.subsMu.Lock()
 	room.subs[sub] = struct{}{}
 	room.subsMu.Unlock()
+	room.served.Store(true)
 	return room, nil
 }
 
@@ -624,13 +719,43 @@ func (h *Hub) ApplyText(ctx context.Context, vaultID uuid.UUID, noteID, newText 
 
 // View runs fn against the note's authoritative doc for reading (state
 // vector, diff, text, full state). fn must not mutate the doc.
+//
+// View first waits until every update applied before the call has
+// settled in the group commit, so a state vector read here never covers
+// an update that is still on its way to Postgres. That keeps the REST
+// state-vector acknowledgement of offline edits (CRDT client protocol
+// §12.6) a proof of durability.
 func (h *Hub) View(ctx context.Context, vaultID uuid.UUID, noteID string, fn func(*crdt.Doc) error) error {
 	room, err := h.acquire(ctx, vaultID, noteID)
 	if err != nil {
 		return err
 	}
 	defer h.release(room, false)
+	if err := room.waitSettled(ctx); err != nil {
+		return err
+	}
 	return fn(room.doc)
+}
+
+// ApplyPlanned computes a change from the note's current text with plan
+// and applies the resulting ranged edits (crdt.Edit, UTF-16 offsets) to
+// the authoritative doc in one yrs transaction, under the room's op lock
+// so no other writer interleaves between the read and the write. The
+// update is then committed, broadcast and mirrored like any other.
+//
+// opts.Origin must be a server-derived op origin (ValidPlannedOrigin):
+// "op:<client>" or "ai:<runtime>", derived from the credential, never
+// read from a request body (PHASE3-PROPOSAL C7).
+func (h *Hub) ApplyPlanned(ctx context.Context, vaultID uuid.UUID, noteID string, plan crdt.Planner, opts ApplyOptions) (ApplyResult, error) {
+	if !ValidPlannedOrigin(opts.Origin) {
+		return ApplyResult{}, fmt.Errorf("%w: %q", ErrPlannedOrigin, opts.Origin)
+	}
+	room, err := h.acquire(ctx, vaultID, noteID)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	defer h.release(room, false)
+	return room.applyPlanned(plan, opts)
 }
 
 // WouldChange reports whether applying update would change the doc,
@@ -688,90 +813,221 @@ func (r *Room) ApplyAndBroadcastFederation(update []byte, originKind string) err
 }
 
 func (r *Room) applyUpdate(update []byte, origin *Subscriber, opts ApplyOptions) (ApplyResult, error) {
-	if err := r.hub.guard(r.vaultID, opts.Origin); err != nil {
-		return ApplyResult{}, err
-	}
-	r.opMu.Lock()
-	defer r.opMu.Unlock()
-	if r.evicted.Load() {
-		return ApplyResult{}, fmt.Errorf("wsync: room evicted")
-	}
-	changed, err := r.doc.ApplyUpdateChanged(update)
-	if err != nil {
-		return ApplyResult{}, err
-	}
-	if !changed {
-		return r.resultLocked(false, nil, nil, opts), nil
-	}
-	return r.commitLocked(update, origin, opts)
+	return r.mutate(origin, opts, func() ([]byte, error) {
+		changed, err := r.doc.ApplyUpdateChanged(update)
+		if err != nil || !changed {
+			return nil, err
+		}
+		return update, nil
+	})
 }
 
 func (r *Room) applyText(newText string, expectSV []byte, opts ApplyOptions) (ApplyResult, error) {
+	return r.mutate(nil, opts, func() ([]byte, error) {
+		if expectSV != nil {
+			want, err := crdt.DecodeStateVector(expectSV)
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", crdt.ErrBaseMismatch, err)
+			}
+			rawCur, err := r.doc.StateVectorV1()
+			if err != nil {
+				return nil, err
+			}
+			cur, err := crdt.DecodeStateVector(rawCur)
+			if err != nil {
+				return nil, err
+			}
+			if !cur.Equal(want) {
+				return nil, crdt.ErrBaseMismatch
+			}
+		}
+		return r.doc.ApplyTextDiff(newText, opts.Origin)
+	})
+}
+
+// applyPlanned applies the edits plan computes against the current text
+// (see Hub.ApplyPlanned). The planner runs under the room's op lock and
+// the doc lock: it must be pure (no doc access, no I/O).
+func (r *Room) applyPlanned(plan crdt.Planner, opts ApplyOptions) (ApplyResult, error) {
+	if !ValidPlannedOrigin(opts.Origin) {
+		return ApplyResult{}, fmt.Errorf("%w: %q", ErrPlannedOrigin, opts.Origin)
+	}
+	return r.mutate(nil, opts, func() ([]byte, error) {
+		return r.doc.ApplyPlanned(plan, opts.Origin)
+	})
+}
+
+// mutate runs apply (which changes r.doc and returns the update, or an
+// empty update for a no-op) under opMu, enqueues the update for group
+// commit while still holding opMu (so commit order matches apply order),
+// then releases opMu and waits until the update is durable. The
+// broadcast, feed bump and debounced mirror run in the committer right
+// after the commit; a synchronous mirror (MirrorNow) runs here.
+//
+// Persist-before-broadcast holds: nobody receives the update before its
+// log row is written, and a failed append is never broadcast. A failed
+// append leaves the change in the in-memory doc (as before group commit);
+// the room then forces a compaction on its next successful commit so the
+// snapshot carries the change and later rows that depend on it load.
+func (r *Room) mutate(from *Subscriber, opts ApplyOptions, apply func() ([]byte, error)) (ApplyResult, error) {
 	if err := r.hub.guard(r.vaultID, opts.Origin); err != nil {
 		return ApplyResult{}, err
 	}
 	r.opMu.Lock()
-	defer r.opMu.Unlock()
 	if r.evicted.Load() {
-		return ApplyResult{}, fmt.Errorf("wsync: room evicted")
+		r.opMu.Unlock()
+		return ApplyResult{}, errRoomEvicted
 	}
-	if expectSV != nil {
-		want, err := crdt.DecodeStateVector(expectSV)
-		if err != nil {
-			return ApplyResult{}, fmt.Errorf("%w: %v", crdt.ErrBaseMismatch, err)
-		}
-		rawCur, err := r.doc.StateVectorV1()
-		if err != nil {
-			return ApplyResult{}, err
-		}
-		cur, err := crdt.DecodeStateVector(rawCur)
-		if err != nil {
-			return ApplyResult{}, err
-		}
-		if !cur.Equal(want) {
-			return ApplyResult{}, crdt.ErrBaseMismatch
-		}
-	}
-	update, err := r.doc.ApplyTextDiff(newText, opts.Origin)
+	update, err := apply()
 	if err != nil {
+		r.opMu.Unlock()
 		return ApplyResult{}, err
 	}
 	if len(update) == 0 {
-		return r.resultLocked(false, nil, nil, opts), nil
+		res := r.resultLocked(false, nil, opts)
+		r.opMu.Unlock()
+		return res, nil
 	}
-	return r.commitLocked(update, nil, opts)
+	res := r.resultLocked(true, update, opts)
+	req := &commitReq{
+		room: r, update: update, actor: opts.Actor, origin: opts.Origin,
+		from: from, mirror: opts.Mirror, done: make(chan error, 1),
+	}
+	r.seqMu.Lock()
+	r.applied++
+	req.seq = r.applied
+	r.seqMu.Unlock()
+	if !r.hub.gcFor(r.vaultID, r.noteID).enqueue(req) {
+		r.repair.Store(true)
+		r.settle(req.seq)
+		r.opMu.Unlock()
+		return ApplyResult{}, ErrHubClosed
+	}
+	r.opMu.Unlock()
+
+	if err := <-req.done; err != nil {
+		return ApplyResult{}, err
+	}
+	if opts.Mirror == MirrorNow && opts.Origin != OriginFSWatcher {
+		res.MirrorErr = r.flushMirror(r.hub.rootCtx)
+	}
+	return res, nil
 }
 
-// commitLocked persists an update already applied to r.doc, broadcasts
-// it and handles the mirror. Caller holds opMu.
-func (r *Room) commitLocked(update []byte, origin *Subscriber, opts ApplyOptions) (ApplyResult, error) {
-	// Persist before broadcasting so a crash between the two doesn't
-	// leave subscribers with state the server then loses.
-	if err := r.hub.registry.PersistChange(
-		r.persistCtx, r.vaultID, r.noteID, update, opts.Actor, opts.Origin, r.doc,
-	); err != nil {
-		return ApplyResult{}, err
+// afterCommit runs on the group committer, in queue order, once req's
+// append finished: on success the feed bump, the broadcast, the debounced
+// mirror and the compaction check; on failure only the repair mark. It
+// then settles req's sequence number.
+func (r *Room) afterCommit(req *commitReq, err error) {
+	if err != nil {
+		r.repair.Store(true)
+		r.settle(req.seq)
+		return
 	}
 	// Feed seq: schedule the coalesced content bump (<= 1/s per note).
 	r.hub.bumps.touch(r.vaultID, r.noteID)
-	r.broadcast(EncodeSyncUpdate(update), origin)
-	var mirrorErr error
-	switch {
-	case opts.Origin == OriginFSWatcher || opts.Mirror == MirrorNone:
-		// The file is the source of this change; mirroring would race
-		// the fswatch suppression window.
-	case opts.Mirror == MirrorNow:
-		mirrorErr = r.flushMirror(r.hub.rootCtx)
-	default:
+	r.broadcast(EncodeSyncUpdate(req.update), req.from)
+	if req.origin != OriginFSWatcher && req.mirror == MirrorDebounced {
+		// fs-watcher input: the file is the source of this change, and
+		// mirroring would race the fswatch suppression window.
 		r.scheduleMirror()
 	}
-	return r.resultLocked(true, update, mirrorErr, opts), nil
+	stats := crdt.LogStats{Count: r.logCount.Add(1), Bytes: r.logBytes.Add(int64(len(req.update)))}
+	if stats.OverThreshold() || r.repair.Load() {
+		r.startCompaction()
+	}
+	r.settle(req.seq)
 }
 
-func (r *Room) resultLocked(changed bool, update []byte, mirrorErr error, opts ApplyOptions) ApplyResult {
-	res := ApplyResult{Changed: changed, Update: update, MirrorErr: mirrorErr}
-	res.Text, _ = r.doc.Text()
-	res.StateVector, _ = r.doc.StateVectorV1()
+// settle records that the commit with sequence seq finished.
+func (r *Room) settle(seq uint64) {
+	r.seqMu.Lock()
+	if seq > r.settled {
+		r.settled = seq
+	}
+	if r.settledCh != nil {
+		close(r.settledCh)
+		r.settledCh = nil
+	}
+	r.seqMu.Unlock()
+}
+
+// waitSettled blocks until every update applied before the call has
+// settled (committed or failed), or ctx ends. It is free when nothing is
+// in flight.
+func (r *Room) waitSettled(ctx context.Context) error {
+	r.seqMu.Lock()
+	target := r.applied
+	for r.settled < target {
+		if r.settledCh == nil {
+			r.settledCh = make(chan struct{})
+		}
+		ch := r.settledCh
+		r.seqMu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		r.seqMu.Lock()
+	}
+	r.seqMu.Unlock()
+	return nil
+}
+
+// compactTimeout bounds one background compaction.
+const compactTimeout = 30 * time.Second
+
+// startCompaction folds the update log into a snapshot in the background
+// (at most one at a time per room). The room is retained for the
+// duration so it is not evicted (and its doc not closed) underneath.
+func (r *Room) startCompaction() {
+	if !r.compacting.CompareAndSwap(false, true) {
+		return
+	}
+	if !r.hub.retain(r) {
+		r.compacting.Store(false)
+		return
+	}
+	go r.compact()
+}
+
+func (r *Room) compact() {
+	defer func() {
+		r.compacting.Store(false)
+		r.hub.release(r, r.served.Load())
+	}()
+	r.compactMu.Lock()
+	defer r.compactMu.Unlock()
+	if r.evicted.Load() {
+		return
+	}
+	force := r.repair.Swap(false)
+	preCount, preBytes := r.logCount.Load(), r.logBytes.Load()
+	ctx, cancel := context.WithTimeout(r.hub.rootCtx, compactTimeout)
+	defer cancel()
+	// Safe off opMu: every row in the log was applied to r.doc before it
+	// was enqueued, and the room is the note's only writer, so the state
+	// encoded after reading the highest id covers every row it deletes.
+	stats, _, err := r.hub.registry.MaybeCompact(ctx, r.vaultID, r.noteID, r.doc, force)
+	if err != nil {
+		if force {
+			r.repair.Store(true)
+		}
+		return
+	}
+	// Re-base the counters on the measured log, keeping increments made
+	// by commits that landed meanwhile.
+	r.logCount.Add(stats.Count - preCount)
+	r.logBytes.Add(stats.Bytes - preBytes)
+}
+
+func (r *Room) resultLocked(changed bool, update []byte, opts ApplyOptions) ApplyResult {
+	res := ApplyResult{Changed: changed, Update: update}
+	if opts.WantText {
+		res.Text, _ = r.doc.Text()
+		res.StateVector, _ = r.doc.StateVectorV1()
+	}
 	if opts.WantState {
 		res.State, _ = r.doc.EncodeStateAsUpdate()
 	}
@@ -827,6 +1083,8 @@ func (r *Room) writeMirror(ctx context.Context) error {
 	if fn == nil {
 		return nil
 	}
+	r.mirrorWriteMu.Lock()
+	defer r.mirrorWriteMu.Unlock()
 	text, err := r.doc.Text()
 	if err != nil {
 		return err
