@@ -8,8 +8,10 @@ import (
 
 // yjsUpdates are v1 updates produced by Yjs 13.6 (JS), covering every
 // content kind the guard accepts: text, deletes, formats, embeds, maps
-// with every Any tag, nested types and XML. Regenerate with the script in
-// the commit message of the guard if Yjs changes its encoding.
+// with every Any tag, nested types and XML. Each is the hex of
+// Y.encodeStateAsUpdate (or a delta since a state vector) on a doc that
+// exercises that kind; regenerate from the web client's yjs if Yjs ever
+// changes its encoding.
 var yjsUpdates = map[string]string{
 	"text":        "0101eaacf9b00100040107636f6e74656e74106f6cc3a120f09f9880206d756e646f0a00",
 	"textDelta":   "0101eaacf9b0010dc4eaacf9b00100eaacf9b001010378797a01eaacf9b001010203",
