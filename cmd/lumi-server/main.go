@@ -92,6 +92,17 @@ func (a crdtRepoAdapter) ListUpdatesSince(ctx context.Context, vaultID uuid.UUID
 	return out, nil
 }
 
+var _ crdt.BatchAppender = crdtRepoAdapter{}
+
+// AppendUpdates makes the adapter a crdt.BatchAppender (group commit).
+func (a crdtRepoAdapter) AppendUpdates(ctx context.Context, rows []crdt.PendingUpdate) error {
+	out := make([]pg.NoteYjsAppend, len(rows))
+	for i, r := range rows {
+		out[i] = pg.NoteYjsAppend(r)
+	}
+	return a.NoteYjsStore.AppendUpdates(ctx, out)
+}
+
 // fedMemberAdapter bridges pg.FederatedMemberStore to
 // federation.FederatedMemberRepo (DTO type conversion only).
 type fedMemberAdapter struct{ *pg.FederatedMemberStore }
