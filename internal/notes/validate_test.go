@@ -158,3 +158,14 @@ func TestNoteIDValidation_RejectsSeparators(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateBodyRejectsNul: U+0000 cannot live in the CRDT (yffi C
+// strings), so it is a 400 at the edge instead of a truncated note.
+func TestValidateBodyRejectsNul(t *testing.T) {
+	if err := validateBody("ok\nbody"); err != nil {
+		t.Fatalf("plain body rejected: %v", err)
+	}
+	if err := validateBody("a\x00b"); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("NUL body err = %v, want ErrValidation", err)
+	}
+}

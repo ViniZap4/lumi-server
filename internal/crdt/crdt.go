@@ -44,6 +44,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"unicode/utf16"
 	"unsafe"
@@ -264,6 +265,9 @@ func (d *Doc) ApplyUpdate(update []byte) error {
 	if len(update) == 0 {
 		return nil
 	}
+	if err := checkUpdateV1(update); err != nil {
+		return err
+	}
 	txn := C.ydoc_write_transaction(d.ptr, 0, nil)
 	if txn == nil {
 		return errors.New("crdt: write transaction unavailable")
@@ -294,6 +298,9 @@ func (d *Doc) ApplyUpdate(update []byte) error {
 func (d *Doc) ApplyUpdateChanged(update []byte) (bool, error) {
 	if isEmptyUpdateV1(update) {
 		return false, nil
+	}
+	if err := checkUpdateV1(update); err != nil {
+		return false, err
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -399,6 +406,12 @@ func (d *Doc) ApplyTextDiff(newText string, origin string) ([]byte, error) {
 	defer d.mu.Unlock()
 	if d.closed {
 		return nil, errClosed
+	}
+	// A NUL would be cut by C.CString (silently dropping the rest of the
+	// insert) and could never be read back through yffi; see
+	// ErrUnsafeUpdate.
+	if strings.IndexByte(newText, 0) >= 0 {
+		return nil, fmt.Errorf("%w: text contains U+0000", ErrUnsafeUpdate)
 	}
 
 	// Read current text under a read txn so the diff is computed against

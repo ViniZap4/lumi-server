@@ -475,13 +475,17 @@ func isEmptyCanvasJSON(body string) bool {
 }
 
 // validateBody applies the limits shared by every note kind: valid UTF-8
-// and at most domain.MaxNoteBodyBytes.
+// without NUL and at most domain.MaxNoteBodyBytes.
 func validateBody(body string) error {
 	if len(body) > domain.MaxNoteBodyBytes {
 		return fmt.Errorf("%w: body larger than %d bytes", domain.ErrValidation, domain.MaxNoteBodyBytes)
 	}
 	if !utf8.ValidString(body) {
 		return fmt.Errorf("%w: body is not valid UTF-8", domain.ErrValidation)
+	}
+	// The CRDT layer cannot hold U+0000 (yffi C strings; crdt.ErrUnsafeUpdate).
+	if strings.IndexByte(body, 0) >= 0 {
+		return fmt.Errorf("%w: body contains U+0000", domain.ErrValidation)
 	}
 	return nil
 }
