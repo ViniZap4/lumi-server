@@ -1,6 +1,9 @@
 package pg
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // No Postgres in unit tests: pin the shape of the group-commit INSERT.
 // Rows are listed in slice order with five parameters each, so the
@@ -12,9 +15,10 @@ func TestAppendUpdatesSQL(t *testing.T) {
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
-	// 256 rows (DefaultGroupCommitMaxBatch) stay far below Postgres's
-	// 65535 bind-parameter limit.
-	if n := 5 * 256; n > 65535 {
-		t.Fatalf("%d parameters", n)
+	// A full batch (wsync.DefaultGroupCommitMaxBatch = 256 rows) binds
+	// 1280 parameters, far below Postgres's 65535 limit, and ends on the
+	// last row's fifth parameter.
+	if full := appendUpdatesSQL(256); !strings.HasSuffix(full, ",($1276,$1277,$1278,$1279,$1280)") {
+		t.Fatalf("256-row statement ends with %q", full[len(full)-40:])
 	}
 }
